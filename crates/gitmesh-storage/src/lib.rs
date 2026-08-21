@@ -1,0 +1,567 @@
+//! V0 local storage proof for GitMesh.
+//!
+//! This crate intentionally models only the first roadmap milestone:
+//! bytes -> encrypt -> erasure code -> distribute -> lose shards -> reconstruct
+//! -> decrypt -> exact original bytes.
+
+use gitmesh_core::{Cid, encrypted_segment_cid, shard_cid};
+use gitmesh_crypto::{
+    AeadAlgorithm, CryptoError, SegmentKey, SegmentNonce,
+    decrypt_segment_bytes as crypto_decrypt_segment_bytes,
+    encrypt_segment as crypto_encrypt_segment,
+};
+use gitmesh_network::{InMemoryAvailabilityDirectory, NodeRole, PeerId, ShardProviderRecord};
+use reed_solomon_erasure::galois_8::ReedSolomon;
+use thiserror::Error;
+
+const ENCRYPTION_AAD: &[u8] = b"gitmesh.v0.segment";
+
+pub use gitmesh_core::hex;
+
+#[derive(Debug, Error)]
+pub enum StorageError {
+    #[error("erasure coding failed: {0}")]
+    Erasure(String),
+    #[error("crypto failed: {0}")]
+    Crypto(#[from] CryptoError),
+    #[error("node {0} does not exist")]
+    MissingNode(usize),
+    #[error("not enough shards to reconstruct: have {available}, need {required}")]
+    NotEnoughShards { available: usize, required: usize },
+    #[error("invalid shard index {0}")]
+    InvalidShardIndex(usize),
+    #[error("network discovery failed: {0}")]
+    Network(String),
+}
+
+pub type Result<T> = std::result::Result<T, StorageError>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoragePolicy {
+    pub data_shards: usize,
+    pub parity_shards: usize,
+}
+
+impl StoragePolicy {
+    pub fn total_shards(&self) -> usize {
+        self.data_shards + self.parity_shards
+    }
+}
+
+impl Default for StoragePolicy {
+    fn default() -> Self {
+        Self {
+            data_shards: 10,
+            parity_shards: 6,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct EncryptedSegment {
+    pub cid: Cid,
+    pub algorithm: AeadAlgorithm,
+    pub plaintext_len: usize,
+    pub ciphertext_len: usize,
+    pub nonce: [u8; 24],
+    pub key: [u8; 32],
+    pub ciphertext: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Shard {
+    pub segment_cid: Cid,
+    pub shard_index: usize,
+    pub shard_count: usize,
+    pub data_shards: usize,
+    pub bytes: Vec<u8>,
+    pub cid: Cid,
+}
+
+#[derive(Clone, Debug)]
+pub struct StoredShard {
+    pub node_id: usize,
+    pub shard: Shard,
+}
+
+#[derive(Clone, Debug)]
+pub struct SimulatedNode {
+    pub id: usize,
+    pub shard: Option<Shard>,
+    pub online: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct SimulatedNetwork {
+    nodes: Vec<SimulatedNode>,
+}
+
+impl SimulatedNetwork {
+    pub fn with_node_count(count: usize) -> Self {
+        let nodes = (0..count)
+            .map(|id| SimulatedNode {
+                id,
+                shard: None,
+                online: true,
+            })
+            .collect();
+        Self { nodes }
+    }
+
+    pub fn store_shards(&mut self, shards: Vec<Shard>) -> Result<()> {
+        for shard in shards {
+            let node = self
+                .nodes
+                .get_mut(shard.shard_index)
+                .ok_or(StorageError::MissingNode(shard.shard_index))?;
+            node.shard = Some(shard);
+        }
+        Ok(())
+    }
+
+    pub fn destroy_nodes(&mut self, node_ids: &[usize]) -> Result<()> {
+        for &node_id in node_ids {
+            let node = self
+                .nodes
+                .get_mut(node_id)
+                .ok_or(StorageError::MissingNode(node_id))?;
+            node.shard = None;
+            node.online = false;
+        }
+        Ok(())
+    }
+
+    pub fn corrupt_node_shard(&mut self, node_id: usize) -> Result<()> {
+        let node = self
+            .nodes
+            .get_mut(node_id)
+            .ok_or(StorageError::MissingNode(node_id))?;
+        let shard = node
+            .shard
+            .as_mut()
+            .ok_or(StorageError::MissingNode(node_id))?;
+        if let Some(first) = shard.bytes.first_mut() {
+            *first ^= 0xff;
+        } else {
+            shard.bytes.push(0xff);
+        }
+        Ok(())
+    }
+
+    pub fn available_shards(&self) -> Vec<StoredShard> {
+        self.nodes
+            .iter()
+            .filter(|node| node.online)
+            .filter_map(|node| {
+                node.shard.as_ref().map(|shard| StoredShard {
+                    node_id: node.id,
+                    shard: shard.clone(),
+                })
+            })
+            .collect()
+    }
+
+    pub fn publish_availability(
+        &self,
+        directory: &mut InMemoryAvailabilityDirectory,
+        lease_epoch: u64,
+        expires_at_unix: u64,
+    ) -> Result<()> {
+        for stored in self.available_shards() {
+            directory.publish(ShardProviderRecord::new(
+                stored.shard.segment_cid,
+                stored.shard.cid,
+                stored.shard.shard_index,
+                PeerId::new(format!("v0-node-{}", stored.node_id))
+                    .map_err(|err| StorageError::Network(err.to_string()))?,
+                [NodeRole::Storage],
+                lease_epoch,
+                expires_at_unix,
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShardAuditReport {
+    pub segment_cid: Cid,
+    pub total_shards: usize,
+    pub required_shards: usize,
+    pub verified_shards: Vec<usize>,
+    pub missing_shards: Vec<usize>,
+    pub corrupt_shards: Vec<usize>,
+    pub durability_satisfied: bool,
+    pub repair_needed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepairOutcome {
+    pub segment_cid: Cid,
+    pub repaired_shards: Vec<usize>,
+    pub verified_after_repair: usize,
+    pub durability_satisfied: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct V0ProofResult {
+    pub plaintext_len: usize,
+    pub ciphertext_len: usize,
+    pub segment_cid: Cid,
+    pub destroyed_nodes: Vec<usize>,
+    pub available_shards: usize,
+    pub recovered: Vec<u8>,
+}
+
+pub fn encrypt_segment(plaintext: &[u8]) -> Result<EncryptedSegment> {
+    let encrypted = crypto_encrypt_segment(plaintext, ENCRYPTION_AAD)?;
+    let cid = encrypted_segment_cid(&encrypted.ciphertext);
+
+    Ok(EncryptedSegment {
+        cid,
+        algorithm: encrypted.algorithm,
+        plaintext_len: plaintext.len(),
+        ciphertext_len: encrypted.ciphertext.len(),
+        nonce: encrypted.nonce.expose_bytes(),
+        key: encrypted.key.expose_bytes(),
+        ciphertext: encrypted.ciphertext,
+    })
+}
+
+pub fn decrypt_segment(segment: &EncryptedSegment, ciphertext: &[u8]) -> Result<Vec<u8>> {
+    Ok(crypto_decrypt_segment_bytes(
+        segment.algorithm,
+        SegmentKey::from_bytes(segment.key),
+        SegmentNonce::from_bytes(segment.nonce),
+        ciphertext,
+        ENCRYPTION_AAD,
+    )?)
+}
+
+pub fn erasure_encode(segment: &EncryptedSegment, policy: &StoragePolicy) -> Result<Vec<Shard>> {
+    let r = ReedSolomon::new(policy.data_shards, policy.parity_shards)
+        .map_err(|err| StorageError::Erasure(err.to_string()))?;
+    let shard_len = segment.ciphertext.len().div_ceil(policy.data_shards);
+    let mut shards = vec![vec![0_u8; shard_len]; policy.total_shards()];
+
+    for (index, byte) in segment.ciphertext.iter().enumerate() {
+        shards[index / shard_len][index % shard_len] = *byte;
+    }
+
+    r.encode(&mut shards)
+        .map_err(|err| StorageError::Erasure(err.to_string()))?;
+
+    Ok(shards
+        .into_iter()
+        .enumerate()
+        .map(|(shard_index, bytes)| {
+            let cid = shard_cid(segment.cid, shard_index, &bytes);
+            Shard {
+                segment_cid: segment.cid,
+                shard_index,
+                shard_count: policy.total_shards(),
+                data_shards: policy.data_shards,
+                bytes,
+                cid,
+            }
+        })
+        .collect())
+}
+
+pub fn reconstruct_ciphertext(
+    segment: &EncryptedSegment,
+    policy: &StoragePolicy,
+    stored_shards: &[StoredShard],
+) -> Result<Vec<u8>> {
+    let available = stored_shards.len();
+    if available < policy.data_shards {
+        return Err(StorageError::NotEnoughShards {
+            available,
+            required: policy.data_shards,
+        });
+    }
+
+    let r = ReedSolomon::new(policy.data_shards, policy.parity_shards)
+        .map_err(|err| StorageError::Erasure(err.to_string()))?;
+    let mut shards: Vec<Option<Vec<u8>>> = vec![None; policy.total_shards()];
+
+    for stored in stored_shards {
+        let shard = &stored.shard;
+        if shard.shard_index >= policy.total_shards() {
+            return Err(StorageError::InvalidShardIndex(shard.shard_index));
+        }
+        if shard.segment_cid != segment.cid
+            || shard.cid != shard_cid(segment.cid, shard.shard_index, &shard.bytes)
+        {
+            continue;
+        }
+        shards[shard.shard_index] = Some(shard.bytes.clone());
+    }
+
+    let verified_available = shards.iter().filter(|shard| shard.is_some()).count();
+    if verified_available < policy.data_shards {
+        return Err(StorageError::NotEnoughShards {
+            available: verified_available,
+            required: policy.data_shards,
+        });
+    }
+
+    r.reconstruct(&mut shards)
+        .map_err(|err| StorageError::Erasure(err.to_string()))?;
+
+    let mut ciphertext = Vec::with_capacity(segment.ciphertext_len);
+    for shard in shards.into_iter().take(policy.data_shards) {
+        let shard = shard.expect("reed-solomon reconstruct fills missing data shards");
+        ciphertext.extend_from_slice(&shard);
+    }
+    ciphertext.truncate(segment.ciphertext_len);
+    Ok(ciphertext)
+}
+
+pub fn audit_segment_shards(
+    segment: &EncryptedSegment,
+    policy: &StoragePolicy,
+    network: &SimulatedNetwork,
+) -> Result<ShardAuditReport> {
+    if network.nodes.len() < policy.total_shards() {
+        return Err(StorageError::MissingNode(network.nodes.len()));
+    }
+    let mut verified_shards = Vec::new();
+    let mut missing_shards = Vec::new();
+    let mut corrupt_shards = Vec::new();
+
+    for shard_index in 0..policy.total_shards() {
+        let node = network
+            .nodes
+            .get(shard_index)
+            .ok_or(StorageError::MissingNode(shard_index))?;
+        match (&node.shard, node.online) {
+            (Some(shard), true) if verify_shard(segment, policy, shard) => {
+                verified_shards.push(shard_index);
+            }
+            (Some(_), true) => corrupt_shards.push(shard_index),
+            _ => missing_shards.push(shard_index),
+        }
+    }
+
+    let durability_satisfied = verified_shards.len() >= policy.data_shards;
+    let repair_needed = verified_shards.len() < policy.total_shards()
+        || !missing_shards.is_empty()
+        || !corrupt_shards.is_empty();
+
+    Ok(ShardAuditReport {
+        segment_cid: segment.cid,
+        total_shards: policy.total_shards(),
+        required_shards: policy.data_shards,
+        verified_shards,
+        missing_shards,
+        corrupt_shards,
+        durability_satisfied,
+        repair_needed,
+    })
+}
+
+pub fn repair_segment_shards(
+    segment: &EncryptedSegment,
+    policy: &StoragePolicy,
+    network: &mut SimulatedNetwork,
+) -> Result<RepairOutcome> {
+    let before = audit_segment_shards(segment, policy, network)?;
+    if before.verified_shards.len() < policy.data_shards {
+        return Err(StorageError::NotEnoughShards {
+            available: before.verified_shards.len(),
+            required: policy.data_shards,
+        });
+    }
+
+    let r = ReedSolomon::new(policy.data_shards, policy.parity_shards)
+        .map_err(|err| StorageError::Erasure(err.to_string()))?;
+    let shard_len = segment.ciphertext.len().div_ceil(policy.data_shards);
+    let mut shards: Vec<Option<Vec<u8>>> = vec![None; policy.total_shards()];
+    for shard_index in before.verified_shards {
+        let node = network
+            .nodes
+            .get(shard_index)
+            .ok_or(StorageError::MissingNode(shard_index))?;
+        let shard = node
+            .shard
+            .as_ref()
+            .ok_or(StorageError::MissingNode(shard_index))?;
+        shards[shard_index] = Some(shard.bytes.clone());
+    }
+    r.reconstruct(&mut shards)
+        .map_err(|err| StorageError::Erasure(err.to_string()))?;
+
+    let mut repaired_shards = Vec::new();
+    for shard_index in before
+        .missing_shards
+        .into_iter()
+        .chain(before.corrupt_shards)
+    {
+        let bytes = shards[shard_index]
+            .clone()
+            .ok_or(StorageError::InvalidShardIndex(shard_index))?;
+        let mut trimmed = bytes;
+        if trimmed.len() != shard_len {
+            trimmed.resize(shard_len, 0);
+        }
+        let cid = shard_cid(segment.cid, shard_index, &trimmed);
+        let node = network
+            .nodes
+            .get_mut(shard_index)
+            .ok_or(StorageError::MissingNode(shard_index))?;
+        node.online = true;
+        node.shard = Some(Shard {
+            segment_cid: segment.cid,
+            shard_index,
+            shard_count: policy.total_shards(),
+            data_shards: policy.data_shards,
+            bytes: trimmed,
+            cid,
+        });
+        repaired_shards.push(shard_index);
+    }
+
+    let after = audit_segment_shards(segment, policy, network)?;
+    Ok(RepairOutcome {
+        segment_cid: segment.cid,
+        repaired_shards,
+        verified_after_repair: after.verified_shards.len(),
+        durability_satisfied: after.durability_satisfied,
+    })
+}
+
+fn verify_shard(segment: &EncryptedSegment, policy: &StoragePolicy, shard: &Shard) -> bool {
+    shard.segment_cid == segment.cid
+        && shard.shard_count == policy.total_shards()
+        && shard.data_shards == policy.data_shards
+        && shard.shard_index < policy.total_shards()
+        && shard.cid == shard_cid(segment.cid, shard.shard_index, &shard.bytes)
+}
+
+pub fn run_v0_local_storage_proof(
+    plaintext: &[u8],
+    policy: StoragePolicy,
+    destroyed_nodes: Vec<usize>,
+) -> Result<V0ProofResult> {
+    let encrypted = encrypt_segment(plaintext)?;
+    let shards = erasure_encode(&encrypted, &policy)?;
+    let mut network = SimulatedNetwork::with_node_count(policy.total_shards());
+    network.store_shards(shards)?;
+    network.destroy_nodes(&destroyed_nodes)?;
+
+    let available = network.available_shards();
+    let ciphertext = reconstruct_ciphertext(&encrypted, &policy, &available)?;
+    let recovered = decrypt_segment(&encrypted, &ciphertext)?;
+
+    Ok(V0ProofResult {
+        plaintext_len: plaintext.len(),
+        ciphertext_len: encrypted.ciphertext_len,
+        segment_cid: encrypted.cid,
+        destroyed_nodes,
+        available_shards: available.len(),
+        recovered,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconstructs_after_losing_parity_count_nodes() {
+        let plaintext = b"hello from GitMesh V0; this payload must round-trip exactly";
+        let policy = StoragePolicy::default();
+        let destroyed = vec![0, 3, 6, 9, 12, 15];
+
+        let result = run_v0_local_storage_proof(plaintext, policy, destroyed).unwrap();
+
+        assert_eq!(result.recovered, plaintext);
+    }
+
+    #[test]
+    fn refuses_when_too_many_nodes_are_lost() {
+        let plaintext = b"not enough shards should fail";
+        let policy = StoragePolicy::default();
+        let encrypted = encrypt_segment(plaintext).unwrap();
+        let shards = erasure_encode(&encrypted, &policy).unwrap();
+        let mut network = SimulatedNetwork::with_node_count(policy.total_shards());
+        network.store_shards(shards).unwrap();
+        network.destroy_nodes(&[0, 1, 2, 3, 4, 5, 6]).unwrap();
+
+        let err =
+            reconstruct_ciphertext(&encrypted, &policy, &network.available_shards()).unwrap_err();
+
+        assert!(matches!(
+            err,
+            StorageError::NotEnoughShards {
+                available: 9,
+                required: 10
+            }
+        ));
+    }
+
+    #[test]
+    fn audit_reports_missing_and_corrupt_shards() {
+        let policy = StoragePolicy::default();
+        let encrypted = encrypt_segment(b"audit me").unwrap();
+        let shards = erasure_encode(&encrypted, &policy).unwrap();
+        let mut network = SimulatedNetwork::with_node_count(policy.total_shards());
+        network.store_shards(shards).unwrap();
+        network.destroy_nodes(&[2, 4]).unwrap();
+        network.corrupt_node_shard(6).unwrap();
+
+        let report = audit_segment_shards(&encrypted, &policy, &network).unwrap();
+
+        assert_eq!(report.segment_cid, encrypted.cid);
+        assert_eq!(report.missing_shards, vec![2, 4]);
+        assert_eq!(report.corrupt_shards, vec![6]);
+        assert_eq!(report.verified_shards.len(), policy.total_shards() - 3);
+        assert!(report.durability_satisfied);
+        assert!(report.repair_needed);
+    }
+
+    #[test]
+    fn repair_restores_missing_and_corrupt_shards() {
+        let plaintext = b"repair can rebuild the full shard set";
+        let policy = StoragePolicy::default();
+        let encrypted = encrypt_segment(plaintext).unwrap();
+        let shards = erasure_encode(&encrypted, &policy).unwrap();
+        let mut network = SimulatedNetwork::with_node_count(policy.total_shards());
+        network.store_shards(shards).unwrap();
+        network.destroy_nodes(&[0, 3, 6]).unwrap();
+        network.corrupt_node_shard(9).unwrap();
+
+        let outcome = repair_segment_shards(&encrypted, &policy, &mut network).unwrap();
+        let report = audit_segment_shards(&encrypted, &policy, &network).unwrap();
+        let ciphertext =
+            reconstruct_ciphertext(&encrypted, &policy, &network.available_shards()).unwrap();
+        let recovered = decrypt_segment(&encrypted, &ciphertext).unwrap();
+
+        assert_eq!(outcome.repaired_shards, vec![0, 3, 6, 9]);
+        assert_eq!(outcome.verified_after_repair, policy.total_shards());
+        assert!(outcome.durability_satisfied);
+        assert!(!report.repair_needed);
+        assert_eq!(recovered, plaintext);
+    }
+
+    #[test]
+    fn repair_refuses_below_reconstruction_threshold() {
+        let policy = StoragePolicy::default();
+        let encrypted = encrypt_segment(b"too damaged").unwrap();
+        let shards = erasure_encode(&encrypted, &policy).unwrap();
+        let mut network = SimulatedNetwork::with_node_count(policy.total_shards());
+        network.store_shards(shards).unwrap();
+        network.destroy_nodes(&[0, 1, 2, 3, 4, 5, 6]).unwrap();
+
+        let err = repair_segment_shards(&encrypted, &policy, &mut network).unwrap_err();
+
+        assert!(matches!(
+            err,
+            StorageError::NotEnoughShards {
+                available: 9,
+                required: 10
+            }
+        ));
+    }
+}

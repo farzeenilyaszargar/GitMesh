@@ -1,0 +1,10 @@
+[package]
+name = "gitmesh-network"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+gitmesh-core.workspace = true
+thiserror.workspace = true

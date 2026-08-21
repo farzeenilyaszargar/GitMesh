@@ -1,0 +1,43 @@
+[workspace]
+members = [
+    "crates/gitmesh-core",
+    "crates/gitmesh-collaboration",
+    "crates/gitmesh-coordination",
+    "crates/gitmesh-crypto",
+    "crates/gitmesh-git",
+    "crates/gitmesh-identity",
+    "crates/gitmesh-network",
+    "crates/gitmesh-repository",
+    "crates/gitmesh-storage",
+    "crates/gitmeshd",
+    "crates/git-remote-gitmesh",
+    "crates/gm",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/farzeenilyaszargar/GitMesh.git"
+
+[workspace.dependencies]
+blake3 = "1.8"
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+ed25519-dalek = "3.0"
+flate2 = "1.1"
+gitmesh-core = { path = "crates/gitmesh-core" }
+gitmesh-collaboration = { path = "crates/gitmesh-collaboration" }
+gitmesh-coordination = { path = "crates/gitmesh-coordination" }
+gitmesh-crypto = { path = "crates/gitmesh-crypto" }
+gitmesh-git = { path = "crates/gitmesh-git" }
+gitmesh-identity = { path = "crates/gitmesh-identity" }
+gitmesh-network = { path = "crates/gitmesh-network" }
+gitmesh-repository = { path = "crates/gitmesh-repository" }
+gitmesh-storage = { path = "crates/gitmesh-storage" }
+gitmeshd = { path = "crates/gitmeshd" }
+git-remote-gitmesh = { path = "crates/git-remote-gitmesh" }
+gm = { path = "crates/gm" }
+rand = "0.8"
+reed-solomon-erasure = "6.0"
+sha1 = "0.10"
+thiserror = "2.0"
