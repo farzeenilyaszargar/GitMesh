@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 
 import { RepoHeader, SiteHeader } from "./repo-chrome";
+import type { GatewaySnapshot } from "./api/gitmesh/backend";
 import {
   checks,
   files,
@@ -25,7 +26,18 @@ import {
   repository
 } from "./repository-data";
 
-export default function RepositoryView() {
+type RepositoryViewProps = {
+  snapshot?: GatewaySnapshot;
+};
+
+export default function RepositoryView({ snapshot }: RepositoryViewProps) {
+  const daemonOnline = snapshot?.health.ok === true;
+  const objectCount = snapshot?.repo.fields.objects ?? "0";
+  const refCount = snapshot?.repo.fields.refs ?? "0";
+  const checkpointCount = snapshot?.repo.fields.checkpoints ?? "0";
+  const keyGrantCount = snapshot?.repo.fields.key_grants ?? snapshot?.keyGrants.fields.grants ?? "0";
+  const latestEpoch = snapshot?.keyGrants.fields.latest_epoch ?? "none";
+
   return (
     <main>
       <SiteHeader showRepositoryPath />
@@ -213,20 +225,35 @@ export default function RepositoryView() {
             <div className="healthRows">
               <div>
                 <Network size={16} />
-                <span>Durable shards</span>
-                <strong>10 / 16</strong>
+                <span>Daemon</span>
+                <strong>{daemonOnline ? "online" : "offline"}</strong>
               </div>
               <div>
                 <CheckCircle2 size={16} />
-                <span>Latest checkpoint</span>
-                <strong>verified</strong>
+                <span>Objects</span>
+                <strong>{objectCount}</strong>
               </div>
               <div>
                 <UploadCloud size={16} />
-                <span>Repair queue</span>
-                <strong>0</strong>
+                <span>Refs</span>
+                <strong>{refCount}</strong>
+              </div>
+              <div>
+                <ShieldCheck size={16} />
+                <span>Key grants</span>
+                <strong>{keyGrantCount}</strong>
+              </div>
+              <div>
+                <History size={16} />
+                <span>Checkpoints</span>
+                <strong>{checkpointCount}</strong>
               </div>
             </div>
+            <p className="smallText">
+              {daemonOnline
+                ? `Live from gitmeshd. Latest key epoch: ${latestEpoch}.`
+                : "Start gitmeshd to populate live repository state."}
+            </p>
           </section>
 
           <section className="sidePanel">
