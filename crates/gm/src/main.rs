@@ -41,6 +41,8 @@ fn run() -> Result<(), GmError> {
         Some("ref") => refs(&args[1..]),
         Some("object") => object(&args[1..]),
         Some("key") => key(&args[1..]),
+        Some("account") => account(&args[1..]),
+        Some("session") => session(&args[1..]),
         Some("proof") => proof(&args[1..]),
         Some(command) => Err(GmError::UnknownCommand(command.to_string())),
     }
@@ -1215,6 +1217,162 @@ fn key(args: &[String]) -> Result<(), GmError> {
     }
 }
 
+fn account(args: &[String]) -> Result<(), GmError> {
+    match args.first().map(String::as_str) {
+        Some("create") => {
+            let socket_path = args.get(1).map_or_else(default_socket_path, Into::into);
+            let username = args.get(2).ok_or_else(|| {
+                GmError::InvalidArguments("account create requires a username".to_string())
+            })?;
+            validate_account_token(username, "username")?;
+            let display_name = args.get(3).map_or(username.as_str(), String::as_str);
+            let bio = args.get(4).map_or("", String::as_str);
+            let avatar = args.get(5).map_or("", String::as_str);
+            validate_state_field(display_name)?;
+            validate_state_field(bio)?;
+            validate_state_field(avatar)?;
+            let identity = LocalIdentity::load_or_create_default()?;
+            println!(
+                "{}",
+                request_unix_socket(
+                    socket_path,
+                    &format!(
+                        "ACCOUNT_CREATE {username} {} {} {} {}",
+                        identity.certificate.account_id.as_cid(),
+                        encode_text_arg(display_name),
+                        encode_text_arg(bio),
+                        encode_text_arg(avatar)
+                    )
+                )?
+            );
+            Ok(())
+        }
+        Some("profile") => {
+            let socket_path = args.get(1).map_or_else(default_socket_path, Into::into);
+            let username = args.get(2).ok_or_else(|| {
+                GmError::InvalidArguments("account profile requires a username".to_string())
+            })?;
+            validate_account_token(username, "username")?;
+            println!(
+                "{}",
+                request_unix_socket(socket_path, &format!("ACCOUNT_PROFILE {username}"))?
+            );
+            Ok(())
+        }
+        Some("update") => {
+            let socket_path = args.get(1).map_or_else(default_socket_path, Into::into);
+            let username = args.get(2).ok_or_else(|| {
+                GmError::InvalidArguments("account update requires a username".to_string())
+            })?;
+            validate_account_token(username, "username")?;
+            let display_name = args
+                .get(3)
+                .map_or("keep".to_string(), |value| encode_text_arg_or_keep(value));
+            let bio = args
+                .get(4)
+                .map_or("keep".to_string(), |value| encode_text_arg_or_keep(value));
+            let avatar = args
+                .get(5)
+                .map_or("keep".to_string(), |value| encode_text_arg_or_keep(value));
+            println!(
+                "{}",
+                request_unix_socket(
+                    socket_path,
+                    &format!("ACCOUNT_UPDATE_PROFILE {username} {display_name} {bio} {avatar}")
+                )?
+            );
+            Ok(())
+        }
+        Some("register-repo") => {
+            let socket_path = args.get(1).map_or_else(default_socket_path, Into::into);
+            let owner = args.get(2).ok_or_else(|| {
+                GmError::InvalidArguments("account register-repo requires an owner".to_string())
+            })?;
+            let name = args.get(3).ok_or_else(|| {
+                GmError::InvalidArguments("account register-repo requires a repo name".to_string())
+            })?;
+            let repo_id = args.get(4).ok_or_else(|| {
+                GmError::InvalidArguments("account register-repo requires a repo id".to_string())
+            })?;
+            let visibility = args.get(5).map_or("private", String::as_str);
+            validate_account_token(owner, "owner")?;
+            validate_account_token(name, "repo name")?;
+            validate_protocol_token(repo_id, "repo id")?;
+            if !matches!(visibility, "public" | "private") {
+                return Err(GmError::InvalidArguments(
+                    "visibility must be public or private".to_string(),
+                ));
+            }
+            println!(
+                "{}",
+                request_unix_socket(
+                    socket_path,
+                    &format!("REPO_REGISTER {owner} {name} {repo_id} {visibility}")
+                )?
+            );
+            Ok(())
+        }
+        Some("status") | None => {
+            let socket_path = args.get(1).map_or_else(default_socket_path, Into::into);
+            println!("{}", request_unix_socket(socket_path, "ACCOUNT_STATUS")?);
+            Ok(())
+        }
+        Some(command) => Err(GmError::UnknownCommand(format!("account {command}"))),
+    }
+}
+
+fn session(args: &[String]) -> Result<(), GmError> {
+    match args.first().map(String::as_str) {
+        Some("issue") => {
+            let socket_path = args.get(1).map_or_else(default_socket_path, Into::into);
+            let username = args.get(2).ok_or_else(|| {
+                GmError::InvalidArguments("session issue requires a username".to_string())
+            })?;
+            let ttl = args.get(3).map_or("86400", String::as_str);
+            let device_id = args.get(4).map_or("none", String::as_str);
+            validate_account_token(username, "username")?;
+            validate_protocol_token(ttl, "ttl")?;
+            validate_protocol_token(device_id, "device id")?;
+            println!(
+                "{}",
+                request_unix_socket(
+                    socket_path,
+                    &format!("SESSION_ISSUE {username} {ttl} {device_id}")
+                )?
+            );
+            Ok(())
+        }
+        Some("auth") => {
+            let socket_path = args.get(1).map_or_else(default_socket_path, Into::into);
+            let token = args.get(2).ok_or_else(|| {
+                GmError::InvalidArguments("session auth requires a token".to_string())
+            })?;
+            validate_protocol_token(token, "session token")?;
+            println!(
+                "{}",
+                request_unix_socket(socket_path, &format!("SESSION_AUTH {token}"))?
+            );
+            Ok(())
+        }
+        Some("revoke") => {
+            let socket_path = args.get(1).map_or_else(default_socket_path, Into::into);
+            let session_id = args.get(2).ok_or_else(|| {
+                GmError::InvalidArguments("session revoke requires a session id".to_string())
+            })?;
+            validate_protocol_token(session_id, "session id")?;
+            println!(
+                "{}",
+                request_unix_socket(socket_path, &format!("SESSION_REVOKE {session_id}"))?
+            );
+            Ok(())
+        }
+        Some(command) => Err(GmError::UnknownCommand(format!("session {command}"))),
+        None => Err(GmError::InvalidArguments(
+            "session requires issue, auth, or revoke".to_string(),
+        )),
+    }
+}
+
 fn import_loose_objects(socket_path: PathBuf, git_dir: PathBuf) -> Result<(), GmError> {
     let objects_dir = git_dir.join("objects");
     let mut imported = 0_u64;
@@ -1366,6 +1524,36 @@ fn validate_protocol_token(value: &str, name: &str) -> Result<(), GmError> {
     Ok(())
 }
 
+fn validate_account_token(value: &str, name: &str) -> Result<(), GmError> {
+    if value.is_empty()
+        || value.contains(char::is_whitespace)
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(GmError::InvalidArguments(format!(
+            "{name} must be a non-empty ASCII token"
+        )));
+    }
+    Ok(())
+}
+
+fn encode_text_arg(value: &str) -> String {
+    if value.is_empty() {
+        "-".to_string()
+    } else {
+        hex(value.as_bytes())
+    }
+}
+
+fn encode_text_arg_or_keep(value: &str) -> String {
+    if value == "keep" {
+        "keep".to_string()
+    } else {
+        encode_text_arg(value)
+    }
+}
+
 fn short_cid(cid: gitmesh_core::Cid) -> String {
     let hex = cid.as_hex();
     hex.chars().take(12).collect()
@@ -1409,6 +1597,16 @@ fn print_help() {
     println!("  key list [socket] <repo-id> [latest|all|epoch]");
     println!("  key revoke-device [socket] <device-cid> <effective-epoch>");
     println!("  key status [socket] [repo-id]");
+    println!("  account create [socket] <username> [display-name] [bio] [avatar-uri]");
+    println!("  account profile [socket] <username>");
+    println!(
+        "  account update [socket] <username> [display-name|keep] [bio|keep] [avatar-uri|keep]"
+    );
+    println!("  account register-repo [socket] <owner> <name> <repo-id> [public|private]");
+    println!("  account status [socket]");
+    println!("  session issue [socket] <username> [ttl-seconds] [device-id|none]");
+    println!("  session auth [socket] <token>");
+    println!("  session revoke [socket] <session-id>");
     println!("  proof [payload...]");
 }
 

@@ -302,6 +302,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "gitmesh-accounts"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "gitmesh-core",
+ "gitmesh-identity",
+ "rand",
+ "thiserror",
+]
+
+[[package]]
 name = "gitmesh-collaboration"
 version = "0.1.0"
 dependencies = [
@@ -390,6 +401,7 @@ dependencies = [
 name = "gitmeshd"
 version = "0.1.0"
 dependencies = [
+ "gitmesh-accounts",
  "gitmesh-coordination",
  "gitmesh-crypto",
  "gitmesh-git",

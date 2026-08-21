@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+gitmesh-accounts.workspace = true
 gitmesh-coordination.workspace = true
 gitmesh-crypto.workspace = true
 gitmesh-git.workspace = true

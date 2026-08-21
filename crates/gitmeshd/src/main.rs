@@ -28,6 +28,7 @@ fn run() -> Result<(), GitMeshdError> {
             let ref_store_path: Option<PathBuf> = args.next().map(Into::into);
             let policy_store_path: Option<PathBuf> = args.next().map(Into::into);
             let key_grant_store_path: Option<PathBuf> = args.next().map(Into::into);
+            let account_store_path: Option<PathBuf> = args.next().map(Into::into);
             println!("gitmeshd listening on {}", socket_path.display());
             if let Some(path) = &object_store_path {
                 println!("gitmeshd object store {}", path.display());
@@ -41,6 +42,9 @@ fn run() -> Result<(), GitMeshdError> {
             if let Some(path) = &key_grant_store_path {
                 println!("gitmeshd key grant store {}", path.display());
             }
+            if let Some(path) = &account_store_path {
+                println!("gitmeshd account store {}", path.display());
+            }
             let auth = DaemonAuth::from_env()?;
             if auth.is_enabled() {
                 println!("gitmeshd admin auth enabled");
@@ -51,6 +55,7 @@ fn run() -> Result<(), GitMeshdError> {
                 ref_store_path,
                 policy_store_path,
                 key_grant_store_path,
+                account_store_path,
                 auth,
             )?;
             Ok(())
@@ -327,7 +332,7 @@ fn print_help() {
     println!("Commands:");
     println!("  v0-proof [payload...]   run the local encrypt/erasure-code/recover proof");
     println!(
-        "  serve [socket] [object-store] [ref-store] [policy-store] [key-grant-store]   run the local daemon socket server"
+        "  serve [socket] [object-store] [ref-store] [policy-store] [key-grant-store] [account-store]   run the local daemon socket server"
     );
     println!("  ping [socket]           ping a running local daemon");
     println!("  frame-ping [socket] [request-id]   ping using the binary frame protocol");

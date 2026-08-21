@@ -13,6 +13,10 @@ use std::sync::{Arc, Mutex};
 #[cfg(unix)]
 use std::thread;
 
+use gitmesh_accounts::{
+    AccountError, AccountStore, NewAccountProfile, ProfileUpdate, RepositoryVisibility, Username,
+    now_unix,
+};
 use gitmesh_coordination::{
     CoordinationError, RefName, RefStore, RefUpdate, RefUpdateActor, RejectionReason, RepoId,
     RepoPolicy, SignedRefUpdate, SignedRefUpdateActor, TransactionId, TransactionReceipt,
@@ -52,6 +56,8 @@ pub enum DaemonError {
     Identity(#[from] IdentityError),
     #[error("repository object store failed: {0}")]
     Repository(#[from] RepositoryError),
+    #[error("account store failed: {0}")]
+    Accounts(#[from] AccountError),
     #[error("ref target object is not durably stored: {0}")]
     MissingDurableObject(GitSha1Oid),
     #[error("invalid daemon command: {0}")]
@@ -121,10 +127,12 @@ pub struct DaemonState {
     policy: RepoPolicy,
     objects: RepositoryObjectStore,
     key_grants: RepoKeyGrantStore,
+    accounts: AccountStore,
     object_store_path: Option<PathBuf>,
     ref_store_path: Option<PathBuf>,
     policy_store_path: Option<PathBuf>,
     key_grant_store_path: Option<PathBuf>,
+    account_store_path: Option<PathBuf>,
 }
 
 impl Default for DaemonState {
@@ -135,10 +143,12 @@ impl Default for DaemonState {
             policy: RepoPolicy::default(),
             objects: RepositoryObjectStore::default(),
             key_grants: RepoKeyGrantStore::default(),
+            accounts: AccountStore::default(),
             object_store_path: None,
             ref_store_path: None,
             policy_store_path: None,
             key_grant_store_path: None,
+            account_store_path: None,
         }
     }
 }
@@ -167,6 +177,22 @@ impl DaemonState {
         policy_store_path: Option<PathBuf>,
         key_grant_store_path: Option<PathBuf>,
     ) -> Result<Self> {
+        Self::with_all_store_paths(
+            object_store_path,
+            ref_store_path,
+            policy_store_path,
+            key_grant_store_path,
+            None,
+        )
+    }
+
+    pub fn with_all_store_paths(
+        object_store_path: Option<PathBuf>,
+        ref_store_path: Option<PathBuf>,
+        policy_store_path: Option<PathBuf>,
+        key_grant_store_path: Option<PathBuf>,
+        account_store_path: Option<PathBuf>,
+    ) -> Result<Self> {
         Ok(Self {
             repo_id: RepoId::new(b"gitmeshd-v0-repo"),
             refs: if let Some(path) = &ref_store_path {
@@ -189,10 +215,16 @@ impl DaemonState {
             } else {
                 RepoKeyGrantStore::default()
             },
+            accounts: if let Some(path) = &account_store_path {
+                AccountStore::load_from_path(path)?
+            } else {
+                AccountStore::default()
+            },
             object_store_path,
             ref_store_path,
             policy_store_path,
             key_grant_store_path,
+            account_store_path,
         })
     }
 
@@ -318,15 +350,50 @@ impl DaemonState {
             return self.key_grant_status(rest);
         }
 
+        if let Some(rest) = trimmed.strip_prefix("ACCOUNT_CREATE ") {
+            return self.account_create(rest);
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("ACCOUNT_PROFILE ") {
+            return self.account_profile(rest);
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("ACCOUNT_UPDATE_PROFILE ") {
+            return self.account_update_profile(rest);
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("SESSION_ISSUE ") {
+            return self.session_issue(rest);
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("SESSION_AUTH ") {
+            return self.session_auth(rest);
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("SESSION_REVOKE ") {
+            return self.session_revoke(rest);
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("REPO_REGISTER ") {
+            return self.repo_register(rest);
+        }
+
+        if trimmed == "ACCOUNT_STATUS" {
+            return Ok(DaemonResponse::Ok(format_account_status(&self.accounts)?));
+        }
+
         if trimmed == "REPO_STATUS" {
             return Ok(DaemonResponse::Ok(format!(
-                "objects={} refs={} mutations={} checkpoints={} key_grants={} revoked_devices={} data_shards={} parity_shards={}",
+                "objects={} refs={} mutations={} checkpoints={} key_grants={} revoked_devices={} accounts={} active_sessions={} registered_repos={} data_shards={} parity_shards={}",
                 self.objects.object_count(),
                 self.refs.ref_count(),
                 self.refs.mutation_count(),
                 self.refs.checkpoint_count(),
                 self.key_grants.grant_count(),
                 self.key_grants.revoked_device_count(),
+                self.accounts.profile_count(),
+                self.accounts.active_session_count(now_unix()?),
+                self.accounts.repository_count(),
                 self.objects.policy().data_shards,
                 self.objects.policy().parity_shards
             )));
@@ -673,6 +740,133 @@ impl DaemonState {
         )))
     }
 
+    fn account_create(&mut self, rest: &str) -> Result<DaemonResponse> {
+        let parts = rest.split_whitespace().collect::<Vec<_>>();
+        if parts.len() != 5 {
+            return Err(DaemonError::InvalidCommand(
+                "ACCOUNT_CREATE requires <username> <account-cid> <display-hex|-> <bio-hex|-> <avatar-hex|->".to_string(),
+            ));
+        }
+        let username = Username::new(parts[0])?;
+        let account_id = gitmesh_identity::AccountId::from_protocol_cid_text(parts[1])?;
+        let profile = self.accounts.create_profile(
+            NewAccountProfile {
+                username,
+                account_id,
+                display_name: decode_text_arg(parts[2])?,
+                bio: decode_text_arg(parts[3])?,
+                avatar_uri: decode_text_arg(parts[4])?,
+            },
+            now_unix()?,
+        )?;
+        let response = format_profile(profile);
+        self.save_accounts()?;
+        Ok(DaemonResponse::Ok(response))
+    }
+
+    fn account_profile(&self, rest: &str) -> Result<DaemonResponse> {
+        let username = Username::new(rest.trim())?;
+        let profile = self
+            .accounts
+            .profile(&username)
+            .ok_or(AccountError::AccountNotFound)?;
+        Ok(DaemonResponse::Ok(format_profile(profile)))
+    }
+
+    fn account_update_profile(&mut self, rest: &str) -> Result<DaemonResponse> {
+        let parts = rest.split_whitespace().collect::<Vec<_>>();
+        if parts.len() != 4 {
+            return Err(DaemonError::InvalidCommand(
+                "ACCOUNT_UPDATE_PROFILE requires <username> <display-hex|keep|-> <bio-hex|keep|-> <avatar-hex|keep|->".to_string(),
+            ));
+        }
+        let username = Username::new(parts[0])?;
+        let profile = self.accounts.update_profile(
+            &username,
+            ProfileUpdate {
+                display_name: decode_optional_text_arg(parts[1])?,
+                bio: decode_optional_text_arg(parts[2])?,
+                avatar_uri: decode_optional_text_arg(parts[3])?,
+            },
+            now_unix()?,
+        )?;
+        let response = format_profile(profile);
+        self.save_accounts()?;
+        Ok(DaemonResponse::Ok(response))
+    }
+
+    fn session_issue(&mut self, rest: &str) -> Result<DaemonResponse> {
+        let parts = rest.split_whitespace().collect::<Vec<_>>();
+        if parts.len() != 3 {
+            return Err(DaemonError::InvalidCommand(
+                "SESSION_ISSUE requires <username> <ttl-seconds> <device-id|none>".to_string(),
+            ));
+        }
+        let username = Username::new(parts[0])?;
+        let ttl = parts[1].parse::<u64>().map_err(|_| {
+            DaemonError::InvalidCommand("ttl seconds must be a positive integer".to_string())
+        })?;
+        let device_id = if parts[2] == "none" {
+            None
+        } else {
+            Some(parts[2].to_string())
+        };
+        let issued = self
+            .accounts
+            .issue_session(&username, device_id, ttl, now_unix()?)?;
+        let response = format!(
+            "session={} username={} expires_at={} token={}",
+            issued.session.session_id,
+            issued.session.username.as_str(),
+            issued.session.expires_at_unix,
+            issued.token.expose_for_client()
+        );
+        self.save_accounts()?;
+        Ok(DaemonResponse::Ok(response))
+    }
+
+    fn session_auth(&self, rest: &str) -> Result<DaemonResponse> {
+        let session = self
+            .accounts
+            .authenticate_session(rest.trim(), now_unix()?)?;
+        Ok(DaemonResponse::Ok(format!(
+            "session={} username={} expires_at={} active=true",
+            session.session_id,
+            session.username.as_str(),
+            session.expires_at_unix
+        )))
+    }
+
+    fn session_revoke(&mut self, rest: &str) -> Result<DaemonResponse> {
+        let session_id = rest.trim();
+        self.accounts.revoke_session(session_id, now_unix()?)?;
+        self.save_accounts()?;
+        Ok(DaemonResponse::Ok(format!(
+            "session={session_id} revoked=true"
+        )))
+    }
+
+    fn repo_register(&mut self, rest: &str) -> Result<DaemonResponse> {
+        let parts = rest.split_whitespace().collect::<Vec<_>>();
+        if parts.len() != 4 {
+            return Err(DaemonError::InvalidCommand(
+                "REPO_REGISTER requires <owner> <name> <repo-id> <public|private>".to_string(),
+            ));
+        }
+        let owner = Username::new(parts[0])?;
+        let visibility = parse_repository_visibility(parts[3])?;
+        let registration = self.accounts.register_repository(
+            &owner,
+            parts[1],
+            parts[2],
+            visibility,
+            now_unix()?,
+        )?;
+        let response = format_repository_registration(registration);
+        self.save_accounts()?;
+        Ok(DaemonResponse::Ok(response))
+    }
+
     fn save_objects(&self) -> Result<()> {
         if let Some(path) = &self.object_store_path {
             self.objects.save_to_path(path)?;
@@ -697,6 +891,13 @@ impl DaemonState {
     fn save_key_grants(&self) -> Result<()> {
         if let Some(path) = &self.key_grant_store_path {
             self.key_grants.save_to_path(path)?;
+        }
+        Ok(())
+    }
+
+    fn save_accounts(&self) -> Result<()> {
+        if let Some(path) = &self.account_store_path {
+            self.accounts.save_to_path(path)?;
         }
         Ok(())
     }
@@ -812,6 +1013,11 @@ fn requires_admin_auth(command: &str) -> bool {
                 | "OBJECT_REPAIR"
                 | "KEY_GRANT_PUT"
                 | "KEY_GRANT_REVOKE_DEVICE"
+                | "ACCOUNT_CREATE"
+                | "ACCOUNT_UPDATE_PROFILE"
+                | "SESSION_ISSUE"
+                | "SESSION_REVOKE"
+                | "REPO_REGISTER"
         )
     )
 }
@@ -986,6 +1192,7 @@ pub fn serve_unix_socket_with_stores(
         ref_store_path,
         policy_store_path,
         None::<PathBuf>,
+        None::<PathBuf>,
         DaemonAuth::disabled(),
     )
 }
@@ -997,16 +1204,18 @@ pub fn serve_unix_socket_with_stores_and_auth(
     ref_store_path: Option<impl Into<PathBuf>>,
     policy_store_path: Option<impl Into<PathBuf>>,
     key_grant_store_path: Option<impl Into<PathBuf>>,
+    account_store_path: Option<impl Into<PathBuf>>,
     auth: DaemonAuth,
 ) -> Result<()> {
     let socket_path = socket_path.as_ref();
     remove_stale_socket(socket_path)?;
     let listener = UnixListener::bind(socket_path)?;
-    let state = Arc::new(Mutex::new(DaemonState::with_store_paths_and_key_grants(
+    let state = Arc::new(Mutex::new(DaemonState::with_all_store_paths(
         object_store_path.map(Into::into),
         ref_store_path.map(Into::into),
         policy_store_path.map(Into::into),
         key_grant_store_path.map(Into::into),
+        account_store_path.map(Into::into),
     )?));
     let auth = Arc::new(auth);
     for stream in listener.incoming() {
@@ -1052,6 +1261,7 @@ pub fn serve_unix_socket_with_stores_and_auth(
     _ref_store_path: Option<impl Into<PathBuf>>,
     _policy_store_path: Option<impl Into<PathBuf>>,
     _key_grant_store_path: Option<impl Into<PathBuf>>,
+    _account_store_path: Option<impl Into<PathBuf>>,
     _auth: DaemonAuth,
 ) -> Result<()> {
     Err(DaemonError::UnsupportedPlatform)
@@ -1302,6 +1512,21 @@ fn decode_label(value: &str) -> Result<String> {
         .map_err(|_| DaemonError::InvalidCommand("label must be UTF-8 encoded as hex".to_string()))
 }
 
+fn decode_text_arg(value: &str) -> Result<String> {
+    if value == "-" {
+        return Ok(String::new());
+    }
+    decode_label(value)
+}
+
+fn decode_optional_text_arg(value: &str) -> Result<Option<String>> {
+    if value == "keep" {
+        Ok(None)
+    } else {
+        Ok(Some(decode_text_arg(value)?))
+    }
+}
+
 fn decode_fixed_hex<const N: usize>(value: &str) -> Result<[u8; N]> {
     let bytes = decode_hex(value)?;
     bytes
@@ -1315,6 +1540,16 @@ fn parse_bool_arg(value: &str) -> Result<bool> {
         "false" => Ok(false),
         _ => Err(DaemonError::InvalidCommand(
             "expected boolean value 'true' or 'false'".to_string(),
+        )),
+    }
+}
+
+fn parse_repository_visibility(value: &str) -> Result<RepositoryVisibility> {
+    match value {
+        "public" => Ok(RepositoryVisibility::Public),
+        "private" => Ok(RepositoryVisibility::Private),
+        _ => Err(DaemonError::InvalidCommand(
+            "repository visibility must be public or private".to_string(),
         )),
     }
 }
@@ -1461,6 +1696,41 @@ fn format_key_grant_list(
     )
 }
 
+fn format_profile(profile: &gitmesh_accounts::AccountProfile) -> String {
+    format!(
+        "username={} account={} display_hex={} bio_hex={} avatar_hex={} created_at={} updated_at={}",
+        profile.username.as_str(),
+        profile.account_id,
+        encode_hex(profile.display_name.as_bytes()),
+        encode_hex(profile.bio.as_bytes()),
+        encode_hex(profile.avatar_uri.as_bytes()),
+        profile.created_at_unix,
+        profile.updated_at_unix
+    )
+}
+
+fn format_repository_registration(
+    registration: &gitmesh_accounts::RepositoryRegistration,
+) -> String {
+    format!(
+        "owner={} name={} repo={} visibility={} created_at={}",
+        registration.owner.as_str(),
+        registration.name,
+        registration.repo_id,
+        registration.visibility.as_str(),
+        registration.created_at_unix
+    )
+}
+
+fn format_account_status(accounts: &AccountStore) -> Result<String> {
+    Ok(format!(
+        "accounts={} active_sessions={} registered_repos={}",
+        accounts.profile_count(),
+        accounts.active_session_count(now_unix()?),
+        accounts.repository_count()
+    ))
+}
+
 fn format_audit_reports(audits: &[RepositoryObjectAudit]) -> String {
     if audits.is_empty() {
         return "audits=none unhealthy=0 repair_needed=0".to_string();
@@ -1580,6 +1850,10 @@ mod tests {
             "tree {tree_oid}\nparent {parent_oid}\nauthor A <a@example.com> 0 +0000\ncommitter A <a@example.com> 0 +0000\n\n{message}\n"
         );
         put_object(state, "commit", &encode_hex(payload.as_bytes()))
+    }
+
+    fn account_cid() -> String {
+        AccountRootKey::generate().account_id().as_cid().to_string()
     }
 
     fn repo_key_grant_wire(repo_id: &str, epoch: u64) -> (String, String) {
@@ -1730,6 +2004,97 @@ mod tests {
 
         assert!(response.contains("latest_epoch=2"));
         assert!(response.contains("grants=1"));
+    }
+
+    #[test]
+    fn account_commands_create_session_auth_revoke_and_register_repo() {
+        let mut state = DaemonState::default();
+        let account_id = account_cid();
+        let display = encode_hex(b"Farzeen Ilyas");
+        let bio = encode_hex(b"building GitMesh");
+        let avatar = encode_hex(b"asset:prof_pic.jpeg");
+
+        let create = state
+            .handle_command(&format!(
+                "ACCOUNT_CREATE farzeen {account_id} {display} {bio} {avatar}"
+            ))
+            .unwrap()
+            .into_line();
+        let issue = state
+            .handle_command("SESSION_ISSUE farzeen 3600 none")
+            .unwrap()
+            .into_line();
+        let token = issue
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix("token="))
+            .unwrap();
+        let session_id = issue
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix("session="))
+            .unwrap()
+            .to_string();
+        let auth = state
+            .handle_command(&format!("SESSION_AUTH {token}"))
+            .unwrap()
+            .into_line();
+        let repo = state
+            .handle_command("REPO_REGISTER farzeen GitMesh repo:farzeen/gitmesh private")
+            .unwrap()
+            .into_line();
+        let status = state.handle_command("ACCOUNT_STATUS").unwrap().into_line();
+        let revoke = state
+            .handle_command(&format!("SESSION_REVOKE {session_id}"))
+            .unwrap()
+            .into_line();
+
+        assert!(create.contains("username=farzeen"));
+        assert!(auth.contains("active=true"));
+        assert!(repo.contains("repo=repo:farzeen/gitmesh"));
+        assert!(status.contains("accounts=1"));
+        assert!(status.contains("registered_repos=1"));
+        assert!(revoke.contains("revoked=true"));
+        assert!(
+            state
+                .handle_command(&format!("SESSION_AUTH {token}"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn account_store_persists_to_disk() {
+        let path = std::env::temp_dir().join(format!(
+            "gitmeshd-accounts-{}-{}.tsv",
+            std::process::id(),
+            "persist"
+        ));
+        let mut state =
+            DaemonState::with_all_store_paths(None, None, None, None, Some(path.clone())).unwrap();
+        let account_id = account_cid();
+        state
+            .handle_command(&format!(
+                "ACCOUNT_CREATE farzeen {account_id} {} - -",
+                encode_hex(b"Farzeen")
+            ))
+            .unwrap();
+        state
+            .handle_command("REPO_REGISTER farzeen GitMesh repo:farzeen/gitmesh private")
+            .unwrap();
+
+        let mut restored =
+            DaemonState::with_all_store_paths(None, None, None, None, Some(path.clone())).unwrap();
+        let status = restored
+            .handle_command("ACCOUNT_STATUS")
+            .unwrap()
+            .into_line();
+        let profile = restored
+            .handle_command("ACCOUNT_PROFILE farzeen")
+            .unwrap()
+            .into_line();
+        let _ = fs::remove_file(path);
+
+        assert!(status.contains("accounts=1"));
+        assert!(status.contains("registered_repos=1"));
+        assert!(profile.contains("username=farzeen"));
     }
 
     #[cfg(unix)]
