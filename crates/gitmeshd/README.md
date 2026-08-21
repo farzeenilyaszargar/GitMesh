@@ -54,5 +54,19 @@ packs for compatibility.
 
 The Next.js web app exposes read-only gateway routes under `/api/gitmesh/*`.
 Those routes translate HTTP JSON requests into local `gitmeshd` socket reads for
-health, status, refs, and key grants. Browser mutation APIs are intentionally
-not exposed until account sessions and CSRF protection exist.
+health, status, refs, and key grants. Account/session infrastructure is exposed
+through server-side JSON routes for local development:
+
+- `GET /api/gitmesh/accounts`
+- `POST /api/gitmesh/accounts`
+- `GET /api/gitmesh/accounts/:username`
+- `PATCH /api/gitmesh/accounts/:username`
+- `POST /api/gitmesh/accounts/:username/repositories`
+- `POST /api/gitmesh/sessions`
+- `POST /api/gitmesh/sessions/auth`
+- `DELETE /api/gitmesh/sessions/:sessionId`
+
+Mutating routes require `x-gitmesh-admin-token` when
+`GITMESH_WEB_ADMIN_TOKEN` is set, and the web gateway wraps daemon mutations
+with `GITMESHD_ADMIN_TOKEN` when the daemon itself has admin auth enabled. This
+is still a local backend API, not a production browser auth flow.

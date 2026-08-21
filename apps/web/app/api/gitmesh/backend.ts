@@ -1,6 +1,7 @@
 import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { NextRequest, NextResponse } from "next/server";
 
 export type DaemonStatus = {
   ok: boolean;
@@ -20,14 +21,22 @@ export type GatewaySnapshot = {
 const COMMAND_TIMEOUT_MS = 1200;
 const DEFAULT_REPO_ID = "repo:farzeen/gitmesh";
 
+type RequestDaemonOptions = {
+  admin?: boolean;
+};
+
 export function daemonSocketPath() {
   return process.env.GITMESHD_SOCKET ?? path.join(tmpdir(), "gitmeshd.sock");
 }
 
-export async function requestDaemon(command: string): Promise<DaemonStatus> {
+export async function requestDaemon(
+  command: string,
+  options: RequestDaemonOptions = {}
+): Promise<DaemonStatus> {
   const socketPath = daemonSocketPath();
+  const daemonCommand = options.admin ? adminWrap(command) : command;
   try {
-    const raw = await sendLine(socketPath, `${command}\n`);
+    const raw = await sendLine(socketPath, `${daemonCommand}\n`);
     const ok = raw.startsWith("OK ");
     return {
       ok,
@@ -44,6 +53,74 @@ export async function requestDaemon(command: string): Promise<DaemonStatus> {
       socketPath,
       error: error instanceof Error ? error.message : "daemon request failed"
     };
+  }
+}
+
+export function daemonJson<T extends { ok: boolean }>(response: T, successStatus = 200) {
+  return NextResponse.json(response, { status: response.ok ? successStatus : 503 });
+}
+
+export function requireMutationAuth(request: NextRequest) {
+  const expected = process.env.GITMESH_WEB_ADMIN_TOKEN;
+  if (!expected) {
+    return null;
+  }
+  const actual = request.headers.get("x-gitmesh-admin-token");
+  if (actual === expected) {
+    return null;
+  }
+  return NextResponse.json(
+    { ok: false, error: "mutation requires x-gitmesh-admin-token" },
+    { status: 401 }
+  );
+}
+
+export function safeToken(value: string) {
+  return value.length > 0 && !/\s/.test(value);
+}
+
+export function safeAccountToken(value: string) {
+  return /^[A-Za-z0-9._-]+$/.test(value);
+}
+
+export function encodeTextArg(value: string | undefined) {
+  if (!value) {
+    return "-";
+  }
+  return Buffer.from(value, "utf8").toString("hex");
+}
+
+export function encodeOptionalTextArg(value: unknown) {
+  if (typeof value !== "string") {
+    return "keep";
+  }
+  return encodeTextArg(value);
+}
+
+export function decodeHexField(value: string | undefined) {
+  if (!value) {
+    return "";
+  }
+  return Buffer.from(value, "hex").toString("utf8");
+}
+
+export function profileFromFields(fields: Record<string, string>) {
+  return {
+    username: fields.username,
+    account: fields.account,
+    displayName: decodeHexField(fields.display_hex),
+    bio: decodeHexField(fields.bio_hex),
+    avatarUri: decodeHexField(fields.avatar_hex),
+    createdAt: fields.created_at ? Number(fields.created_at) : null,
+    updatedAt: fields.updated_at ? Number(fields.updated_at) : null
+  };
+}
+
+export async function readJsonBody(request: NextRequest) {
+  try {
+    return (await request.json()) as Record<string, unknown>;
+  } catch {
+    return {};
   }
 }
 
@@ -66,6 +143,11 @@ export function parseRefs(value: string | undefined) {
     const [name, oid] = entry.split(":");
     return { name, oid };
   });
+}
+
+function adminWrap(command: string) {
+  const token = process.env.GITMESHD_ADMIN_TOKEN;
+  return token ? `AUTH ${token} ${command}` : command;
 }
 
 function sendLine(socketPath: string, line: string) {
