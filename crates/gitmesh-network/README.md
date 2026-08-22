@@ -17,6 +17,9 @@ Currently implemented:
 - `NetworkTransport`
 - `InMemoryPeer`
 - `InMemorySwarm`
+- `PlacementPolicy`
+- `PlacementPlan`
+- deterministic shard placement over qualified storage descriptors
 
 This is the V0 testable P2P architecture boundary, not production libp2p yet.
 The purpose is to make core storage flows depend on an explicit transport
@@ -30,15 +33,17 @@ The in-memory swarm supports:
 - shard integrity verification before store/fetch success
 - provider publication and lease expiry
 - provider discovery through the availability protocol
+- placement across qualified storage peers with operator and region constraints
 
 `gitmesh-storage` now uses this boundary for a round-trip test:
 
 1. encrypt plaintext into a segment
 2. erasure-code ciphertext into shards
-3. send shards to storage peers through `NetworkTransport`
-4. fetch enough shards back from provider records
-5. reconstruct ciphertext
-6. decrypt exactly to the original plaintext
+3. plan placement across independent storage operators
+4. send shards to storage peers through `NetworkTransport`
+5. fetch enough shards back from provider records
+6. reconstruct ciphertext
+7. decrypt exactly to the original plaintext
 
 The later libp2p implementation should implement `NetworkTransport` or a
 compatible async form of it, while preserving these request/response semantics.

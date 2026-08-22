@@ -11,8 +11,9 @@ use gitmesh_crypto::{
     encrypt_segment as crypto_encrypt_segment,
 };
 use gitmesh_network::{
-    InMemoryAvailabilityDirectory, NetworkRequest, NetworkResponse, NetworkTransport, NodeRole,
-    OperatorId, PeerId, ProviderLease, ShardEnvelope, ShardProviderRecord,
+    InMemoryAvailabilityDirectory, NetworkRequest, NetworkResponse, NetworkTransport,
+    NodeDescriptor, NodeRole, OperatorId, PeerId, PlacementPlan, PlacementPolicy, ProviderLease,
+    ShardEnvelope, ShardProviderRecord, plan_shard_placement,
 };
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use thiserror::Error;
@@ -512,6 +513,62 @@ pub fn distribute_shards_via_transport<T: NetworkTransport>(
     Ok(providers)
 }
 
+pub fn distribute_shards_with_plan<T: NetworkTransport>(
+    transport: &mut T,
+    client_peer: &PeerId,
+    plan: &PlacementPlan,
+    shards: &[Shard],
+    lease_epoch: u64,
+    expires_at_unix: u64,
+) -> Result<Vec<ShardProviderRecord>> {
+    if plan.assignments.len() < shards.len() {
+        return Err(StorageError::NotEnoughShards {
+            available: plan.assignments.len(),
+            required: shards.len(),
+        });
+    }
+    let peers = plan
+        .assignments
+        .iter()
+        .take(shards.len())
+        .map(|assignment| assignment.peer_id.clone())
+        .collect::<Vec<_>>();
+    let mut providers = distribute_shards_via_transport(
+        transport,
+        client_peer,
+        &peers,
+        shards,
+        lease_epoch,
+        expires_at_unix,
+    )?;
+    for (provider, assignment) in providers.iter_mut().zip(&plan.assignments) {
+        provider.operator_id = assignment.operator_id.clone();
+    }
+    Ok(providers)
+}
+
+pub fn plan_and_distribute_shards<T: NetworkTransport>(
+    transport: &mut T,
+    client_peer: &PeerId,
+    descriptors: impl IntoIterator<Item = NodeDescriptor>,
+    placement_policy: &PlacementPolicy,
+    shards: &[Shard],
+    lease_epoch: u64,
+    expires_at_unix: u64,
+) -> Result<(PlacementPlan, Vec<ShardProviderRecord>)> {
+    let plan = plan_shard_placement(descriptors, placement_policy)
+        .map_err(|err| StorageError::Network(err.to_string()))?;
+    let providers = distribute_shards_with_plan(
+        transport,
+        client_peer,
+        &plan,
+        shards,
+        lease_epoch,
+        expires_at_unix,
+    )?;
+    Ok((plan, providers))
+}
+
 pub fn fetch_shards_via_transport<T: NetworkTransport>(
     transport: &mut T,
     client_peer: &PeerId,
@@ -719,6 +776,68 @@ mod tests {
 
         assert_eq!(providers.len(), policy.total_shards());
         assert_eq!(fetched.len(), policy.data_shards);
+        assert_eq!(recovered, plaintext);
+    }
+
+    #[test]
+    fn plans_independent_placement_before_network_distribution() {
+        let plaintext = b"placement should choose independent storage operators before transfer";
+        let storage_policy = StoragePolicy {
+            data_shards: 3,
+            parity_shards: 2,
+        };
+        let placement_policy = PlacementPolicy::new(
+            storage_policy.total_shards(),
+            storage_policy.total_shards(),
+            2,
+            true,
+        )
+        .unwrap();
+        let encrypted = encrypt_segment(plaintext).unwrap();
+        let shards = erasure_encode(&encrypted, &storage_policy).unwrap();
+        let client = PeerId::new("client-a").unwrap();
+        let mut swarm = InMemorySwarm::default();
+        swarm
+            .add_peer(InMemoryPeer::new(client_descriptor("client-a").unwrap()))
+            .unwrap();
+        for index in 0..storage_policy.total_shards() {
+            let peer = format!("storage-{index}");
+            let operator = format!("operator-{index}");
+            let region = if index % 2 == 0 { "iad" } else { "sfo" };
+            swarm
+                .add_peer(InMemoryPeer::new(
+                    storage_descriptor(&peer, &operator, region).unwrap(),
+                ))
+                .unwrap();
+        }
+
+        let descriptors = swarm.descriptors();
+        let (plan, providers) = plan_and_distribute_shards(
+            &mut swarm,
+            &client,
+            descriptors,
+            &placement_policy,
+            &shards,
+            1,
+            1_000,
+        )
+        .unwrap();
+        let fetched = fetch_shards_via_transport(
+            &mut swarm,
+            &client,
+            &providers[..storage_policy.data_shards],
+            100,
+        )
+        .unwrap();
+        let ciphertext = reconstruct_ciphertext(&encrypted, &storage_policy, &fetched).unwrap();
+        let recovered = decrypt_segment(&encrypted, &ciphertext).unwrap();
+
+        assert_eq!(
+            plan.distinct_operator_count(),
+            storage_policy.total_shards()
+        );
+        assert_eq!(plan.distinct_region_count(), 2);
+        assert_eq!(providers.len(), storage_policy.total_shards());
         assert_eq!(recovered, plaintext);
     }
 }

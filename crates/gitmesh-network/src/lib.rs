@@ -326,6 +326,128 @@ impl InMemoryAvailabilityDirectory {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlacementPolicy {
+    pub shard_count: usize,
+    pub min_distinct_operators: usize,
+    pub min_distinct_regions: usize,
+    pub require_distinct_operator_per_shard: bool,
+}
+
+impl PlacementPolicy {
+    pub fn new(
+        shard_count: usize,
+        min_distinct_operators: usize,
+        min_distinct_regions: usize,
+        require_distinct_operator_per_shard: bool,
+    ) -> Result<Self, NetworkError> {
+        if shard_count == 0
+            || min_distinct_operators == 0
+            || min_distinct_regions == 0
+            || min_distinct_operators > shard_count
+            || min_distinct_regions > shard_count
+        {
+            return Err(NetworkError::InvalidPlacementPolicy);
+        }
+        Ok(Self {
+            shard_count,
+            min_distinct_operators,
+            min_distinct_regions,
+            require_distinct_operator_per_shard,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlacementAssignment {
+    pub shard_index: usize,
+    pub peer_id: PeerId,
+    pub operator_id: OperatorId,
+    pub region: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlacementPlan {
+    pub assignments: Vec<PlacementAssignment>,
+}
+
+impl PlacementPlan {
+    pub fn peers(&self) -> Vec<PeerId> {
+        self.assignments
+            .iter()
+            .map(|assignment| assignment.peer_id.clone())
+            .collect()
+    }
+
+    pub fn distinct_operator_count(&self) -> usize {
+        self.assignments
+            .iter()
+            .map(|assignment| assignment.operator_id.clone())
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+
+    pub fn distinct_region_count(&self) -> usize {
+        self.assignments
+            .iter()
+            .map(|assignment| assignment.region.clone())
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+}
+
+pub fn plan_shard_placement(
+    descriptors: impl IntoIterator<Item = NodeDescriptor>,
+    policy: &PlacementPolicy,
+) -> Result<PlacementPlan, NetworkError> {
+    let mut candidates = descriptors
+        .into_iter()
+        .filter(|descriptor| {
+            descriptor.has_role(NodeRole::Storage)
+                && descriptor.protocols.contains(&ProtocolId::ShardTransferV0)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.peer_id.cmp(&right.peer_id));
+
+    let mut assignments = Vec::with_capacity(policy.shard_count);
+    let mut used_peers = BTreeSet::new();
+    let mut used_operators = BTreeSet::new();
+    let mut used_regions = BTreeSet::new();
+
+    for descriptor in &candidates {
+        if assignments.len() == policy.shard_count {
+            break;
+        }
+        if used_peers.contains(&descriptor.peer_id) {
+            continue;
+        }
+        if policy.require_distinct_operator_per_shard
+            && used_operators.contains(&descriptor.operator_id)
+        {
+            continue;
+        }
+        let shard_index = assignments.len();
+        used_peers.insert(descriptor.peer_id.clone());
+        used_operators.insert(descriptor.operator_id.clone());
+        used_regions.insert(descriptor.region.clone());
+        assignments.push(PlacementAssignment {
+            shard_index,
+            peer_id: descriptor.peer_id.clone(),
+            operator_id: descriptor.operator_id.clone(),
+            region: descriptor.region.clone(),
+        });
+    }
+
+    if assignments.len() < policy.shard_count
+        || used_operators.len() < policy.min_distinct_operators
+        || used_regions.len() < policy.min_distinct_regions
+    {
+        return Err(NetworkError::InsufficientStoragePeers);
+    }
+
+    Ok(PlacementPlan { assignments })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NetworkRequest {
     Ping,
     PublishProvider(ShardProviderRecord),
@@ -516,6 +638,13 @@ impl InMemorySwarm {
             .map(|peer| peer.descriptor.peer_id.clone())
             .collect()
     }
+
+    pub fn descriptors(&self) -> Vec<NodeDescriptor> {
+        self.peers
+            .values()
+            .map(|peer| peer.descriptor.clone())
+            .collect()
+    }
 }
 
 impl NetworkTransport for InMemorySwarm {
@@ -589,6 +718,10 @@ pub enum NetworkError {
     UnsupportedProtocol,
     #[error("shard not found")]
     ShardNotFound,
+    #[error("invalid placement policy")]
+    InvalidPlacementPolicy,
+    #[error("not enough qualified independent storage peers")]
+    InsufficientStoragePeers,
 }
 
 #[cfg(test)]
@@ -815,5 +948,45 @@ mod tests {
         };
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].peer_id, PeerId::new("storage-a").unwrap());
+    }
+
+    #[test]
+    fn placement_selects_distinct_storage_operators_and_regions() {
+        let descriptors = vec![
+            storage_descriptor("storage-a", "operator-a", "iad").unwrap(),
+            storage_descriptor("storage-b", "operator-b", "sfo").unwrap(),
+            storage_descriptor("storage-c", "operator-c", "fra").unwrap(),
+            storage_descriptor("storage-d", "operator-c", "fra").unwrap(),
+            client_descriptor("client-a").unwrap(),
+        ];
+        let policy = PlacementPolicy::new(3, 3, 2, true).unwrap();
+
+        let plan = plan_shard_placement(descriptors, &policy).unwrap();
+
+        assert_eq!(plan.assignments.len(), 3);
+        assert_eq!(plan.distinct_operator_count(), 3);
+        assert_eq!(plan.distinct_region_count(), 3);
+        assert_eq!(
+            plan.peers(),
+            vec![
+                PeerId::new("storage-a").unwrap(),
+                PeerId::new("storage-b").unwrap(),
+                PeerId::new("storage-c").unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn placement_rejects_insufficient_independent_operators() {
+        let descriptors = vec![
+            storage_descriptor("storage-a", "operator-a", "iad").unwrap(),
+            storage_descriptor("storage-b", "operator-a", "sfo").unwrap(),
+            storage_descriptor("storage-c", "operator-a", "fra").unwrap(),
+        ];
+        let policy = PlacementPolicy::new(3, 3, 2, true).unwrap();
+
+        let err = plan_shard_placement(descriptors, &policy).unwrap_err();
+
+        assert_eq!(err, NetworkError::InsufficientStoragePeers);
     }
 }
