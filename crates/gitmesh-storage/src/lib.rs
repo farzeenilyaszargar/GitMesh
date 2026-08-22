@@ -11,7 +11,7 @@ use gitmesh_crypto::{
     encrypt_segment as crypto_encrypt_segment,
 };
 use gitmesh_network::{
-    InMemoryAvailabilityDirectory, NetworkRequest, NetworkResponse, NetworkTransport,
+    InMemoryAvailabilityDirectory, NetworkError, NetworkRequest, NetworkResponse, NetworkTransport,
     NodeDescriptor, NodeRole, OperatorId, PeerId, PlacementPlan, PlacementPolicy, ProviderLease,
     ShardEnvelope, ShardProviderRecord, ShardRef, plan_shard_placement,
 };
@@ -268,6 +268,7 @@ pub struct TransportRepairRequest<'a> {
     pub segment: &'a EncryptedSegment,
     pub policy: &'a StoragePolicy,
     pub providers: &'a [ShardProviderRecord],
+    pub replacement_descriptors: &'a [NodeDescriptor],
     pub now_unix: u64,
     pub lease_epoch: u64,
     pub expires_at_unix: u64,
@@ -774,7 +775,20 @@ pub fn audit_shards_via_transport<T: NetworkTransport>(
                 &provider.peer_id,
                 NetworkRequest::AuditShard { shard_ref },
             )
-            .map_err(|err| StorageError::Network(err.to_string()))?;
+            .or_else(|err| match err {
+                NetworkError::UnknownPeer | NetworkError::ShardNotFound => {
+                    Ok(NetworkResponse::ShardAudit {
+                        shard_ref: ShardRef {
+                            segment_cid: provider.segment_cid,
+                            shard_cid: provider.shard_cid,
+                            shard_index: provider.shard_index,
+                        },
+                        present: false,
+                        valid: false,
+                    })
+                }
+                err => Err(StorageError::Network(err.to_string())),
+            })?;
         let NetworkResponse::ShardAudit { present, valid, .. } = response else {
             return Err(StorageError::Network(
                 "unexpected response to AuditShard".to_string(),
@@ -813,6 +827,81 @@ pub fn audit_shards_via_transport<T: NetworkTransport>(
         durability_satisfied,
         repair_needed,
     })
+}
+
+fn choose_repair_target(
+    providers_after_repair: &[ShardProviderRecord],
+    fallback_provider: &ShardProviderRecord,
+    replacement_descriptors: &[NodeDescriptor],
+) -> ShardProviderRecord {
+    let used_peers = providers_after_repair
+        .iter()
+        .map(|provider| provider.peer_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let used_operators = providers_after_repair
+        .iter()
+        .map(|provider| provider.operator_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    replacement_descriptors
+        .iter()
+        .filter(|descriptor| {
+            descriptor.has_role(NodeRole::Storage)
+                && descriptor
+                    .protocols
+                    .contains(&gitmesh_network::ProtocolId::ShardTransferV0)
+                && !used_peers.contains(&descriptor.peer_id)
+        })
+        .min_by_key(|descriptor| {
+            (
+                used_operators.contains(&descriptor.operator_id),
+                descriptor.peer_id.clone(),
+            )
+        })
+        .map(|descriptor| {
+            let mut provider = fallback_provider.clone();
+            provider.peer_id = descriptor.peer_id.clone();
+            provider.operator_id = descriptor.operator_id.clone();
+            provider.roles = descriptor.roles.clone();
+            provider
+        })
+        .unwrap_or_else(|| fallback_provider.clone())
+}
+
+fn store_repaired_shard<T: NetworkTransport>(
+    transport: &mut T,
+    client_peer: &PeerId,
+    provider: &ShardProviderRecord,
+    shard: &Shard,
+    lease_epoch: u64,
+    expires_at_unix: u64,
+) -> Result<ShardProviderRecord> {
+    let response = transport
+        .request(
+            client_peer,
+            &provider.peer_id,
+            NetworkRequest::PutShard {
+                envelope: shard.to_network_envelope()?,
+                lease_epoch,
+                expires_at_unix,
+            },
+        )
+        .map_err(|err| StorageError::Network(err.to_string()))?;
+    let NetworkResponse::ShardStored { shard_ref } = response else {
+        return Err(StorageError::Network(
+            "unexpected response to PutShard during repair".to_string(),
+        ));
+    };
+    Ok(ShardProviderRecord::new(
+        shard_ref.segment_cid,
+        shard_ref.shard_cid,
+        shard_ref.shard_index,
+        provider.peer_id.clone(),
+        provider.operator_id.clone(),
+        provider.roles.clone(),
+        ProviderLease::new(lease_epoch, expires_at_unix)
+            .map_err(|err| StorageError::Network(err.to_string()))?,
+    ))
 }
 
 pub fn repair_shards_via_transport<T: NetworkTransport>(
@@ -874,6 +963,11 @@ pub fn repair_shards_via_transport<T: NetworkTransport>(
         .chain(&audit_before.corrupt_shards)
         .copied()
         .collect::<std::collections::BTreeSet<_>>();
+    let missing_targets = audit_before
+        .missing_shards
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
     let mut providers_after_repair = request.providers.to_vec();
     let mut repaired_shards = Vec::new();
 
@@ -884,32 +978,56 @@ pub fn repair_shards_via_transport<T: NetworkTransport>(
         let shard = rebuilt_shards
             .get(shard_index)
             .ok_or(StorageError::InvalidShardIndex(shard_index))?;
-        let response = transport
-            .request(
-                request.client_peer,
-                &target_provider.peer_id,
-                NetworkRequest::PutShard {
-                    envelope: shard.to_network_envelope()?,
-                    lease_epoch: request.lease_epoch,
-                    expires_at_unix: request.expires_at_unix,
-                },
+        let preferred_provider = if missing_targets.contains(&shard_index) {
+            choose_repair_target(
+                &providers_after_repair,
+                target_provider,
+                request.replacement_descriptors,
             )
-            .map_err(|err| StorageError::Network(err.to_string()))?;
-        let NetworkResponse::ShardStored { shard_ref } = response else {
-            return Err(StorageError::Network(
-                "unexpected response to PutShard during repair".to_string(),
-            ));
+        } else {
+            target_provider.clone()
         };
-        let repaired_provider = ShardProviderRecord::new(
-            shard_ref.segment_cid,
-            shard_ref.shard_cid,
-            shard_ref.shard_index,
-            target_provider.peer_id.clone(),
-            target_provider.operator_id.clone(),
-            target_provider.roles.clone(),
-            ProviderLease::new(request.lease_epoch, request.expires_at_unix)
-                .map_err(|err| StorageError::Network(err.to_string()))?,
-        );
+        let repaired_provider = match store_repaired_shard(
+            transport,
+            request.client_peer,
+            &preferred_provider,
+            shard,
+            request.lease_epoch,
+            request.expires_at_unix,
+        ) {
+            Ok(provider) => provider,
+            Err(StorageError::Network(_))
+                if preferred_provider.peer_id != target_provider.peer_id =>
+            {
+                store_repaired_shard(
+                    transport,
+                    request.client_peer,
+                    target_provider,
+                    shard,
+                    request.lease_epoch,
+                    request.expires_at_unix,
+                )?
+            }
+            Err(err) if !request.replacement_descriptors.is_empty() => {
+                let replacement_provider = choose_repair_target(
+                    &providers_after_repair,
+                    target_provider,
+                    request.replacement_descriptors,
+                );
+                if replacement_provider.peer_id == target_provider.peer_id {
+                    return Err(err);
+                }
+                store_repaired_shard(
+                    transport,
+                    request.client_peer,
+                    &replacement_provider,
+                    shard,
+                    request.lease_epoch,
+                    request.expires_at_unix,
+                )?
+            }
+            Err(err) => return Err(err),
+        };
         if let Some(existing) = providers_after_repair
             .iter_mut()
             .find(|provider| provider.shard_index == shard_index)
@@ -1387,6 +1505,7 @@ mod tests {
                 segment: &encrypted,
                 policy: &storage_policy,
                 providers: &providers,
+                replacement_descriptors: &[],
                 now_unix: 100,
                 lease_epoch: 2,
                 expires_at_unix: 2_000,
@@ -1415,6 +1534,95 @@ mod tests {
         );
         assert!(!outcome.audit_after.repair_needed);
         assert!(outcome.durability_satisfied);
+        assert_eq!(recovered, plaintext);
+    }
+
+    #[test]
+    fn transport_repair_uses_replacement_peer_when_provider_disappears() {
+        let plaintext = b"transport repair should move a shard when its provider disappears";
+        let storage_policy = StoragePolicy {
+            data_shards: 3,
+            parity_shards: 2,
+        };
+        let placement_policy =
+            PlacementPolicy::new(storage_policy.total_shards(), 5, 2, true).unwrap();
+        let encrypted = encrypt_segment(plaintext).unwrap();
+        let shards = erasure_encode(&encrypted, &storage_policy).unwrap();
+        let client = PeerId::new("client-a").unwrap();
+        let directory = PeerId::new("directory-a").unwrap();
+        let mut swarm = InMemorySwarm::default();
+        swarm
+            .add_peer(InMemoryPeer::new(client_descriptor("client-a").unwrap()))
+            .unwrap();
+        swarm
+            .add_peer(InMemoryPeer::new(directory_descriptor("directory-a")))
+            .unwrap();
+        for index in 0..=storage_policy.total_shards() {
+            let peer = format!("storage-{index}");
+            let operator = format!("operator-{index}");
+            let region = if index % 2 == 0 { "iad" } else { "sfo" };
+            swarm
+                .add_peer(InMemoryPeer::new(
+                    storage_descriptor(&peer, &operator, region).unwrap(),
+                ))
+                .unwrap();
+        }
+
+        let descriptors = swarm.descriptors();
+        let (_plan, providers) = plan_and_distribute_shards(
+            &mut swarm,
+            &client,
+            descriptors.clone(),
+            &placement_policy,
+            &shards,
+            1,
+            1_000,
+        )
+        .unwrap();
+        publish_providers_via_transport(&mut swarm, &client, &directory, &providers).unwrap();
+        let vanished_provider = providers[3].clone();
+        swarm.remove_peer(&vanished_provider.peer_id).unwrap();
+
+        let outcome = repair_shards_via_transport(
+            &mut swarm,
+            TransportRepairRequest {
+                client_peer: &client,
+                directory_peer: Some(&directory),
+                segment: &encrypted,
+                policy: &storage_policy,
+                providers: &providers,
+                replacement_descriptors: &descriptors,
+                now_unix: 100,
+                lease_epoch: 2,
+                expires_at_unix: 2_000,
+            },
+        )
+        .unwrap();
+        let replacement_provider = outcome
+            .providers_after_repair
+            .iter()
+            .find(|provider| provider.shard_index == vanished_provider.shard_index)
+            .unwrap();
+        let discovered =
+            discover_providers_via_transport(&mut swarm, &client, &directory, encrypted.cid, 1_500)
+                .unwrap();
+        let fetched = fetch_shards_via_transport(
+            &mut swarm,
+            &client,
+            &discovered[..storage_policy.data_shards],
+            1_500,
+        )
+        .unwrap();
+        let ciphertext = reconstruct_ciphertext(&encrypted, &storage_policy, &fetched).unwrap();
+        let recovered = decrypt_segment(&encrypted, &ciphertext).unwrap();
+
+        assert_eq!(outcome.repaired_shards, vec![3]);
+        assert_eq!(outcome.audit_before.missing_shards, vec![3]);
+        assert_ne!(replacement_provider.peer_id, vanished_provider.peer_id);
+        assert_eq!(
+            replacement_provider.peer_id,
+            PeerId::new("storage-5").unwrap()
+        );
         assert_eq!(recovered, plaintext);
     }
 
@@ -1469,6 +1677,7 @@ mod tests {
                 segment: &encrypted,
                 policy: &storage_policy,
                 providers: &providers,
+                replacement_descriptors: &[],
                 now_unix: 100,
                 lease_epoch: 2,
                 expires_at_unix: 2_000,

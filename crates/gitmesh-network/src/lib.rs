@@ -628,6 +628,10 @@ impl InMemorySwarm {
         self.peers.get(peer_id)
     }
 
+    pub fn remove_peer(&mut self, peer_id: &PeerId) -> Result<InMemoryPeer, NetworkError> {
+        self.peers.remove(peer_id).ok_or(NetworkError::UnknownPeer)
+    }
+
     pub fn peer_count(&self) -> usize {
         self.peers.len()
     }
