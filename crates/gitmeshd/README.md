@@ -60,11 +60,17 @@ storage spine. It stores a blob as encrypted erasure-coded shards, publishes
 providers, removes a storage provider, repairs the missing shard to a
 replacement peer, and verifies that the original Git object is recovered exactly.
 
-The Next.js web app exposes read-only gateway routes under `/api/gitmesh/*`.
-Those routes translate HTTP JSON requests into local `gitmeshd` socket reads for
-health, status, refs, and key grants. Account/session infrastructure is exposed
-through server-side JSON routes for local development:
+The Next.js web app exposes gateway routes under `/api/gitmesh/*`. Those routes
+translate HTTP JSON requests into local `gitmeshd` socket reads for health,
+status, refs, key grants, and the network repair proof. Account/session
+infrastructure is exposed through server-side JSON routes for local development:
 
+- `GET /api/gitmesh/health`
+- `GET /api/gitmesh/status`
+- `GET /api/gitmesh/refs`
+- `GET /api/gitmesh/key-grants`
+- `GET /api/gitmesh/network-repair-proof`
+- `POST /api/gitmesh/network-repair-proof`
 - `GET /api/gitmesh/accounts`
 - `POST /api/gitmesh/accounts`
 - `GET /api/gitmesh/accounts/:username`

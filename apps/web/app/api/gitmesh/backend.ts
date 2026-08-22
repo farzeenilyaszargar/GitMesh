@@ -104,6 +104,20 @@ export function decodeHexField(value: string | undefined) {
   return Buffer.from(value, "hex").toString("utf8");
 }
 
+export function safeDaemonText(value: string) {
+  return value.length <= 4096 && !/[\r\n]/.test(value);
+}
+
+export function parseNumberList(value: string | undefined) {
+  if (!value) {
+    return [];
+  }
+  return value
+    .split(",")
+    .filter(Boolean)
+    .map((entry) => Number(entry));
+}
+
 export function profileFromFields(fields: Record<string, string>) {
   return {
     username: fields.username,
