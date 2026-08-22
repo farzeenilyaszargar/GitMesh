@@ -390,6 +390,14 @@ impl DaemonState {
             return self.repo_register(rest);
         }
 
+        if let Some(owner) = trimmed.strip_prefix("REPO_LIST ") {
+            return self.repo_list(owner);
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("REPO_GET ") {
+            return self.repo_get(rest);
+        }
+
         if trimmed == "ACCOUNT_STATUS" {
             return Ok(DaemonResponse::Ok(format_account_status(&self.accounts)?));
         }
@@ -877,6 +885,31 @@ impl DaemonState {
         let response = format_repository_registration(registration);
         self.save_accounts()?;
         Ok(DaemonResponse::Ok(response))
+    }
+
+    fn repo_list(&self, owner: &str) -> Result<DaemonResponse> {
+        let owner = Username::new(owner.trim())?;
+        Ok(DaemonResponse::Ok(format_repository_list(
+            owner.as_str(),
+            &self.accounts.repositories_for_owner(&owner),
+        )))
+    }
+
+    fn repo_get(&self, rest: &str) -> Result<DaemonResponse> {
+        let parts = rest.split_whitespace().collect::<Vec<_>>();
+        if parts.len() != 2 {
+            return Err(DaemonError::InvalidCommand(
+                "REPO_GET requires <owner> <name>".to_string(),
+            ));
+        }
+        let owner = Username::new(parts[0])?;
+        let registration = self
+            .accounts
+            .repository(&owner, parts[1])
+            .ok_or(gitmesh_accounts::AccountError::InvalidRepositoryName)?;
+        Ok(DaemonResponse::Ok(format_repository_registration(
+            registration,
+        )))
     }
 
     fn save_objects(&self) -> Result<()> {
@@ -1734,6 +1767,32 @@ fn format_repository_registration(
     )
 }
 
+fn format_repository_list(
+    owner: &str,
+    registrations: &[&gitmesh_accounts::RepositoryRegistration],
+) -> String {
+    if registrations.is_empty() {
+        return format!("owner={owner} repos=none count=0");
+    }
+    let entries = registrations
+        .iter()
+        .map(|registration| {
+            format!(
+                "{};{};{};{}",
+                registration.name,
+                registration.repo_id,
+                registration.visibility.as_str(),
+                registration.created_at_unix
+            )
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "owner={owner} repos={} count={}",
+        entries.join("|"),
+        registrations.len()
+    )
+}
+
 fn format_account_status(accounts: &AccountStore) -> Result<String> {
     Ok(format!(
         "accounts={} active_sessions={} registered_repos={}",
@@ -2097,6 +2156,20 @@ mod tests {
         assert!(repo.contains("repo=repo:farzeen/gitmesh"));
         assert!(status.contains("accounts=1"));
         assert!(status.contains("registered_repos=1"));
+        assert!(
+            state
+                .handle_command("REPO_LIST farzeen")
+                .unwrap()
+                .into_line()
+                .contains("repos=GitMesh;repo:farzeen/gitmesh;private;")
+        );
+        assert!(
+            state
+                .handle_command("REPO_GET farzeen GitMesh")
+                .unwrap()
+                .into_line()
+                .contains("name=GitMesh")
+        );
         assert!(revoke.contains("revoked=true"));
         assert!(
             state
@@ -2135,11 +2208,17 @@ mod tests {
             .handle_command("ACCOUNT_PROFILE farzeen")
             .unwrap()
             .into_line();
+        let repos = restored
+            .handle_command("REPO_LIST farzeen")
+            .unwrap()
+            .into_line();
         let _ = fs::remove_file(path);
 
         assert!(status.contains("accounts=1"));
         assert!(status.contains("registered_repos=1"));
         assert!(profile.contains("username=farzeen"));
+        assert!(repos.contains("count=1"));
+        assert!(repos.contains("GitMesh;repo:farzeen/gitmesh;private;"));
     }
 
     #[cfg(unix)]

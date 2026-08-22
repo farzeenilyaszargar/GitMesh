@@ -32,6 +32,7 @@ Implemented command families:
 - `gm object import-pack [socket] <pack-file>`
 - `gm object export-pack [socket] <pack-file>`
 - `gm object status [socket]`
+- `gm account repos [socket] <owner>`
 - `gm proof [payload...]`
 
 Repository creation persists local manifests to `~/.gitmesh/gm-state.tsv` by

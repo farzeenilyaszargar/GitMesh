@@ -130,6 +130,22 @@ export function profileFromFields(fields: Record<string, string>) {
   };
 }
 
+export function repositoriesFromFields(fields: Record<string, string>) {
+  const value = fields.repos;
+  if (!value || value === "none") {
+    return [];
+  }
+  return value.split("|").filter(Boolean).map((entry) => {
+    const [name, repoId, visibility, createdAt] = entry.split(";");
+    return {
+      name,
+      repoId,
+      visibility,
+      createdAt: createdAt ? Number(createdAt) : null
+    };
+  });
+}
+
 export async function readJsonBody(request: NextRequest) {
   try {
     return (await request.json()) as Record<string, unknown>;

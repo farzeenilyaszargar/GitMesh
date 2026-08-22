@@ -1385,6 +1385,18 @@ fn account(args: &[String]) -> Result<(), GmError> {
             );
             Ok(())
         }
+        Some("repos") => {
+            let socket_path = args.get(1).map_or_else(default_socket_path, Into::into);
+            let owner = args.get(2).ok_or_else(|| {
+                GmError::InvalidArguments("account repos requires an owner".to_string())
+            })?;
+            validate_account_token(owner, "owner")?;
+            println!(
+                "{}",
+                request_unix_socket(socket_path, &format!("REPO_LIST {owner}"))?
+            );
+            Ok(())
+        }
         Some("status") | None => {
             let socket_path = args.get(1).map_or_else(default_socket_path, Into::into);
             println!("{}", request_unix_socket(socket_path, "ACCOUNT_STATUS")?);
@@ -1677,6 +1689,7 @@ fn print_help() {
         "  account update [socket] <username> [display-name|keep] [bio|keep] [avatar-uri|keep]"
     );
     println!("  account register-repo [socket] <owner> <name> <repo-id> [public|private]");
+    println!("  account repos [socket] <owner>");
     println!("  account status [socket]");
     println!("  session issue [socket] <username> [ttl-seconds] [device-id|none]");
     println!("  session auth [socket] <token>");
