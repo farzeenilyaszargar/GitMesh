@@ -59,6 +59,7 @@ a later auth component.
 Pack import accepts full objects plus OFS-delta and REF-delta entries. Pack
 export currently writes full-object packs for compatibility.
 
-Issue and pull request commands currently read local deterministic sample
-collaboration events. Persistent production auth and full multi-node online
-sync remain future components.
+Issue and pull request commands read daemon collaboration summaries when
+`gitmeshd` has seeded or persisted collaboration events, with deterministic local
+samples as an offline fallback. Persistent production auth and full multi-node
+online sync remain future components.

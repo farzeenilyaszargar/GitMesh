@@ -403,6 +403,7 @@ name = "gitmeshd"
 version = "0.1.0"
 dependencies = [
  "gitmesh-accounts",
+ "gitmesh-collaboration",
  "gitmesh-coordination",
  "gitmesh-crypto",
  "gitmesh-git",

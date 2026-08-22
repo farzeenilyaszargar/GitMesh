@@ -8,7 +8,7 @@ use std::{
 
 use gitmesh_collaboration::{sample_issues, sample_pull_requests};
 use gitmesh_coordination::{RefName, RefUpdate, RepoId, TransactionId};
-use gitmesh_core::hex;
+use gitmesh_core::{Cid, CidKind, HashAlgorithm, hex};
 use gitmesh_crypto::RepoContentKey;
 use gitmesh_git::{GitObjectKind, GitSha1Oid, parse_loose_object, parse_packfile};
 use gitmesh_identity::{AccountRootKey, DevIdentity, DeviceKey, short_id};
@@ -832,10 +832,104 @@ fn response_field<'a>(response: &'a str, name: &str) -> Option<&'a str> {
         .find_map(|part| part.strip_prefix(&format!("{name}=")))
 }
 
+fn load_issue_summaries() -> Vec<gitmesh_collaboration::IssueSummary> {
+    request_unix_socket(default_socket_path(), "ISSUE_LIST farzeen/gitmesh")
+        .ok()
+        .and_then(|response| parse_issue_list_response(&response).ok())
+        .filter(|issues| !issues.is_empty())
+        .unwrap_or_else(sample_issues)
+}
+
+fn load_pull_request_summaries() -> Vec<gitmesh_collaboration::PullRequestSummary> {
+    request_unix_socket(default_socket_path(), "PR_LIST farzeen/gitmesh")
+        .ok()
+        .and_then(|response| parse_pr_list_response(&response).ok())
+        .filter(|pull_requests| !pull_requests.is_empty())
+        .unwrap_or_else(sample_pull_requests)
+}
+
+fn parse_issue_list_response(
+    response: &str,
+) -> Result<Vec<gitmesh_collaboration::IssueSummary>, GmError> {
+    let value = response
+        .strip_prefix("OK ")
+        .and_then(|_| response_field(response, "issues"))
+        .ok_or_else(|| GmError::DaemonResponse(response.to_string()))?;
+    if value == "none" {
+        return Ok(Vec::new());
+    }
+    value
+        .split('|')
+        .map(|entry| {
+            let parts = entry.split(';').collect::<Vec<_>>();
+            if parts.len() != 5 {
+                return Err(GmError::DaemonResponse(response.to_string()));
+            }
+            Ok(gitmesh_collaboration::IssueSummary {
+                number: parse_number(parts[0], "issue")?,
+                title: decode_hex_text(parts[1])?,
+                actor: parts[2].to_string(),
+                labels: decode_hex_text_list(parts[3])?,
+                event_id: parse_protocol_cid_digest(parts[4])?,
+            })
+        })
+        .collect()
+}
+
+fn parse_pr_list_response(
+    response: &str,
+) -> Result<Vec<gitmesh_collaboration::PullRequestSummary>, GmError> {
+    let value = response
+        .strip_prefix("OK ")
+        .and_then(|_| response_field(response, "prs"))
+        .ok_or_else(|| GmError::DaemonResponse(response.to_string()))?;
+    if value == "none" {
+        return Ok(Vec::new());
+    }
+    value
+        .split('|')
+        .map(|entry| {
+            let parts = entry.split(';').collect::<Vec<_>>();
+            if parts.len() != 7 {
+                return Err(GmError::DaemonResponse(response.to_string()));
+            }
+            Ok(gitmesh_collaboration::PullRequestSummary {
+                number: parse_number(parts[0], "pull request")?,
+                title: decode_hex_text(parts[1])?,
+                actor: parts[2].to_string(),
+                source_ref: parts[3].to_string(),
+                target_ref: parts[4].to_string(),
+                labels: decode_hex_text_list(parts[5])?,
+                event_id: parse_protocol_cid_digest(parts[6])?,
+            })
+        })
+        .collect()
+}
+
+fn parse_protocol_cid_digest(value: &str) -> Result<Cid, GmError> {
+    Ok(Cid::from_digest(
+        CidKind::ProtocolObject,
+        HashAlgorithm::Blake3_256,
+        decode_fixed_hex::<32>(value)?,
+    ))
+}
+
+fn decode_hex_text(value: &str) -> Result<String, GmError> {
+    String::from_utf8(decode_hex(value)?)
+        .map_err(|_| GmError::InvalidArguments("invalid UTF-8 text field".to_string()))
+}
+
+fn decode_hex_text_list(value: &str) -> Result<Vec<String>, GmError> {
+    if value == "-" {
+        return Ok(Vec::new());
+    }
+    value.split(',').map(decode_hex_text).collect()
+}
+
 fn issue(args: &[String]) -> Result<(), GmError> {
     match args.first().map(String::as_str) {
         Some("list") | None => {
-            let issues = sample_issues();
+            let issues = load_issue_summaries();
             println!("Showing {} open issues in farzeen/gitmesh", issues.len());
             for issue in issues {
                 println!(
@@ -857,7 +951,7 @@ fn issue(args: &[String]) -> Result<(), GmError> {
                 GmError::InvalidArguments("issue view requires an id".to_string())
             })?;
             let number = parse_number(id, "issue")?;
-            let issue = sample_issues()
+            let issue = load_issue_summaries()
                 .into_iter()
                 .find(|issue| issue.number == number)
                 .ok_or(GmError::NotFound {
@@ -878,7 +972,7 @@ fn issue(args: &[String]) -> Result<(), GmError> {
 fn pr(args: &[String]) -> Result<(), GmError> {
     match args.first().map(String::as_str) {
         Some("list") | None => {
-            let pull_requests = sample_pull_requests();
+            let pull_requests = load_pull_request_summaries();
             println!(
                 "Showing {} open pull requests in farzeen/gitmesh",
                 pull_requests.len()
@@ -898,7 +992,7 @@ fn pr(args: &[String]) -> Result<(), GmError> {
             Ok(())
         }
         Some("status") => {
-            let pull_requests = sample_pull_requests();
+            let pull_requests = load_pull_request_summaries();
             println!("Relevant pull requests in farzeen/gitmesh");
             println!("Current branch: refs/heads/collaboration-cli");
             if let Some(pr) = pull_requests
@@ -918,7 +1012,7 @@ fn pr(args: &[String]) -> Result<(), GmError> {
                 .get(1)
                 .ok_or_else(|| GmError::InvalidArguments("pr view requires an id".to_string()))?;
             let number = parse_number(id, "pull request")?;
-            let pr = sample_pull_requests()
+            let pr = load_pull_request_summaries()
                 .into_iter()
                 .find(|pr| pr.number == number)
                 .ok_or(GmError::NotFound {
@@ -1906,6 +2000,27 @@ mod tests {
             GitSha1Oid::from_str("3b18e512dba79e4c8300dd08aeb37f8e728b8dad").unwrap()
         );
         assert_eq!(parse_ref_list_response("OK refs=none").unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn parses_daemon_issue_and_pr_lists() {
+        let issue_response = "OK repo=farzeen/gitmesh issues=1;5065727369737420636f6c6c61626f726174696f6e206576656e74206c6f6773;farzeen;70726f746f636f6c,636f6c6c61626f726174696f6e;aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa count=1";
+        let pr_response = "OK repo=farzeen/gitmesh prs=1;5769726520676d20636f6c6c61626f726174696f6e20636f6d6d616e6473;farzeen;refs/heads/collaboration-cli;refs/heads/main;636c69;bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb count=1";
+
+        let issues = parse_issue_list_response(issue_response).unwrap();
+        let prs = parse_pr_list_response(pr_response).unwrap();
+
+        assert_eq!(issues[0].number, 1);
+        assert_eq!(issues[0].title, "Persist collaboration event logs");
+        assert_eq!(issues[0].labels, ["protocol", "collaboration"]);
+        assert_eq!(prs[0].title, "Wire gm collaboration commands");
+        assert_eq!(prs[0].source_ref, "refs/heads/collaboration-cli");
+        assert_eq!(prs[0].labels, ["cli"]);
+        assert!(
+            parse_issue_list_response("OK repo=farzeen/gitmesh issues=none count=0")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

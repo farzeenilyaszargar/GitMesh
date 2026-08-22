@@ -17,6 +17,10 @@ use gitmesh_accounts::{
     AccountError, AccountStore, NewAccountProfile, ProfileUpdate, RepositoryVisibility, Username,
     now_unix,
 };
+use gitmesh_collaboration::{
+    CollaborationError, CollaborationEventStore, IssueSummary, PullRequestSummary,
+    sample_issue_events, sample_pull_request_events,
+};
 use gitmesh_coordination::{
     CoordinationError, RefName, RefStore, RefUpdate, RefUpdateActor, RejectionReason, RepoId,
     RepoPolicy, SignedRefUpdate, SignedRefUpdateActor, TransactionId, TransactionReceipt,
@@ -59,6 +63,8 @@ pub enum DaemonError {
     Repository(#[from] RepositoryError),
     #[error("account store failed: {0}")]
     Accounts(#[from] AccountError),
+    #[error("collaboration store failed: {0}")]
+    Collaboration(#[from] CollaborationError),
     #[error("ref target object is not durably stored: {0}")]
     MissingDurableObject(GitSha1Oid),
     #[error("invalid daemon command: {0}")]
@@ -129,11 +135,13 @@ pub struct DaemonState {
     objects: RepositoryObjectStore,
     key_grants: RepoKeyGrantStore,
     accounts: AccountStore,
+    collaboration: CollaborationEventStore,
     object_store_path: Option<PathBuf>,
     ref_store_path: Option<PathBuf>,
     policy_store_path: Option<PathBuf>,
     key_grant_store_path: Option<PathBuf>,
     account_store_path: Option<PathBuf>,
+    collaboration_store_path: Option<PathBuf>,
 }
 
 impl Default for DaemonState {
@@ -145,11 +153,13 @@ impl Default for DaemonState {
             objects: RepositoryObjectStore::default(),
             key_grants: RepoKeyGrantStore::default(),
             accounts: AccountStore::default(),
+            collaboration: CollaborationEventStore::default(),
             object_store_path: None,
             ref_store_path: None,
             policy_store_path: None,
             key_grant_store_path: None,
             account_store_path: None,
+            collaboration_store_path: None,
         }
     }
 }
@@ -194,6 +204,24 @@ impl DaemonState {
         key_grant_store_path: Option<PathBuf>,
         account_store_path: Option<PathBuf>,
     ) -> Result<Self> {
+        Self::with_all_store_paths_and_collaboration(
+            object_store_path,
+            ref_store_path,
+            policy_store_path,
+            key_grant_store_path,
+            account_store_path,
+            None,
+        )
+    }
+
+    pub fn with_all_store_paths_and_collaboration(
+        object_store_path: Option<PathBuf>,
+        ref_store_path: Option<PathBuf>,
+        policy_store_path: Option<PathBuf>,
+        key_grant_store_path: Option<PathBuf>,
+        account_store_path: Option<PathBuf>,
+        collaboration_store_path: Option<PathBuf>,
+    ) -> Result<Self> {
         Ok(Self {
             repo_id: RepoId::new(b"gitmeshd-v0-repo"),
             refs: if let Some(path) = &ref_store_path {
@@ -221,11 +249,17 @@ impl DaemonState {
             } else {
                 AccountStore::default()
             },
+            collaboration: if let Some(path) = &collaboration_store_path {
+                CollaborationEventStore::load_from_path(path)?
+            } else {
+                CollaborationEventStore::default()
+            },
             object_store_path,
             ref_store_path,
             policy_store_path,
             key_grant_store_path,
             account_store_path,
+            collaboration_store_path,
         })
     }
 
@@ -398,13 +432,25 @@ impl DaemonState {
             return self.repo_get(rest);
         }
 
+        if trimmed == "COLLAB_SEED_SAMPLES" {
+            return self.collab_seed_samples();
+        }
+
+        if let Some(repo) = trimmed.strip_prefix("ISSUE_LIST ") {
+            return self.issue_list(repo);
+        }
+
+        if let Some(repo) = trimmed.strip_prefix("PR_LIST ") {
+            return self.pr_list(repo);
+        }
+
         if trimmed == "ACCOUNT_STATUS" {
             return Ok(DaemonResponse::Ok(format_account_status(&self.accounts)?));
         }
 
         if trimmed == "REPO_STATUS" {
             return Ok(DaemonResponse::Ok(format!(
-                "objects={} refs={} mutations={} checkpoints={} key_grants={} revoked_devices={} accounts={} active_sessions={} registered_repos={} data_shards={} parity_shards={}",
+                "objects={} refs={} mutations={} checkpoints={} key_grants={} revoked_devices={} accounts={} active_sessions={} registered_repos={} collaboration_events={} data_shards={} parity_shards={}",
                 self.objects.object_count(),
                 self.refs.ref_count(),
                 self.refs.mutation_count(),
@@ -414,6 +460,7 @@ impl DaemonState {
                 self.accounts.profile_count(),
                 self.accounts.active_session_count(now_unix()?),
                 self.accounts.repository_count(),
+                self.collaboration.event_count(),
                 self.objects.policy().data_shards,
                 self.objects.policy().parity_shards
             )));
@@ -912,6 +959,39 @@ impl DaemonState {
         )))
     }
 
+    fn collab_seed_samples(&mut self) -> Result<DaemonResponse> {
+        let before = self.collaboration.event_count();
+        for event in sample_issue_events()
+            .into_iter()
+            .chain(sample_pull_request_events())
+        {
+            self.collaboration.insert(event);
+        }
+        self.save_collaboration()?;
+        let after = self.collaboration.event_count();
+        Ok(DaemonResponse::Ok(format!(
+            "events={} inserted={}",
+            after,
+            after.saturating_sub(before)
+        )))
+    }
+
+    fn issue_list(&self, repo: &str) -> Result<DaemonResponse> {
+        validate_repo_selector(repo.trim())?;
+        Ok(DaemonResponse::Ok(format_issue_list(
+            repo.trim(),
+            &self.collaboration.issue_summaries(repo.trim()),
+        )))
+    }
+
+    fn pr_list(&self, repo: &str) -> Result<DaemonResponse> {
+        validate_repo_selector(repo.trim())?;
+        Ok(DaemonResponse::Ok(format_pr_list(
+            repo.trim(),
+            &self.collaboration.pull_request_summaries(repo.trim()),
+        )))
+    }
+
     fn save_objects(&self) -> Result<()> {
         if let Some(path) = &self.object_store_path {
             self.objects.save_to_path(path)?;
@@ -943,6 +1023,13 @@ impl DaemonState {
     fn save_accounts(&self) -> Result<()> {
         if let Some(path) = &self.account_store_path {
             self.accounts.save_to_path(path)?;
+        }
+        Ok(())
+    }
+
+    fn save_collaboration(&self) -> Result<()> {
+        if let Some(path) = &self.collaboration_store_path {
+            self.collaboration.save_to_path(path)?;
         }
         Ok(())
     }
@@ -1063,6 +1150,7 @@ fn requires_admin_auth(command: &str) -> bool {
                 | "SESSION_ISSUE"
                 | "SESSION_REVOKE"
                 | "REPO_REGISTER"
+                | "COLLAB_SEED_SAMPLES"
         )
     )
 }
@@ -1599,6 +1687,20 @@ fn parse_repository_visibility(value: &str) -> Result<RepositoryVisibility> {
     }
 }
 
+fn validate_repo_selector(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 160
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/'))
+    {
+        return Err(DaemonError::InvalidCommand(
+            "repository selector must be owner/repo".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn parse_policy_identity(value: &str) -> Result<&str> {
     if value.starts_with("gitmesh:v0:ProtocolObject:Blake3_256:")
         && !value.contains(char::is_whitespace)
@@ -1791,6 +1893,67 @@ fn format_repository_list(
         entries.join("|"),
         registrations.len()
     )
+}
+
+fn format_issue_list(repo: &str, issues: &[IssueSummary]) -> String {
+    if issues.is_empty() {
+        return format!("repo={repo} issues=none count=0");
+    }
+    let entries = issues
+        .iter()
+        .map(|issue| {
+            format!(
+                "{};{};{};{};{}",
+                issue.number,
+                encode_hex(issue.title.as_bytes()),
+                issue.actor,
+                encode_label_list(&issue.labels),
+                issue.event_id.as_hex()
+            )
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "repo={repo} issues={} count={}",
+        entries.join("|"),
+        issues.len()
+    )
+}
+
+fn format_pr_list(repo: &str, pull_requests: &[PullRequestSummary]) -> String {
+    if pull_requests.is_empty() {
+        return format!("repo={repo} prs=none count=0");
+    }
+    let entries = pull_requests
+        .iter()
+        .map(|pr| {
+            format!(
+                "{};{};{};{};{};{};{}",
+                pr.number,
+                encode_hex(pr.title.as_bytes()),
+                pr.actor,
+                pr.source_ref,
+                pr.target_ref,
+                encode_label_list(&pr.labels),
+                pr.event_id.as_hex()
+            )
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "repo={repo} prs={} count={}",
+        entries.join("|"),
+        pull_requests.len()
+    )
+}
+
+fn encode_label_list(labels: &[String]) -> String {
+    if labels.is_empty() {
+        return "-".to_string();
+    }
+    labels
+        .iter()
+        .map(|label| encode_hex(label.as_bytes()))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn format_account_status(accounts: &AccountStore) -> Result<String> {
@@ -2219,6 +2382,76 @@ mod tests {
         assert!(profile.contains("username=farzeen"));
         assert!(repos.contains("count=1"));
         assert!(repos.contains("GitMesh;repo:farzeen/gitmesh;private;"));
+    }
+
+    #[test]
+    fn collaboration_commands_seed_and_list_issue_pr_state() {
+        let mut state = DaemonState::default();
+
+        let seed = state
+            .handle_command("COLLAB_SEED_SAMPLES")
+            .unwrap()
+            .into_line();
+        let second_seed = state
+            .handle_command("COLLAB_SEED_SAMPLES")
+            .unwrap()
+            .into_line();
+        let issues = state
+            .handle_command("ISSUE_LIST farzeen/gitmesh")
+            .unwrap()
+            .into_line();
+        let prs = state
+            .handle_command("PR_LIST farzeen/gitmesh")
+            .unwrap()
+            .into_line();
+        let status = state.handle_command("REPO_STATUS").unwrap().into_line();
+
+        assert!(seed.contains("events=4"));
+        assert!(seed.contains("inserted=4"));
+        assert!(second_seed.contains("inserted=0"));
+        assert!(issues.contains("count=2"));
+        assert!(
+            issues.contains("5065727369737420636f6c6c61626f726174696f6e206576656e74206c6f6773")
+        );
+        assert!(prs.contains("count=2"));
+        assert!(prs.contains("refs/heads/collaboration-cli"));
+        assert!(status.contains("collaboration_events=4"));
+    }
+
+    #[test]
+    fn collaboration_store_persists_to_disk() {
+        let path = std::env::temp_dir().join(format!(
+            "gitmeshd-collaboration-{}-{}.tsv",
+            std::process::id(),
+            "persist"
+        ));
+        let mut state = DaemonState::with_all_store_paths_and_collaboration(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(path.clone()),
+        )
+        .unwrap();
+        state.handle_command("COLLAB_SEED_SAMPLES").unwrap();
+
+        let mut restored = DaemonState::with_all_store_paths_and_collaboration(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(path.clone()),
+        )
+        .unwrap();
+        let issues = restored
+            .handle_command("ISSUE_LIST farzeen/gitmesh")
+            .unwrap()
+            .into_line();
+        let _ = fs::remove_file(path);
+
+        assert!(issues.contains("count=2"));
     }
 
     #[cfg(unix)]

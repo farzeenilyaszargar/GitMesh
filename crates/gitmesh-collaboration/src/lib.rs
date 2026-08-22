@@ -4,7 +4,11 @@
 //! derived collaboration state. Their durable representation is an independently
 //! verifiable event graph, not a web database row.
 
-use gitmesh_core::{Cid, CoreError, ProtocolEnvelope};
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::Path;
+
+use gitmesh_core::{Cid, CidKind, CoreError, HashAlgorithm, ProtocolEnvelope, hex};
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,6 +41,18 @@ impl CollaborationEventKind {
             Self::PullRequestMerged => "pull_request.merged",
             Self::CommentAdded => "comment.added",
             Self::ReviewSubmitted => "review.submitted",
+        }
+    }
+
+    fn parse_label(value: &str) -> Result<Self, CollaborationError> {
+        match value {
+            "issue.opened" => Ok(Self::IssueOpened),
+            "issue.closed" => Ok(Self::IssueClosed),
+            "pull_request.opened" => Ok(Self::PullRequestOpened),
+            "pull_request.merged" => Ok(Self::PullRequestMerged),
+            "comment.added" => Ok(Self::CommentAdded),
+            "review.submitted" => Ok(Self::ReviewSubmitted),
+            _ => Err(CollaborationError::InvalidSnapshot),
         }
     }
 }
@@ -137,6 +153,141 @@ pub struct PullRequestSummary {
     pub target_ref: String,
     pub labels: Vec<String>,
     pub event_id: Cid,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CollaborationEventStore {
+    events: Vec<CollaborationEvent>,
+    seen: BTreeSet<Cid>,
+}
+
+impl CollaborationEventStore {
+    pub fn insert(&mut self, event: CollaborationEvent) -> bool {
+        if !self.seen.insert(event.event_id) {
+            return false;
+        }
+        self.events.push(event);
+        true
+    }
+
+    pub fn event_count(&self) -> usize {
+        self.events.len()
+    }
+
+    pub fn events_for_repo(&self, repo: &str) -> Vec<&CollaborationEvent> {
+        self.events
+            .iter()
+            .filter(|event| event.repo == repo)
+            .collect()
+    }
+
+    pub fn issue_summaries(&self, repo: &str) -> Vec<IssueSummary> {
+        self.events_for_repo(repo)
+            .into_iter()
+            .filter(|event| event.kind == CollaborationEventKind::IssueOpened)
+            .enumerate()
+            .map(|(index, event)| IssueSummary {
+                number: (index + 1) as u64,
+                title: event.payload.title.clone(),
+                actor: event.actor.clone(),
+                labels: event.payload.labels.clone(),
+                event_id: event.event_id,
+            })
+            .collect()
+    }
+
+    pub fn pull_request_summaries(&self, repo: &str) -> Vec<PullRequestSummary> {
+        self.events_for_repo(repo)
+            .into_iter()
+            .filter(|event| event.kind == CollaborationEventKind::PullRequestOpened)
+            .enumerate()
+            .map(|(index, event)| PullRequestSummary {
+                number: (index + 1) as u64,
+                title: event.payload.title.clone(),
+                actor: event.actor.clone(),
+                source_ref: event.payload.source_ref.clone().unwrap_or_default(),
+                target_ref: event.payload.target_ref.clone().unwrap_or_default(),
+                labels: event.payload.labels.clone(),
+                event_id: event.event_id,
+            })
+            .collect()
+    }
+
+    pub fn to_snapshot(&self) -> Result<String, CollaborationError> {
+        let mut out = String::from("gitmesh-collaboration-store-v0\n");
+        for event in &self.events {
+            out.push_str(&format!(
+                "event\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                event.event_id.as_hex(),
+                encode_text(&event.repo),
+                event.kind.label(),
+                encode_text(&event.actor),
+                encode_parents(&event.parents),
+                event.timestamp_unix,
+                encode_text(&event.payload.title),
+                encode_text(&event.payload.body),
+                encode_text_list(&event.payload.labels),
+                encode_optional_text(event.payload.source_ref.as_deref()),
+                encode_optional_text(event.payload.target_ref.as_deref())
+            ));
+        }
+        Ok(out)
+    }
+
+    pub fn from_snapshot(text: &str) -> Result<Self, CollaborationError> {
+        let mut lines = text.lines();
+        if lines.next() != Some("gitmesh-collaboration-store-v0") {
+            return Err(CollaborationError::InvalidSnapshot);
+        }
+        let mut store = Self::default();
+        for line in lines {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let parts = line.split('\t').collect::<Vec<_>>();
+            if parts.len() != 12 || parts[0] != "event" {
+                return Err(CollaborationError::InvalidSnapshot);
+            }
+            let stored_event_id = parse_protocol_cid_digest(parts[1])?;
+            let event = CollaborationEvent::new(
+                decode_text(parts[2])?,
+                CollaborationEventKind::parse_label(parts[3])?,
+                decode_text(parts[4])?,
+                decode_parents(parts[5])?,
+                parse_u64(parts[6])?,
+                CollaborationPayload {
+                    title: decode_text(parts[7])?,
+                    body: decode_text(parts[8])?,
+                    labels: decode_text_list(parts[9])?,
+                    source_ref: decode_optional_text(parts[10])?,
+                    target_ref: decode_optional_text(parts[11])?,
+                },
+            )?;
+            if event.event_id != stored_event_id || !store.insert(event) {
+                return Err(CollaborationError::InvalidSnapshot);
+            }
+        }
+        Ok(store)
+    }
+
+    pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<(), CollaborationError> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp_path = path.with_extension("tmp");
+        fs::write(&tmp_path, self.to_snapshot()?)?;
+        fs::rename(tmp_path, path)?;
+        Ok(())
+    }
+
+    pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, CollaborationError> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        Self::from_snapshot(&fs::read_to_string(path)?)
+    }
 }
 
 pub fn sample_issue_events() -> Vec<CollaborationEvent> {
@@ -249,8 +400,18 @@ pub enum CollaborationError {
     EmptyTitle,
     #[error("pull request events require source and target refs")]
     MissingPullRequestRefs,
+    #[error("invalid collaboration snapshot")]
+    InvalidSnapshot,
+    #[error("I/O failed: {0}")]
+    Io(String),
     #[error(transparent)]
     Core(#[from] CoreError),
+}
+
+impl From<std::io::Error> for CollaborationError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value.to_string())
+    }
 }
 
 fn canonical_event_body(
@@ -339,6 +500,107 @@ fn put_bytes(out: &mut Vec<u8>, value: &[u8]) {
     out.extend_from_slice(value);
 }
 
+fn encode_text(value: &str) -> String {
+    hex(value.as_bytes())
+}
+
+fn decode_text(value: &str) -> Result<String, CollaborationError> {
+    String::from_utf8(decode_hex(value)?).map_err(|_| CollaborationError::InvalidSnapshot)
+}
+
+fn encode_optional_text(value: Option<&str>) -> String {
+    value.map_or_else(|| "-".to_string(), encode_text)
+}
+
+fn decode_optional_text(value: &str) -> Result<Option<String>, CollaborationError> {
+    if value == "-" {
+        Ok(None)
+    } else {
+        Ok(Some(decode_text(value)?))
+    }
+}
+
+fn encode_text_list(values: &[String]) -> String {
+    if values.is_empty() {
+        return "-".to_string();
+    }
+    values
+        .iter()
+        .map(|value| encode_text(value))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn decode_text_list(value: &str) -> Result<Vec<String>, CollaborationError> {
+    if value == "-" {
+        return Ok(Vec::new());
+    }
+    value.split(',').map(decode_text).collect()
+}
+
+fn encode_parents(parents: &[Cid]) -> String {
+    if parents.is_empty() {
+        return "-".to_string();
+    }
+    parents
+        .iter()
+        .map(|parent| parent.as_hex())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn decode_parents(value: &str) -> Result<Vec<Cid>, CollaborationError> {
+    if value == "-" {
+        return Ok(Vec::new());
+    }
+    value.split(',').map(parse_protocol_cid_digest).collect()
+}
+
+fn parse_protocol_cid_digest(value: &str) -> Result<Cid, CollaborationError> {
+    Ok(Cid::from_digest(
+        CidKind::ProtocolObject,
+        HashAlgorithm::Blake3_256,
+        decode_fixed_hex::<32>(value)?,
+    ))
+}
+
+fn parse_u64(value: &str) -> Result<u64, CollaborationError> {
+    value
+        .parse::<u64>()
+        .map_err(|_| CollaborationError::InvalidSnapshot)
+}
+
+fn decode_fixed_hex<const N: usize>(value: &str) -> Result<[u8; N], CollaborationError> {
+    let bytes = decode_hex(value)?;
+    bytes
+        .try_into()
+        .map_err(|_| CollaborationError::InvalidSnapshot)
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>, CollaborationError> {
+    if !value.len().is_multiple_of(2) {
+        return Err(CollaborationError::InvalidSnapshot);
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|chunk| {
+            let high = hex_nibble(chunk[0]).ok_or(CollaborationError::InvalidSnapshot)?;
+            let low = hex_nibble(chunk[1]).ok_or(CollaborationError::InvalidSnapshot)?;
+            Ok((high << 4) | low)
+        })
+        .collect()
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,6 +645,72 @@ mod tests {
         assert_eq!(issues[0].number, 1);
         assert_eq!(prs[0].number, 1);
         assert!(prs[0].source_ref.starts_with("refs/heads/"));
+    }
+
+    #[test]
+    fn event_store_summarizes_issues_and_pull_requests_by_repo() {
+        let mut store = CollaborationEventStore::default();
+        for event in sample_issue_events()
+            .into_iter()
+            .chain(sample_pull_request_events())
+        {
+            assert!(store.insert(event));
+        }
+
+        let issues = store.issue_summaries("farzeen/gitmesh");
+        let prs = store.pull_request_summaries("farzeen/gitmesh");
+
+        assert_eq!(store.event_count(), 4);
+        assert_eq!(issues.len(), 2);
+        assert_eq!(prs.len(), 2);
+        assert_eq!(issues[1].number, 2);
+        assert_eq!(prs[0].source_ref, "refs/heads/collaboration-cli");
+        assert!(store.issue_summaries("other/repo").is_empty());
+    }
+
+    #[test]
+    fn event_store_rejects_duplicate_events() {
+        let mut store = CollaborationEventStore::default();
+        let event = sample_issue_events().remove(0);
+
+        assert!(store.insert(event.clone()));
+        assert!(!store.insert(event));
+        assert_eq!(store.event_count(), 1);
+    }
+
+    #[test]
+    fn event_store_snapshot_round_trips_and_detects_tampering() {
+        let mut store = CollaborationEventStore::default();
+        for event in sample_issue_events()
+            .into_iter()
+            .chain(sample_pull_request_events())
+        {
+            store.insert(event);
+        }
+
+        let snapshot = store.to_snapshot().unwrap();
+        let restored = CollaborationEventStore::from_snapshot(&snapshot).unwrap();
+        let tampered = snapshot.replacen("50657273697374", "54616d7065726564", 1);
+
+        assert_eq!(restored, store);
+        assert!(CollaborationEventStore::from_snapshot(&tampered).is_err());
+    }
+
+    #[test]
+    fn event_store_saves_and_loads_snapshot_file() {
+        let path = std::env::temp_dir().join(format!(
+            "gitmesh-collaboration-store-test-{}.tsv",
+            std::process::id()
+        ));
+        let mut store = CollaborationEventStore::default();
+        store.insert(sample_issue_events().remove(0));
+
+        store.save_to_path(&path).unwrap();
+        let restored = CollaborationEventStore::load_from_path(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(restored.event_count(), 1);
+        assert_eq!(restored.issue_summaries("farzeen/gitmesh")[0].number, 1);
     }
 
     #[test]
