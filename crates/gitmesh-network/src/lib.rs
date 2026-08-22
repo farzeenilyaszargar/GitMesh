@@ -578,6 +578,7 @@ impl InMemoryPeer {
             }
             NetworkRequest::AuditShard { shard_ref } => {
                 self.require_protocol(ProtocolId::ShardTransferV0)?;
+                let present = self.shards.contains_key(&shard_ref.shard_cid);
                 let valid = self
                     .shards
                     .get(&shard_ref.shard_cid)
@@ -585,7 +586,7 @@ impl InMemoryPeer {
                     .unwrap_or(false);
                 Ok(NetworkResponse::ShardAudit {
                     shard_ref,
-                    present: valid,
+                    present,
                     valid,
                 })
             }
@@ -644,6 +645,34 @@ impl InMemorySwarm {
             .values()
             .map(|peer| peer.descriptor.clone())
             .collect()
+    }
+
+    pub fn remove_shard(&mut self, peer_id: &PeerId, shard_cid: Cid) -> Result<(), NetworkError> {
+        let peer = self
+            .peers
+            .get_mut(peer_id)
+            .ok_or(NetworkError::UnknownPeer)?;
+        peer.shards
+            .remove(&shard_cid)
+            .map(|_| ())
+            .ok_or(NetworkError::ShardNotFound)
+    }
+
+    pub fn corrupt_shard(&mut self, peer_id: &PeerId, shard_cid: Cid) -> Result<(), NetworkError> {
+        let peer = self
+            .peers
+            .get_mut(peer_id)
+            .ok_or(NetworkError::UnknownPeer)?;
+        let envelope = peer
+            .shards
+            .get_mut(&shard_cid)
+            .ok_or(NetworkError::ShardNotFound)?;
+        if let Some(first) = envelope.bytes.first_mut() {
+            *first ^= 0xff;
+        } else {
+            envelope.bytes.push(0xff);
+        }
+        Ok(())
     }
 }
 
@@ -871,6 +900,73 @@ mod tests {
             }
         );
         assert_eq!(swarm.peer(&storage).unwrap().stored_shard_count(), 1);
+    }
+
+    #[test]
+    fn in_memory_swarm_audit_distinguishes_corrupt_and_missing_shards() {
+        let client = PeerId::new("client-a").unwrap();
+        let storage = PeerId::new("storage-a").unwrap();
+        let segment = cid(CidKind::EncryptedSegment, 7);
+        let envelope = ShardEnvelope::new(segment, 0, 16, 10, b"shard bytes".to_vec()).unwrap();
+        let shard_ref = envelope.shard_ref.clone();
+        let mut swarm = InMemorySwarm::default();
+        swarm
+            .add_peer(InMemoryPeer::new(client_descriptor("client-a").unwrap()))
+            .unwrap();
+        swarm
+            .add_peer(InMemoryPeer::new(
+                storage_descriptor("storage-a", "operator-a", "iad").unwrap(),
+            ))
+            .unwrap();
+        swarm
+            .request(
+                &client,
+                &storage,
+                NetworkRequest::PutShard {
+                    envelope,
+                    lease_epoch: 1,
+                    expires_at_unix: 500,
+                },
+            )
+            .unwrap();
+
+        swarm.corrupt_shard(&storage, shard_ref.shard_cid).unwrap();
+        let corrupt_audit = swarm
+            .request(
+                &client,
+                &storage,
+                NetworkRequest::AuditShard {
+                    shard_ref: shard_ref.clone(),
+                },
+            )
+            .unwrap();
+        swarm.remove_shard(&storage, shard_ref.shard_cid).unwrap();
+        let missing_audit = swarm
+            .request(
+                &client,
+                &storage,
+                NetworkRequest::AuditShard {
+                    shard_ref: shard_ref.clone(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            corrupt_audit,
+            NetworkResponse::ShardAudit {
+                shard_ref: shard_ref.clone(),
+                present: true,
+                valid: false
+            }
+        );
+        assert_eq!(
+            missing_audit,
+            NetworkResponse::ShardAudit {
+                shard_ref,
+                present: false,
+                valid: false
+            }
+        );
     }
 
     #[test]
