@@ -251,6 +251,28 @@ pub struct RepairOutcome {
     pub durability_satisfied: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransportRepairOutcome {
+    pub segment_cid: Cid,
+    pub audit_before: TransportShardAuditReport,
+    pub audit_after: TransportShardAuditReport,
+    pub repaired_shards: Vec<usize>,
+    pub providers_after_repair: Vec<ShardProviderRecord>,
+    pub durability_satisfied: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct TransportRepairRequest<'a> {
+    pub client_peer: &'a PeerId,
+    pub directory_peer: Option<&'a PeerId>,
+    pub segment: &'a EncryptedSegment,
+    pub policy: &'a StoragePolicy,
+    pub providers: &'a [ShardProviderRecord],
+    pub now_unix: u64,
+    pub lease_epoch: u64,
+    pub expires_at_unix: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct V0ProofResult {
     pub plaintext_len: usize,
@@ -364,6 +386,61 @@ pub fn reconstruct_ciphertext(
     }
     ciphertext.truncate(segment.ciphertext_len);
     Ok(ciphertext)
+}
+
+fn reconstruct_all_shards(
+    segment: &EncryptedSegment,
+    policy: &StoragePolicy,
+    stored_shards: &[StoredShard],
+) -> Result<Vec<Shard>> {
+    let available = stored_shards.len();
+    if available < policy.data_shards {
+        return Err(StorageError::NotEnoughShards {
+            available,
+            required: policy.data_shards,
+        });
+    }
+
+    let r = ReedSolomon::new(policy.data_shards, policy.parity_shards)
+        .map_err(|err| StorageError::Erasure(err.to_string()))?;
+    let shard_len = segment.ciphertext.len().div_ceil(policy.data_shards);
+    let mut shards: Vec<Option<Vec<u8>>> = vec![None; policy.total_shards()];
+    for stored in stored_shards {
+        let shard = &stored.shard;
+        if verify_shard(segment, policy, shard) {
+            shards[shard.shard_index] = Some(shard.bytes.clone());
+        }
+    }
+
+    let verified_available = shards.iter().filter(|shard| shard.is_some()).count();
+    if verified_available < policy.data_shards {
+        return Err(StorageError::NotEnoughShards {
+            available: verified_available,
+            required: policy.data_shards,
+        });
+    }
+
+    r.reconstruct(&mut shards)
+        .map_err(|err| StorageError::Erasure(err.to_string()))?;
+
+    shards
+        .into_iter()
+        .enumerate()
+        .map(|(shard_index, bytes)| {
+            let mut bytes = bytes.expect("reed-solomon reconstruct fills missing shards");
+            if bytes.len() != shard_len {
+                bytes.resize(shard_len, 0);
+            }
+            Ok(Shard {
+                segment_cid: segment.cid,
+                shard_index,
+                shard_count: policy.total_shards(),
+                data_shards: policy.data_shards,
+                cid: shard_cid(segment.cid, shard_index, &bytes),
+                bytes,
+            })
+        })
+        .collect()
 }
 
 pub fn audit_segment_shards(
@@ -735,6 +812,146 @@ pub fn audit_shards_via_transport<T: NetworkTransport>(
         corrupt_shards: corrupt.into_iter().collect(),
         durability_satisfied,
         repair_needed,
+    })
+}
+
+pub fn repair_shards_via_transport<T: NetworkTransport>(
+    transport: &mut T,
+    request: TransportRepairRequest<'_>,
+) -> Result<TransportRepairOutcome> {
+    let audit_before = audit_shards_via_transport(
+        transport,
+        request.client_peer,
+        request.segment.cid,
+        request.policy.total_shards(),
+        request.policy.data_shards,
+        request.providers,
+        request.now_unix,
+    )?;
+    if audit_before.verified_shards.len() < request.policy.data_shards {
+        return Err(StorageError::NotEnoughShards {
+            available: audit_before.verified_shards.len(),
+            required: request.policy.data_shards,
+        });
+    }
+    if !audit_before.repair_needed {
+        return Ok(TransportRepairOutcome {
+            segment_cid: request.segment.cid,
+            audit_after: audit_before.clone(),
+            audit_before,
+            repaired_shards: Vec::new(),
+            providers_after_repair: request.providers.to_vec(),
+            durability_satisfied: true,
+        });
+    }
+
+    let verified_indexes = audit_before
+        .verified_shards
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let verified_providers = request
+        .providers
+        .iter()
+        .filter(|provider| verified_indexes.contains(&provider.shard_index))
+        .cloned()
+        .collect::<Vec<_>>();
+    let stored = fetch_shards_via_transport(
+        transport,
+        request.client_peer,
+        &verified_providers,
+        request.now_unix,
+    )?;
+    let rebuilt_shards = reconstruct_all_shards(request.segment, request.policy, &stored)?;
+    let provider_by_index = request
+        .providers
+        .iter()
+        .map(|provider| (provider.shard_index, provider.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let repair_targets = audit_before
+        .missing_shards
+        .iter()
+        .chain(&audit_before.corrupt_shards)
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut providers_after_repair = request.providers.to_vec();
+    let mut repaired_shards = Vec::new();
+
+    for shard_index in repair_targets {
+        let Some(target_provider) = provider_by_index.get(&shard_index) else {
+            continue;
+        };
+        let shard = rebuilt_shards
+            .get(shard_index)
+            .ok_or(StorageError::InvalidShardIndex(shard_index))?;
+        let response = transport
+            .request(
+                request.client_peer,
+                &target_provider.peer_id,
+                NetworkRequest::PutShard {
+                    envelope: shard.to_network_envelope()?,
+                    lease_epoch: request.lease_epoch,
+                    expires_at_unix: request.expires_at_unix,
+                },
+            )
+            .map_err(|err| StorageError::Network(err.to_string()))?;
+        let NetworkResponse::ShardStored { shard_ref } = response else {
+            return Err(StorageError::Network(
+                "unexpected response to PutShard during repair".to_string(),
+            ));
+        };
+        let repaired_provider = ShardProviderRecord::new(
+            shard_ref.segment_cid,
+            shard_ref.shard_cid,
+            shard_ref.shard_index,
+            target_provider.peer_id.clone(),
+            target_provider.operator_id.clone(),
+            target_provider.roles.clone(),
+            ProviderLease::new(request.lease_epoch, request.expires_at_unix)
+                .map_err(|err| StorageError::Network(err.to_string()))?,
+        );
+        if let Some(existing) = providers_after_repair
+            .iter_mut()
+            .find(|provider| provider.shard_index == shard_index)
+        {
+            *existing = repaired_provider.clone();
+        } else {
+            providers_after_repair.push(repaired_provider.clone());
+        }
+        repaired_shards.push(shard_index);
+    }
+
+    for provider in &mut providers_after_repair {
+        provider.lease_epoch = request.lease_epoch;
+        provider.expires_at_unix = request.expires_at_unix;
+    }
+    if let Some(directory_peer) = request.directory_peer {
+        publish_providers_via_transport(
+            transport,
+            request.client_peer,
+            directory_peer,
+            &providers_after_repair,
+        )?;
+    }
+
+    let audit_after = audit_shards_via_transport(
+        transport,
+        request.client_peer,
+        request.segment.cid,
+        request.policy.total_shards(),
+        request.policy.data_shards,
+        &providers_after_repair,
+        request.now_unix,
+    )?;
+    let durability_satisfied = audit_after.durability_satisfied;
+
+    Ok(TransportRepairOutcome {
+        segment_cid: request.segment.cid,
+        audit_before,
+        audit_after,
+        repaired_shards,
+        providers_after_repair,
+        durability_satisfied,
     })
 }
 
@@ -1110,5 +1327,161 @@ mod tests {
         assert_eq!(report.missing_shards, vec![3]);
         assert!(report.durability_satisfied);
         assert!(report.repair_needed);
+    }
+
+    #[test]
+    fn repairs_transport_providers_and_republishes_refreshed_leases() {
+        let plaintext = b"transport repair should rebuild missing and corrupt shards";
+        let storage_policy = StoragePolicy {
+            data_shards: 3,
+            parity_shards: 2,
+        };
+        let placement_policy =
+            PlacementPolicy::new(storage_policy.total_shards(), 5, 2, true).unwrap();
+        let encrypted = encrypt_segment(plaintext).unwrap();
+        let shards = erasure_encode(&encrypted, &storage_policy).unwrap();
+        let client = PeerId::new("client-a").unwrap();
+        let directory = PeerId::new("directory-a").unwrap();
+        let mut swarm = InMemorySwarm::default();
+        swarm
+            .add_peer(InMemoryPeer::new(client_descriptor("client-a").unwrap()))
+            .unwrap();
+        swarm
+            .add_peer(InMemoryPeer::new(directory_descriptor("directory-a")))
+            .unwrap();
+        for index in 0..storage_policy.total_shards() {
+            let peer = format!("storage-{index}");
+            let operator = format!("operator-{index}");
+            let region = if index % 2 == 0 { "iad" } else { "sfo" };
+            swarm
+                .add_peer(InMemoryPeer::new(
+                    storage_descriptor(&peer, &operator, region).unwrap(),
+                ))
+                .unwrap();
+        }
+
+        let descriptors = swarm.descriptors();
+        let (_plan, providers) = plan_and_distribute_shards(
+            &mut swarm,
+            &client,
+            descriptors,
+            &placement_policy,
+            &shards,
+            1,
+            1_000,
+        )
+        .unwrap();
+        publish_providers_via_transport(&mut swarm, &client, &directory, &providers).unwrap();
+        swarm
+            .corrupt_shard(&providers[1].peer_id, providers[1].shard_cid)
+            .unwrap();
+        swarm
+            .remove_shard(&providers[3].peer_id, providers[3].shard_cid)
+            .unwrap();
+
+        let outcome = repair_shards_via_transport(
+            &mut swarm,
+            TransportRepairRequest {
+                client_peer: &client,
+                directory_peer: Some(&directory),
+                segment: &encrypted,
+                policy: &storage_policy,
+                providers: &providers,
+                now_unix: 100,
+                lease_epoch: 2,
+                expires_at_unix: 2_000,
+            },
+        )
+        .unwrap();
+        let discovered =
+            discover_providers_via_transport(&mut swarm, &client, &directory, encrypted.cid, 1_500)
+                .unwrap();
+        let fetched = fetch_shards_via_transport(
+            &mut swarm,
+            &client,
+            &discovered[..storage_policy.data_shards],
+            1_500,
+        )
+        .unwrap();
+        let ciphertext = reconstruct_ciphertext(&encrypted, &storage_policy, &fetched).unwrap();
+        let recovered = decrypt_segment(&encrypted, &ciphertext).unwrap();
+
+        assert_eq!(outcome.repaired_shards, vec![1, 3]);
+        assert_eq!(outcome.audit_before.corrupt_shards, vec![1]);
+        assert_eq!(outcome.audit_before.missing_shards, vec![3]);
+        assert_eq!(
+            outcome.audit_after.verified_shards.len(),
+            storage_policy.total_shards()
+        );
+        assert!(!outcome.audit_after.repair_needed);
+        assert!(outcome.durability_satisfied);
+        assert_eq!(recovered, plaintext);
+    }
+
+    #[test]
+    fn transport_repair_refuses_below_reconstruction_threshold() {
+        let storage_policy = StoragePolicy {
+            data_shards: 3,
+            parity_shards: 2,
+        };
+        let placement_policy =
+            PlacementPolicy::new(storage_policy.total_shards(), 5, 2, true).unwrap();
+        let encrypted = encrypt_segment(b"too many remote shards are gone").unwrap();
+        let shards = erasure_encode(&encrypted, &storage_policy).unwrap();
+        let client = PeerId::new("client-a").unwrap();
+        let mut swarm = InMemorySwarm::default();
+        swarm
+            .add_peer(InMemoryPeer::new(client_descriptor("client-a").unwrap()))
+            .unwrap();
+        for index in 0..storage_policy.total_shards() {
+            let peer = format!("storage-{index}");
+            let operator = format!("operator-{index}");
+            let region = if index % 2 == 0 { "iad" } else { "sfo" };
+            swarm
+                .add_peer(InMemoryPeer::new(
+                    storage_descriptor(&peer, &operator, region).unwrap(),
+                ))
+                .unwrap();
+        }
+
+        let descriptors = swarm.descriptors();
+        let (_plan, providers) = plan_and_distribute_shards(
+            &mut swarm,
+            &client,
+            descriptors,
+            &placement_policy,
+            &shards,
+            1,
+            1_000,
+        )
+        .unwrap();
+        for provider in providers.iter().take(3) {
+            swarm
+                .remove_shard(&provider.peer_id, provider.shard_cid)
+                .unwrap();
+        }
+
+        let err = repair_shards_via_transport(
+            &mut swarm,
+            TransportRepairRequest {
+                client_peer: &client,
+                directory_peer: None,
+                segment: &encrypted,
+                policy: &storage_policy,
+                providers: &providers,
+                now_unix: 100,
+                lease_epoch: 2,
+                expires_at_unix: 2_000,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            StorageError::NotEnoughShards {
+                available: 2,
+                required: 3
+            }
+        ));
     }
 }
