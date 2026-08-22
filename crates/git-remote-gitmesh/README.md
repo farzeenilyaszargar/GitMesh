@@ -18,6 +18,7 @@ Currently implemented:
   published as a daemon ref, and exported back as a valid GitMesh pack
 - force-push and ref deletion mapping to daemon ref-update semantics
 - live daemon coverage for remote-helper ref deletion
+- live daemon coverage for rejected non-fast-forward branch updates
 - `list` / `list for-push` ref advertisement from local `gitmeshd` when
   available
 - `--v0-proof` smoke command for exercising the storage pipeline through this

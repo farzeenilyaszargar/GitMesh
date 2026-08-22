@@ -1066,6 +1066,123 @@ mod tests {
     }
 
     #[test]
+    fn push_reports_error_when_live_daemon_ref_would_move_backwards() {
+        let daemon = LiveDaemon::start("gitmesh-helper-conflict");
+        let worktree = daemon.root.join("worktree");
+        run_git_command(&daemon.root, ["init", worktree.to_str().unwrap()]);
+        configure_git_author(&worktree);
+        fs::write(worktree.join("README.md"), "first\n").unwrap();
+        run_git_command(&worktree, ["add", "README.md"]);
+        run_git_command(&worktree, ["commit", "-m", "first"]);
+        let first_oid = git_rev_parse(&worktree, "HEAD");
+        let config = HelperConfig::new("origin", Some("gitmesh://farzeen/gitmesh".to_string()))
+            .with_git_dir(Some(worktree.join(".git")))
+            .with_daemon_socket(Some(daemon.socket.clone()))
+            .with_identity_enabled(false);
+        let mut first_output = Vec::new();
+        run_helper(
+            config.clone(),
+            Cursor::new("capabilities\npush HEAD:refs/heads/main\n\n"),
+            &mut first_output,
+        )
+        .unwrap();
+        fs::write(worktree.join("README.md"), "second\n").unwrap();
+        run_git_command(&worktree, ["add", "README.md"]);
+        run_git_command(&worktree, ["commit", "-m", "second"]);
+        let second_oid = git_rev_parse(&worktree, "HEAD");
+        let mut second_output = Vec::new();
+        run_helper(
+            config.clone(),
+            Cursor::new("capabilities\npush HEAD:refs/heads/main\n\n"),
+            &mut second_output,
+        )
+        .unwrap();
+        let mut stale_output = Vec::new();
+
+        run_helper(
+            config,
+            Cursor::new(format!(
+                "capabilities\npush {first_oid}:refs/heads/main\n\n"
+            )),
+            &mut stale_output,
+        )
+        .unwrap();
+        let ref_response =
+            gitmeshd::request_unix_socket(&daemon.socket, "REF_GET refs/heads/main").unwrap();
+
+        assert_eq!(
+            String::from_utf8(second_output).unwrap(),
+            format!("{CAPABILITIES}ok refs/heads/main\n\n")
+        );
+        let stale_text = String::from_utf8(stale_output).unwrap();
+        assert!(stale_text.contains("error refs/heads/main"));
+        assert!(stale_text.contains("non-fast-forward"));
+        assert_eq!(
+            ref_response,
+            format!("OK ref=refs/heads/main oid={second_oid}")
+        );
+
+        let _ = fs::remove_dir_all(daemon.root);
+    }
+
+    #[test]
+    fn push_reports_non_fast_forward_without_force() {
+        let daemon = LiveDaemon::start("gitmesh-helper-non-ff");
+        let first_worktree = daemon.root.join("first");
+        let second_worktree = daemon.root.join("second");
+        run_git_command(&daemon.root, ["init", first_worktree.to_str().unwrap()]);
+        run_git_command(&daemon.root, ["init", second_worktree.to_str().unwrap()]);
+        configure_git_author(&first_worktree);
+        configure_git_author(&second_worktree);
+        fs::write(first_worktree.join("README.md"), "first root\n").unwrap();
+        run_git_command(&first_worktree, ["add", "README.md"]);
+        run_git_command(&first_worktree, ["commit", "-m", "first"]);
+        fs::write(second_worktree.join("README.md"), "second root\n").unwrap();
+        run_git_command(&second_worktree, ["add", "README.md"]);
+        run_git_command(&second_worktree, ["commit", "-m", "second"]);
+        let first_oid = git_rev_parse(&first_worktree, "HEAD");
+        let second_oid = git_rev_parse(&second_worktree, "HEAD");
+        let first_config =
+            HelperConfig::new("origin", Some("gitmesh://farzeen/gitmesh".to_string()))
+                .with_git_dir(Some(first_worktree.join(".git")))
+                .with_daemon_socket(Some(daemon.socket.clone()))
+                .with_identity_enabled(false);
+        let second_config =
+            HelperConfig::new("origin", Some("gitmesh://farzeen/gitmesh".to_string()))
+                .with_git_dir(Some(second_worktree.join(".git")))
+                .with_daemon_socket(Some(daemon.socket.clone()))
+                .with_identity_enabled(false);
+        let mut first_output = Vec::new();
+        let mut rejected_output = Vec::new();
+
+        run_helper(
+            first_config,
+            Cursor::new("capabilities\npush HEAD:refs/heads/main\n\n"),
+            &mut first_output,
+        )
+        .unwrap();
+        run_helper(
+            second_config,
+            Cursor::new("capabilities\npush HEAD:refs/heads/main\n\n"),
+            &mut rejected_output,
+        )
+        .unwrap();
+        let ref_response =
+            gitmeshd::request_unix_socket(&daemon.socket, "REF_GET refs/heads/main").unwrap();
+        let rejected_text = String::from_utf8(rejected_output).unwrap();
+
+        assert!(rejected_text.contains("error refs/heads/main"));
+        assert!(rejected_text.contains("non-fast-forward"));
+        assert_eq!(
+            ref_response,
+            format!("OK ref=refs/heads/main oid={first_oid}")
+        );
+        assert_ne!(first_oid, second_oid);
+
+        let _ = fs::remove_dir_all(daemon.root);
+    }
+
+    #[test]
     fn decodes_pack_hex_payloads() {
         assert_eq!(decode_hex("5041434b").unwrap(), b"PACK");
         assert!(decode_hex("xyz").is_err());
@@ -1199,5 +1316,29 @@ mod tests {
             "git failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    fn configure_git_author(worktree: &Path) {
+        run_git_command(
+            worktree,
+            ["config", "user.email", "gitmesh@example.invalid"],
+        );
+        run_git_command(worktree, ["config", "user.name", "GitMesh Test"]);
+    }
+
+    fn git_rev_parse(worktree: &Path, rev: &str) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(worktree)
+            .arg("rev-parse")
+            .arg(rev)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git rev-parse failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 }
