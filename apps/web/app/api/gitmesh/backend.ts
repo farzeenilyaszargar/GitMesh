@@ -18,8 +18,32 @@ export type GatewaySnapshot = {
   keyGrants: DaemonStatus;
 };
 
+export type GatewayIssue = {
+  id: number;
+  title: string;
+  labels: string[];
+  author: string;
+  time: string;
+  status: string;
+  comments: number;
+  eventId?: string;
+};
+
+export type GatewayPullRequest = {
+  id: number;
+  title: string;
+  source: string;
+  target: string;
+  checks: string;
+  author: string;
+  reviews: number;
+  comments: number;
+  eventId?: string;
+};
+
 const COMMAND_TIMEOUT_MS = 1200;
 const DEFAULT_REPO_ID = "repo:farzeen/gitmesh";
+const DEFAULT_REPO_NAME = "farzeen/gitmesh";
 
 type RequestDaemonOptions = {
   admin?: boolean;
@@ -146,6 +170,59 @@ export function repositoriesFromFields(fields: Record<string, string>) {
   });
 }
 
+export function issuesFromFields(fields: Record<string, string>): GatewayIssue[] {
+  const value = fields.issues;
+  if (!value || value === "none") {
+    return [];
+  }
+  return value.split("|").filter(Boolean).map((entry) => {
+    const [number, titleHex, actor, labels, eventId] = entry.split(";");
+    return {
+      id: Number(number),
+      title: decodeHexField(titleHex),
+      labels: decodeHexList(labels),
+      author: actor,
+      time: "opened from daemon event log",
+      status: "Open",
+      comments: 0,
+      eventId
+    };
+  });
+}
+
+export function pullRequestsFromFields(fields: Record<string, string>): GatewayPullRequest[] {
+  const value = fields.prs;
+  if (!value || value === "none") {
+    return [];
+  }
+  return value.split("|").filter(Boolean).map((entry) => {
+    const [number, titleHex, actor, source, target, labels, eventId] = entry.split(";");
+    return {
+      id: Number(number),
+      title: decodeHexField(titleHex),
+      source: shortRef(source),
+      target: shortRef(target),
+      checks: labels === "-" ? "event verified" : `${decodeHexList(labels).length} labels`,
+      author: actor,
+      reviews: 0,
+      comments: 0,
+      eventId
+    };
+  });
+}
+
+export async function gatewayIssues(repo = DEFAULT_REPO_NAME): Promise<GatewayIssue[]> {
+  const response = await requestDaemon(`ISSUE_LIST ${repo}`);
+  return response.ok ? issuesFromFields(response.fields) : [];
+}
+
+export async function gatewayPullRequests(
+  repo = DEFAULT_REPO_NAME
+): Promise<GatewayPullRequest[]> {
+  const response = await requestDaemon(`PR_LIST ${repo}`);
+  return response.ok ? pullRequestsFromFields(response.fields) : [];
+}
+
 export async function readJsonBody(request: NextRequest) {
   try {
     return (await request.json()) as Record<string, unknown>;
@@ -173,6 +250,17 @@ export function parseRefs(value: string | undefined) {
     const [name, oid] = entry.split(":");
     return { name, oid };
   });
+}
+
+function decodeHexList(value: string | undefined) {
+  if (!value || value === "-") {
+    return [];
+  }
+  return value.split(",").filter(Boolean).map(decodeHexField);
+}
+
+function shortRef(value: string | undefined) {
+  return value?.replace(/^refs\/heads\//, "") ?? "";
 }
 
 function adminWrap(command: string) {

@@ -1,9 +1,15 @@
 import { CheckCircle2, CircleDot, MessageSquare, Plus, Search, SlidersHorizontal } from "lucide-react";
 
+import { gatewayIssues } from "../api/gitmesh/backend";
 import { RepoHeader, SiteHeader } from "../repo-chrome";
-import { issues } from "../repository-data";
+import { issues as fallbackIssues } from "../repository-data";
 
-export default function IssuesPage() {
+export const dynamic = "force-dynamic";
+
+export default async function IssuesPage() {
+  const daemonIssues = await gatewayIssues();
+  const issues = daemonIssues.length > 0 ? daemonIssues : fallbackIssues;
+
   return (
     <main>
       <SiteHeader showRepositoryPath />
@@ -70,8 +76,8 @@ export default function IssuesPage() {
         <div className="protocolNote">
           <CheckCircle2 size={16} />
           <span>
-            Issues are rendered as signed collaboration-event records in the
-            GitMesh plan; this page is wired to local typed repository data.
+            Issues are rendered from daemon collaboration-event summaries when
+            available, with static data only as an offline fallback.
           </span>
         </div>
       </section>

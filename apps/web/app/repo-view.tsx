@@ -17,20 +17,28 @@ import {
 } from "lucide-react";
 
 import { RepoHeader, SiteHeader } from "./repo-chrome";
-import type { GatewaySnapshot } from "./api/gitmesh/backend";
+import type {
+  GatewayIssue,
+  GatewayPullRequest,
+  GatewaySnapshot
+} from "./api/gitmesh/backend";
 import {
   checks,
   files,
-  issues,
-  pullRequests,
   repository
 } from "./repository-data";
 
 type RepositoryViewProps = {
   snapshot?: GatewaySnapshot;
+  issues: GatewayIssue[];
+  pullRequests: GatewayPullRequest[];
 };
 
-export default function RepositoryView({ snapshot }: RepositoryViewProps) {
+export default function RepositoryView({
+  snapshot,
+  issues,
+  pullRequests
+}: RepositoryViewProps) {
   const daemonOnline = snapshot?.health.ok === true;
   const objectCount = snapshot?.repo.fields.objects ?? "0";
   const refCount = snapshot?.repo.fields.refs ?? "0";

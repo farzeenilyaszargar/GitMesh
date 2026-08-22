@@ -8,10 +8,17 @@ import {
   SlidersHorizontal
 } from "lucide-react";
 
+import { gatewayPullRequests } from "../api/gitmesh/backend";
 import { RepoHeader, SiteHeader } from "../repo-chrome";
-import { pullRequests } from "../repository-data";
+import { pullRequests as fallbackPullRequests } from "../repository-data";
 
-export default function PullRequestsPage() {
+export const dynamic = "force-dynamic";
+
+export default async function PullRequestsPage() {
+  const daemonPullRequests = await gatewayPullRequests();
+  const pullRequests =
+    daemonPullRequests.length > 0 ? daemonPullRequests : fallbackPullRequests;
+
   return (
     <main>
       <SiteHeader showRepositoryPath />
