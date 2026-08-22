@@ -10,7 +10,10 @@ use gitmesh_crypto::{
     decrypt_segment_bytes as crypto_decrypt_segment_bytes,
     encrypt_segment as crypto_encrypt_segment,
 };
-use gitmesh_network::{InMemoryAvailabilityDirectory, NodeRole, PeerId, ShardProviderRecord};
+use gitmesh_network::{
+    InMemoryAvailabilityDirectory, NetworkRequest, NetworkResponse, NetworkTransport, NodeRole,
+    OperatorId, PeerId, ProviderLease, ShardEnvelope, ShardProviderRecord,
+};
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use thiserror::Error;
 
@@ -82,6 +85,33 @@ pub struct Shard {
 pub struct StoredShard {
     pub node_id: usize,
     pub shard: Shard,
+}
+
+impl Shard {
+    pub fn to_network_envelope(&self) -> Result<ShardEnvelope> {
+        ShardEnvelope::new(
+            self.segment_cid,
+            self.shard_index,
+            self.shard_count,
+            self.data_shards,
+            self.bytes.clone(),
+        )
+        .map_err(|err| StorageError::Network(err.to_string()))
+    }
+
+    pub fn from_network_envelope(envelope: ShardEnvelope) -> Result<Self> {
+        envelope
+            .verify()
+            .map_err(|err| StorageError::Network(err.to_string()))?;
+        Ok(Self {
+            segment_cid: envelope.shard_ref.segment_cid,
+            shard_index: envelope.shard_ref.shard_index,
+            shard_count: envelope.shard_count,
+            data_shards: envelope.data_shards,
+            bytes: envelope.bytes,
+            cid: envelope.shard_ref.shard_cid,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -168,16 +198,20 @@ impl SimulatedNetwork {
         expires_at_unix: u64,
     ) -> Result<()> {
         for stored in self.available_shards() {
-            directory.publish(ShardProviderRecord::new(
-                stored.shard.segment_cid,
-                stored.shard.cid,
-                stored.shard.shard_index,
-                PeerId::new(format!("v0-node-{}", stored.node_id))
-                    .map_err(|err| StorageError::Network(err.to_string()))?,
-                [NodeRole::Storage],
-                lease_epoch,
-                expires_at_unix,
-            ));
+            directory
+                .publish(ShardProviderRecord::new(
+                    stored.shard.segment_cid,
+                    stored.shard.cid,
+                    stored.shard.shard_index,
+                    PeerId::new(format!("v0-node-{}", stored.node_id))
+                        .map_err(|err| StorageError::Network(err.to_string()))?,
+                    OperatorId::new(format!("v0-operator-{}", stored.node_id))
+                        .map_err(|err| StorageError::Network(err.to_string()))?,
+                    [NodeRole::Storage],
+                    ProviderLease::new(lease_epoch, expires_at_unix)
+                        .map_err(|err| StorageError::Network(err.to_string()))?,
+                ))
+                .map_err(|err| StorageError::Network(err.to_string()))?;
         }
         Ok(())
     }
@@ -431,6 +465,90 @@ pub fn repair_segment_shards(
     })
 }
 
+pub fn distribute_shards_via_transport<T: NetworkTransport>(
+    transport: &mut T,
+    client_peer: &PeerId,
+    storage_peers: &[PeerId],
+    shards: &[Shard],
+    lease_epoch: u64,
+    expires_at_unix: u64,
+) -> Result<Vec<ShardProviderRecord>> {
+    if storage_peers.len() < shards.len() {
+        return Err(StorageError::NotEnoughShards {
+            available: storage_peers.len(),
+            required: shards.len(),
+        });
+    }
+    let mut providers = Vec::with_capacity(shards.len());
+    for (peer, shard) in storage_peers.iter().zip(shards) {
+        let response = transport
+            .request(
+                client_peer,
+                peer,
+                NetworkRequest::PutShard {
+                    envelope: shard.to_network_envelope()?,
+                    lease_epoch,
+                    expires_at_unix,
+                },
+            )
+            .map_err(|err| StorageError::Network(err.to_string()))?;
+        let NetworkResponse::ShardStored { shard_ref } = response else {
+            return Err(StorageError::Network(
+                "unexpected response to PutShard".to_string(),
+            ));
+        };
+        providers.push(ShardProviderRecord::new(
+            shard_ref.segment_cid,
+            shard_ref.shard_cid,
+            shard_ref.shard_index,
+            peer.clone(),
+            OperatorId::new(format!("remote-operator-{}", peer.as_str()))
+                .map_err(|err| StorageError::Network(err.to_string()))?,
+            [NodeRole::Storage],
+            ProviderLease::new(lease_epoch, expires_at_unix)
+                .map_err(|err| StorageError::Network(err.to_string()))?,
+        ));
+    }
+    Ok(providers)
+}
+
+pub fn fetch_shards_via_transport<T: NetworkTransport>(
+    transport: &mut T,
+    client_peer: &PeerId,
+    providers: &[ShardProviderRecord],
+    now_unix: u64,
+) -> Result<Vec<StoredShard>> {
+    let mut stored = Vec::new();
+    for provider in providers {
+        if !provider.is_active_at(now_unix) {
+            continue;
+        }
+        let response = transport
+            .request(
+                client_peer,
+                &provider.peer_id,
+                NetworkRequest::GetShard {
+                    shard_ref: gitmesh_network::ShardRef {
+                        segment_cid: provider.segment_cid,
+                        shard_cid: provider.shard_cid,
+                        shard_index: provider.shard_index,
+                    },
+                },
+            )
+            .map_err(|err| StorageError::Network(err.to_string()))?;
+        let NetworkResponse::ShardFound { envelope } = response else {
+            return Err(StorageError::Network(
+                "unexpected response to GetShard".to_string(),
+            ));
+        };
+        stored.push(StoredShard {
+            node_id: provider.shard_index,
+            shard: Shard::from_network_envelope(envelope)?,
+        });
+    }
+    Ok(stored)
+}
+
 fn verify_shard(segment: &EncryptedSegment, policy: &StoragePolicy, shard: &Shard) -> bool {
     shard.segment_cid == segment.cid
         && shard.shard_count == policy.total_shards()
@@ -467,6 +585,7 @@ pub fn run_v0_local_storage_proof(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gitmesh_network::{InMemoryPeer, InMemorySwarm, client_descriptor, storage_descriptor};
 
     #[test]
     fn reconstructs_after_losing_parity_count_nodes() {
@@ -563,5 +682,43 @@ mod tests {
                 required: 10
             }
         ));
+    }
+
+    #[test]
+    fn distributes_and_fetches_shards_through_transport_boundary() {
+        let plaintext = b"network transport should carry erasure-coded ciphertext shards";
+        let policy = StoragePolicy::default();
+        let encrypted = encrypt_segment(plaintext).unwrap();
+        let shards = erasure_encode(&encrypted, &policy).unwrap();
+        let client = PeerId::new("client-a").unwrap();
+        let mut swarm = InMemorySwarm::default();
+        swarm
+            .add_peer(InMemoryPeer::new(client_descriptor("client-a").unwrap()))
+            .unwrap();
+        let storage_peers = (0..policy.total_shards())
+            .map(|index| {
+                let peer_id = PeerId::new(format!("storage-{index}")).unwrap();
+                swarm
+                    .add_peer(InMemoryPeer::new(
+                        storage_descriptor(peer_id.as_str(), &format!("operator-{index}"), "iad")
+                            .unwrap(),
+                    ))
+                    .unwrap();
+                peer_id
+            })
+            .collect::<Vec<_>>();
+
+        let providers =
+            distribute_shards_via_transport(&mut swarm, &client, &storage_peers, &shards, 1, 1_000)
+                .unwrap();
+        let fetched =
+            fetch_shards_via_transport(&mut swarm, &client, &providers[..policy.data_shards], 100)
+                .unwrap();
+        let ciphertext = reconstruct_ciphertext(&encrypted, &policy, &fetched).unwrap();
+        let recovered = decrypt_segment(&encrypted, &ciphertext).unwrap();
+
+        assert_eq!(providers.len(), policy.total_shards());
+        assert_eq!(fetched.len(), policy.data_shards);
+        assert_eq!(recovered, plaintext);
     }
 }
