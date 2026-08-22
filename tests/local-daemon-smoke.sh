@@ -11,8 +11,14 @@ KEY_STORE="$TMP_DIR/key-grants.tsv"
 ACCOUNT_STORE="$TMP_DIR/accounts.tsv"
 COLLAB_STORE="$TMP_DIR/collaboration.tsv"
 DAEMON_PID=""
+WEB_PID=""
+WEB_PORT=""
 
 cleanup() {
+  if [[ -n "$WEB_PID" ]] && kill -0 "$WEB_PID" 2>/dev/null; then
+    kill "$WEB_PID" 2>/dev/null || true
+    wait "$WEB_PID" 2>/dev/null || true
+  fi
   if [[ -n "$DAEMON_PID" ]] && kill -0 "$DAEMON_PID" 2>/dev/null; then
     kill "$DAEMON_PID" 2>/dev/null || true
     wait "$DAEMON_PID" 2>/dev/null || true
@@ -33,6 +39,20 @@ expect_contains() {
     echo "response: $haystack" >&2
     exit 1
   fi
+}
+
+post_json() {
+  local path="$1"
+  local body="$2"
+  curl -fsS \
+    -H "content-type: application/json" \
+    -d "$body" \
+    "http://127.0.0.1:$WEB_PORT$path"
+}
+
+get_json() {
+  local path="$1"
+  curl -fsS "http://127.0.0.1:$WEB_PORT$path"
 }
 
 cd "$ROOT_DIR"
@@ -107,6 +127,51 @@ status_response="$(run_gitmeshd repo-status "$SOCKET_PATH")"
 expect_contains "$status_response" "objects=1"
 expect_contains "$status_response" "refs=1"
 expect_contains "$status_response" "collaboration_events=2"
+
+npm --prefix apps/web run build >/dev/null
+WEB_PORT="$(
+  node -e "const net=require('net'); const s=net.createServer(); s.listen(0,'127.0.0.1',()=>{console.log(s.address().port); s.close();});"
+)"
+GITMESHD_SOCKET="$SOCKET_PATH" npm --prefix apps/web run start -- \
+  -H 127.0.0.1 \
+  -p "$WEB_PORT" \
+  >"$TMP_DIR/next.log" 2>&1 &
+WEB_PID="$!"
+
+for _ in {1..120}; do
+  if get_json "/api/gitmesh/health" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.1
+done
+
+web_issue_response="$(
+  post_json \
+    "/api/gitmesh/issues" \
+    '{"repo":"farzeen/gitmesh","actor":"farzeen","title":"Web issue","body":"verifies api writes","labels":["web","collaboration"]}'
+)"
+expect_contains "$web_issue_response" '"ok":true'
+expect_contains "$web_issue_response" '"number":"2"'
+
+web_pr_response="$(
+  post_json \
+    "/api/gitmesh/pulls" \
+    '{"repo":"farzeen/gitmesh","actor":"farzeen","sourceRef":"refs/heads/web-smoke","targetRef":"refs/heads/main","title":"Web pull request","body":"verifies api pr writes","labels":["web"]}'
+)"
+expect_contains "$web_pr_response" '"ok":true'
+expect_contains "$web_pr_response" '"number":"2"'
+
+web_issues_list="$(get_json "/api/gitmesh/issues?repo=farzeen/gitmesh")"
+expect_contains "$web_issues_list" '"issues"'
+expect_contains "$web_issues_list" '"title":"Web issue"'
+
+web_pulls_list="$(get_json "/api/gitmesh/pulls?repo=farzeen/gitmesh")"
+expect_contains "$web_pulls_list" '"pullRequests"'
+expect_contains "$web_pulls_list" '"title":"Web pull request"'
+
+web_status="$(get_json "/api/gitmesh/status")"
+expect_contains "$web_status" '"ok":true'
+expect_contains "$web_status" '"collaboration_events":"4"'
 
 for store in "$OBJECT_STORE" "$REF_STORE" "$COLLAB_STORE"; do
   if [[ ! -s "$store" ]]; then
