@@ -23,6 +23,7 @@ pub struct HelperConfig {
     pub pack_advertisement: Option<String>,
     pub git_dir: Option<PathBuf>,
     pub daemon_socket: Option<PathBuf>,
+    pub identity_enabled: bool,
 }
 
 impl HelperConfig {
@@ -34,6 +35,7 @@ impl HelperConfig {
             pack_advertisement: None,
             git_dir: None,
             daemon_socket: None,
+            identity_enabled: true,
         }
     }
 
@@ -54,6 +56,11 @@ impl HelperConfig {
 
     pub fn with_daemon_socket(mut self, daemon_socket: Option<PathBuf>) -> Self {
         self.daemon_socket = daemon_socket;
+        self
+    }
+
+    pub fn with_identity_enabled(mut self, identity_enabled: bool) -> Self {
+        self.identity_enabled = identity_enabled;
         self
     }
 }
@@ -368,7 +375,9 @@ impl HelperState {
             expected_text,
             new_target
         );
-        let response = if let Some(identity) = LocalIdentity::load_optional()? {
+        let response = if self.config.identity_enabled
+            && let Some(identity) = LocalIdentity::load_optional()?
+        {
             let command = identity.signed_ref_update_command(
                 &transaction_id,
                 &push.dst,
@@ -754,6 +763,7 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::*;
 
@@ -955,6 +965,90 @@ mod tests {
     }
 
     #[test]
+    fn push_imports_commit_graph_into_live_daemon_and_publishes_ref() {
+        let root = unique_temp_dir("gitmesh-helper-push");
+        let socket = root.join("gitmeshd.sock");
+        let object_store = root.join("objects.tsv");
+        let ref_store = root.join("refs.tsv");
+        let policy_store = root.join("policy.tsv");
+        let key_store = root.join("keys.tsv");
+        let account_store = root.join("accounts.tsv");
+        let worktree = root.join("worktree");
+        fs::create_dir_all(&root).unwrap();
+        let daemon_socket = socket.clone();
+        let daemon_object_store = object_store.clone();
+        let daemon_ref_store = ref_store.clone();
+        let daemon_policy_store = policy_store.clone();
+        let daemon_key_store = key_store.clone();
+        let daemon_account_store = account_store.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let _daemon = std::thread::spawn(move || {
+            let result = gitmeshd::serve_unix_socket_with_stores_and_auth(
+                daemon_socket,
+                Some(daemon_object_store),
+                Some(daemon_ref_store),
+                Some(daemon_policy_store),
+                Some(daemon_key_store),
+                Some(daemon_account_store),
+                gitmeshd::DaemonAuth::disabled(),
+            );
+            let _ = ready_tx.send(result.map_err(|err| err.to_string()));
+        });
+        wait_for_socket(&socket, &ready_rx);
+        run_git_command(&root, ["init", worktree.to_str().unwrap()]);
+        run_git_command(
+            &worktree,
+            ["config", "user.email", "gitmesh@example.invalid"],
+        );
+        run_git_command(&worktree, ["config", "user.name", "GitMesh Test"]);
+        fs::write(worktree.join("README.md"), "hello from remote helper\n").unwrap();
+        run_git_command(&worktree, ["add", "README.md"]);
+        run_git_command(&worktree, ["commit", "-m", "initial"]);
+        let oid_output = Command::new("git")
+            .arg("-C")
+            .arg(&worktree)
+            .arg("rev-parse")
+            .arg("HEAD")
+            .output()
+            .unwrap();
+        assert!(oid_output.status.success());
+        let oid = String::from_utf8_lossy(&oid_output.stdout)
+            .trim()
+            .to_string();
+        let mut output = Vec::new();
+
+        run_helper(
+            HelperConfig::new("origin", Some("gitmesh://farzeen/gitmesh".to_string()))
+                .with_git_dir(Some(worktree.join(".git")))
+                .with_daemon_socket(Some(socket.clone()))
+                .with_identity_enabled(false),
+            Cursor::new("capabilities\npush HEAD:refs/heads/main\n\n"),
+            &mut output,
+        )
+        .unwrap();
+        let ref_response =
+            gitmeshd::request_unix_socket(&socket, "REF_GET refs/heads/main").unwrap();
+        let pack_response = gitmeshd::request_unix_socket(&socket, "PACK_GET all").unwrap();
+        let pack_hex = response_field(&pack_response, "pack_hex").unwrap();
+        let pack = decode_hex(pack_hex).unwrap();
+        let parsed = gitmesh_git::parse_packfile(&pack).unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            format!("{CAPABILITIES}ok refs/heads/main\n\n")
+        );
+        assert_eq!(ref_response, format!("OK ref=refs/heads/main oid={oid}"));
+        assert!(
+            parsed
+                .objects
+                .iter()
+                .any(|object| object.sha1_oid().to_string() == oid)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn decodes_pack_hex_payloads() {
         assert_eq!(decode_hex("5041434b").unwrap(), b"PACK");
         assert!(decode_hex("xyz").is_err());
@@ -1017,5 +1111,42 @@ mod tests {
         ));
 
         let _ = fs::remove_file(path);
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        PathBuf::from("/tmp").join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    }
+
+    fn wait_for_socket(
+        socket: &Path,
+        server_result: &std::sync::mpsc::Receiver<std::result::Result<(), String>>,
+    ) {
+        for _ in 0..100 {
+            if socket.exists() {
+                return;
+            }
+            if let Ok(result) = server_result.try_recv() {
+                panic!("daemon exited before creating socket: {result:?}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("daemon socket was not created: {}", socket.display());
+    }
+
+    fn run_git_command<const N: usize>(cwd: &Path, args: [&str; N]) {
+        let output = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

@@ -14,6 +14,8 @@ Currently implemented:
   object database
 - `push` capability for branch updates: imports reachable local objects into
   `gitmeshd` and publishes refs through daemon CAS updates
+- live daemon coverage for helper push: a real local Git commit is imported,
+  published as a daemon ref, and exported back as a valid GitMesh pack
 - force-push and ref deletion mapping to daemon ref-update semantics
 - `list` / `list for-push` ref advertisement from local `gitmeshd` when
   available
