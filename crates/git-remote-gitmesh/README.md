@@ -10,6 +10,8 @@ Currently implemented:
 - `fetch` capability that installs the daemon-exported pack into `$GIT_DIR`
   with `git index-pack --strict`
 - real `check-connectivity` handling through `git fsck --connectivity-only`
+- integration coverage for installing an advertised pack into a real bare Git
+  object database
 - `push` capability for branch updates: imports reachable local objects into
   `gitmeshd` and publishes refs through daemon CAS updates
 - force-push and ref deletion mapping to daemon ref-update semantics

@@ -902,6 +902,59 @@ mod tests {
     }
 
     #[test]
+    fn fetch_installs_advertised_pack_and_checks_connectivity() {
+        let git_dir =
+            std::env::temp_dir().join(format!("gitmesh-helper-fetch-{}.git", std::process::id()));
+        let init = Command::new("git")
+            .arg("init")
+            .arg("--bare")
+            .arg(&git_dir)
+            .output()
+            .unwrap();
+        assert!(
+            init.status.success(),
+            "{}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        let object = gitmesh_git::GitObject::new(gitmesh_git::GitObjectKind::Blob, b"fetched");
+        let oid = object.sha1_oid().to_string();
+        let pack = gitmesh_git::write_packfile(&[object]).unwrap();
+        let refs_advertisement = format!("OK refs=refs/heads/main:{oid}");
+        let pack_advertisement =
+            format!("OK pack_version=2 objects=1 pack_hex={}", encode_hex(&pack));
+        let mut output = Vec::new();
+
+        run_helper(
+            HelperConfig::new("origin", None)
+                .with_refs_advertisement(Some(refs_advertisement))
+                .with_pack_advertisement(Some(pack_advertisement))
+                .with_git_dir(Some(git_dir.clone())),
+            Cursor::new(format!(
+                "capabilities\noption check-connectivity true\nfetch {oid} refs/heads/main\n\n"
+            )),
+            &mut output,
+        )
+        .unwrap();
+        let cat = Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .arg("cat-file")
+            .arg("-p")
+            .arg(&oid)
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            format!("{CAPABILITIES}ok\nconnectivity-ok\n\n")
+        );
+        assert!(cat.status.success());
+        assert_eq!(cat.stdout, b"fetched");
+
+        let _ = fs::remove_dir_all(git_dir);
+    }
+
+    #[test]
     fn decodes_pack_hex_payloads() {
         assert_eq!(decode_hex("5041434b").unwrap(), b"PACK");
         assert!(decode_hex("xyz").is_err());
