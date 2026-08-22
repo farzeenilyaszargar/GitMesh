@@ -966,36 +966,9 @@ mod tests {
 
     #[test]
     fn push_imports_commit_graph_into_live_daemon_and_publishes_ref() {
-        let root = unique_temp_dir("gitmesh-helper-push");
-        let socket = root.join("gitmeshd.sock");
-        let object_store = root.join("objects.tsv");
-        let ref_store = root.join("refs.tsv");
-        let policy_store = root.join("policy.tsv");
-        let key_store = root.join("keys.tsv");
-        let account_store = root.join("accounts.tsv");
-        let worktree = root.join("worktree");
-        fs::create_dir_all(&root).unwrap();
-        let daemon_socket = socket.clone();
-        let daemon_object_store = object_store.clone();
-        let daemon_ref_store = ref_store.clone();
-        let daemon_policy_store = policy_store.clone();
-        let daemon_key_store = key_store.clone();
-        let daemon_account_store = account_store.clone();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let _daemon = std::thread::spawn(move || {
-            let result = gitmeshd::serve_unix_socket_with_stores_and_auth(
-                daemon_socket,
-                Some(daemon_object_store),
-                Some(daemon_ref_store),
-                Some(daemon_policy_store),
-                Some(daemon_key_store),
-                Some(daemon_account_store),
-                gitmeshd::DaemonAuth::disabled(),
-            );
-            let _ = ready_tx.send(result.map_err(|err| err.to_string()));
-        });
-        wait_for_socket(&socket, &ready_rx);
-        run_git_command(&root, ["init", worktree.to_str().unwrap()]);
+        let daemon = LiveDaemon::start("gitmesh-helper-push");
+        let worktree = daemon.root.join("worktree");
+        run_git_command(&daemon.root, ["init", worktree.to_str().unwrap()]);
         run_git_command(
             &worktree,
             ["config", "user.email", "gitmesh@example.invalid"],
@@ -1020,15 +993,15 @@ mod tests {
         run_helper(
             HelperConfig::new("origin", Some("gitmesh://farzeen/gitmesh".to_string()))
                 .with_git_dir(Some(worktree.join(".git")))
-                .with_daemon_socket(Some(socket.clone()))
+                .with_daemon_socket(Some(daemon.socket.clone()))
                 .with_identity_enabled(false),
             Cursor::new("capabilities\npush HEAD:refs/heads/main\n\n"),
             &mut output,
         )
         .unwrap();
         let ref_response =
-            gitmeshd::request_unix_socket(&socket, "REF_GET refs/heads/main").unwrap();
-        let pack_response = gitmeshd::request_unix_socket(&socket, "PACK_GET all").unwrap();
+            gitmeshd::request_unix_socket(&daemon.socket, "REF_GET refs/heads/main").unwrap();
+        let pack_response = gitmeshd::request_unix_socket(&daemon.socket, "PACK_GET all").unwrap();
         let pack_hex = response_field(&pack_response, "pack_hex").unwrap();
         let pack = decode_hex(pack_hex).unwrap();
         let parsed = gitmesh_git::parse_packfile(&pack).unwrap();
@@ -1045,7 +1018,51 @@ mod tests {
                 .any(|object| object.sha1_oid().to_string() == oid)
         );
 
-        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(daemon.root);
+    }
+
+    #[test]
+    fn push_delete_removes_live_daemon_ref() {
+        let daemon = LiveDaemon::start("gitmesh-helper-delete");
+        let worktree = daemon.root.join("worktree");
+        run_git_command(&daemon.root, ["init", worktree.to_str().unwrap()]);
+        run_git_command(
+            &worktree,
+            ["config", "user.email", "gitmesh@example.invalid"],
+        );
+        run_git_command(&worktree, ["config", "user.name", "GitMesh Test"]);
+        fs::write(worktree.join("README.md"), "delete me\n").unwrap();
+        run_git_command(&worktree, ["add", "README.md"]);
+        run_git_command(&worktree, ["commit", "-m", "initial"]);
+        let config = HelperConfig::new("origin", Some("gitmesh://farzeen/gitmesh".to_string()))
+            .with_git_dir(Some(worktree.join(".git")))
+            .with_daemon_socket(Some(daemon.socket.clone()))
+            .with_identity_enabled(false);
+        let mut create_output = Vec::new();
+        let mut delete_output = Vec::new();
+
+        run_helper(
+            config.clone(),
+            Cursor::new("capabilities\npush HEAD:refs/heads/main\n\n"),
+            &mut create_output,
+        )
+        .unwrap();
+        run_helper(
+            config,
+            Cursor::new("capabilities\npush :refs/heads/main\n\n"),
+            &mut delete_output,
+        )
+        .unwrap();
+        let ref_response =
+            gitmeshd::request_unix_socket(&daemon.socket, "REF_GET refs/heads/main").unwrap();
+
+        assert_eq!(
+            String::from_utf8(delete_output).unwrap(),
+            format!("{CAPABILITIES}ok refs/heads/main\n\n")
+        );
+        assert_eq!(ref_response, "OK ref=refs/heads/main oid=none");
+
+        let _ = fs::remove_dir_all(daemon.root);
     }
 
     #[test]
@@ -1119,6 +1136,40 @@ mod tests {
             .unwrap()
             .as_nanos();
         PathBuf::from("/tmp").join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    }
+
+    struct LiveDaemon {
+        root: PathBuf,
+        socket: PathBuf,
+    }
+
+    impl LiveDaemon {
+        fn start(prefix: &str) -> Self {
+            let root = unique_temp_dir(prefix);
+            let socket = root.join("gitmeshd.sock");
+            fs::create_dir_all(&root).unwrap();
+            let daemon_socket = socket.clone();
+            let object_store = root.join("objects.tsv");
+            let ref_store = root.join("refs.tsv");
+            let policy_store = root.join("policy.tsv");
+            let key_store = root.join("keys.tsv");
+            let account_store = root.join("accounts.tsv");
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result = gitmeshd::serve_unix_socket_with_stores_and_auth(
+                    daemon_socket,
+                    Some(object_store),
+                    Some(ref_store),
+                    Some(policy_store),
+                    Some(key_store),
+                    Some(account_store),
+                    gitmeshd::DaemonAuth::disabled(),
+                );
+                let _ = ready_tx.send(result.map_err(|err| err.to_string()));
+            });
+            wait_for_socket(&socket, &ready_rx);
+            Self { root, socket }
+        }
     }
 
     fn wait_for_socket(
