@@ -1275,11 +1275,14 @@ mod tests {
             std::thread::spawn(move || {
                 let result = gitmeshd::serve_unix_socket_with_stores_and_auth(
                     daemon_socket,
-                    Some(object_store),
-                    Some(ref_store),
-                    Some(policy_store),
-                    Some(key_store),
-                    Some(account_store),
+                    gitmeshd::DaemonStorePaths {
+                        object_store_path: Some(object_store),
+                        ref_store_path: Some(ref_store),
+                        policy_store_path: Some(policy_store),
+                        key_grant_store_path: Some(key_store),
+                        account_store_path: Some(account_store),
+                        collaboration_store_path: None,
+                    },
                     gitmeshd::DaemonAuth::disabled(),
                 );
                 let _ = ready_tx.send(result.map_err(|err| err.to_string()));

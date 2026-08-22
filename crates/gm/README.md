@@ -63,3 +63,8 @@ Issue and pull request commands read daemon collaboration summaries when
 `gitmeshd` has seeded or persisted collaboration events, with deterministic local
 samples as an offline fallback. Persistent production auth and full multi-node
 online sync remain future components.
+
+For local end-to-end collaboration demos, start `gitmeshd serve` with a
+collaboration store path and run `gitmeshd collab-seed-samples [socket]` once.
+The web gateway, `gm issue`, and `gm pr` then read the same persisted daemon
+event summaries.

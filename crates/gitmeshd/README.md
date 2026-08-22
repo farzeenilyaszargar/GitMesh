@@ -6,7 +6,7 @@ Currently implemented:
 
 - `gitmeshd v0-proof [payload...]`
 - `gitmeshd network-repair-proof [payload...]`
-- `gitmeshd serve [socket] [object-store] [ref-store] [policy-store] [key-grant-store]`
+- `gitmeshd serve [socket] [object-store] [ref-store] [policy-store] [key-grant-store] [account-store] [collaboration-store]`
 - `gitmeshd ping [socket]`
 - `gitmeshd socket-v0-proof [socket] [payload...]`
 - `gitmeshd socket-network-repair-proof [socket] [payload...]`
@@ -22,6 +22,9 @@ Currently implemented:
 - `gitmeshd object-get [socket] <oid>`
 - `gitmeshd object-list [socket]`
 - `gitmeshd repo-status [socket]`
+- `gitmeshd collab-seed-samples [socket]`
+- `gitmeshd issue-list [socket] <owner/repo>`
+- `gitmeshd pr-list [socket] <owner/repo>`
 - `gitmeshd key-grant-list [socket] <repo-id> [latest|all|epoch]`
 - `gitmeshd key-grant-revoke-device [socket] <device-cid> <effective-epoch>`
 - `gitmeshd key-grant-status [socket] <repo-id>`
@@ -46,14 +49,17 @@ The socket protocol is a V0 line protocol over Unix domain sockets:
 - `KEY_GRANT_LIST <repo-id> [latest|all|epoch]`
 - `KEY_GRANT_REVOKE_DEVICE <device-cid> <effective-epoch>`
 - `KEY_GRANT_STATUS <repo-id>`
+- `COLLAB_SEED_SAMPLES`
+- `ISSUE_LIST <owner/repo>`
+- `PR_LIST <owner/repo>`
 - `REPO_STATUS`
 
 The optional store paths persist canonical Git object storage state and
-repository ref, transaction-receipt, checkpoint, policy, and key-grant state across daemon
-restarts. This is not the final daemon API, but it is now a real local IPC
-boundary. `PACK_PUT` imports full objects plus OFS-delta and REF-delta entries
-with pack checksum validation. `PACK_GET all` currently exports full-object
-packs for compatibility.
+repository ref, transaction-receipt, checkpoint, policy, key-grant, account, and
+collaboration event state across daemon restarts. This is not the final daemon
+API, but it is now a real local IPC boundary. `PACK_PUT` imports full objects
+plus OFS-delta and REF-delta entries with pack checksum validation. `PACK_GET
+all` currently exports full-object packs for compatibility.
 
 `NETWORK_REPAIR_PROOF` is a Git-object-level backend proof for the current P2P
 storage spine. It stores a blob as encrypted erasure-coded shards, publishes
@@ -71,6 +77,8 @@ infrastructure is exposed through server-side JSON routes for local development:
 - `GET /api/gitmesh/key-grants`
 - `GET /api/gitmesh/network-repair-proof`
 - `POST /api/gitmesh/network-repair-proof`
+- `GET /api/gitmesh/issues`
+- `GET /api/gitmesh/pulls`
 - `GET /api/gitmesh/accounts`
 - `POST /api/gitmesh/accounts`
 - `GET /api/gitmesh/accounts/:username`

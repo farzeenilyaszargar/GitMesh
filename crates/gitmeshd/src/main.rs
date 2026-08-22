@@ -3,8 +3,8 @@ use std::{fs, path::PathBuf, process::ExitCode};
 use gitmesh_repository::{RepositoryError, encode_hex, run_repository_transport_repair_proof};
 use gitmesh_storage::{StoragePolicy, run_v0_local_storage_proof};
 use gitmeshd::{
-    DaemonAuth, default_socket_path, request_unix_socket, request_unix_socket_frame,
-    serve_unix_socket_with_stores_and_auth,
+    DaemonAuth, DaemonStorePaths, default_socket_path, request_unix_socket,
+    request_unix_socket_frame, serve_unix_socket_with_stores_and_auth,
 };
 use thiserror::Error;
 
@@ -29,6 +29,7 @@ fn run() -> Result<(), GitMeshdError> {
             let policy_store_path: Option<PathBuf> = args.next().map(Into::into);
             let key_grant_store_path: Option<PathBuf> = args.next().map(Into::into);
             let account_store_path: Option<PathBuf> = args.next().map(Into::into);
+            let collaboration_store_path: Option<PathBuf> = args.next().map(Into::into);
             println!("gitmeshd listening on {}", socket_path.display());
             if let Some(path) = &object_store_path {
                 println!("gitmeshd object store {}", path.display());
@@ -45,17 +46,23 @@ fn run() -> Result<(), GitMeshdError> {
             if let Some(path) = &account_store_path {
                 println!("gitmeshd account store {}", path.display());
             }
+            if let Some(path) = &collaboration_store_path {
+                println!("gitmeshd collaboration store {}", path.display());
+            }
             let auth = DaemonAuth::from_env()?;
             if auth.is_enabled() {
                 println!("gitmeshd admin auth enabled");
             }
             serve_unix_socket_with_stores_and_auth(
                 socket_path,
-                object_store_path,
-                ref_store_path,
-                policy_store_path,
-                key_grant_store_path,
-                account_store_path,
+                DaemonStorePaths {
+                    object_store_path,
+                    ref_store_path,
+                    policy_store_path,
+                    key_grant_store_path,
+                    account_store_path,
+                    collaboration_store_path,
+                },
                 auth,
             )?;
             Ok(())
@@ -268,6 +275,36 @@ fn run() -> Result<(), GitMeshdError> {
             println!("{}", request_unix_socket(socket_path, "REPO_STATUS")?);
             Ok(())
         }
+        Some("collab-seed-samples") => {
+            let socket_path = args.next().map_or_else(default_socket_path, Into::into);
+            println!(
+                "{}",
+                request_unix_socket(socket_path, "COLLAB_SEED_SAMPLES")?
+            );
+            Ok(())
+        }
+        Some("issue-list") => {
+            let socket_path = args.next().map_or_else(default_socket_path, Into::into);
+            let repo = args
+                .next()
+                .ok_or_else(|| GitMeshdError::InvalidArguments("missing repo".to_string()))?;
+            println!(
+                "{}",
+                request_unix_socket(socket_path, &format!("ISSUE_LIST {repo}"))?
+            );
+            Ok(())
+        }
+        Some("pr-list") => {
+            let socket_path = args.next().map_or_else(default_socket_path, Into::into);
+            let repo = args
+                .next()
+                .ok_or_else(|| GitMeshdError::InvalidArguments("missing repo".to_string()))?;
+            println!(
+                "{}",
+                request_unix_socket(socket_path, &format!("PR_LIST {repo}"))?
+            );
+            Ok(())
+        }
         Some("key-grant-list") => {
             let socket_path = args.next().map_or_else(default_socket_path, Into::into);
             let repo_id = args
@@ -365,7 +402,7 @@ fn print_help() {
     println!("  v0-proof [payload...]   run the local encrypt/erasure-code/recover proof");
     println!("  network-repair-proof [payload...]   run Git-object transport repair proof");
     println!(
-        "  serve [socket] [object-store] [ref-store] [policy-store] [key-grant-store] [account-store]   run the local daemon socket server"
+        "  serve [socket] [object-store] [ref-store] [policy-store] [key-grant-store] [account-store] [collaboration-store]   run the local daemon socket server"
     );
     println!("  ping [socket]           ping a running local daemon");
     println!("  frame-ping [socket] [request-id]   ping using the binary frame protocol");
@@ -391,6 +428,9 @@ fn print_help() {
     println!("  key-grant-list [socket] <repo-id> [latest|all|epoch]");
     println!("  key-grant-revoke-device [socket] <device-cid> <effective-epoch>");
     println!("  key-grant-status [socket] <repo-id>");
+    println!("  collab-seed-samples [socket]");
+    println!("  issue-list [socket] <owner/repo>");
+    println!("  pr-list [socket] <owner/repo>");
 }
 
 #[derive(Debug, Error)]

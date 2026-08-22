@@ -127,6 +127,16 @@ impl DaemonAuth {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DaemonStorePaths {
+    pub object_store_path: Option<PathBuf>,
+    pub ref_store_path: Option<PathBuf>,
+    pub policy_store_path: Option<PathBuf>,
+    pub key_grant_store_path: Option<PathBuf>,
+    pub account_store_path: Option<PathBuf>,
+    pub collaboration_store_path: Option<PathBuf>,
+}
+
 #[derive(Clone, Debug)]
 pub struct DaemonState {
     repo_id: RepoId,
@@ -1321,11 +1331,12 @@ pub fn serve_unix_socket_with_stores(
 ) -> Result<()> {
     serve_unix_socket_with_stores_and_auth(
         socket_path,
-        object_store_path,
-        ref_store_path,
-        policy_store_path,
-        None::<PathBuf>,
-        None::<PathBuf>,
+        DaemonStorePaths {
+            object_store_path: object_store_path.map(Into::into),
+            ref_store_path: ref_store_path.map(Into::into),
+            policy_store_path: policy_store_path.map(Into::into),
+            ..DaemonStorePaths::default()
+        },
         DaemonAuth::disabled(),
     )
 }
@@ -1333,23 +1344,22 @@ pub fn serve_unix_socket_with_stores(
 #[cfg(unix)]
 pub fn serve_unix_socket_with_stores_and_auth(
     socket_path: impl AsRef<Path>,
-    object_store_path: Option<impl Into<PathBuf>>,
-    ref_store_path: Option<impl Into<PathBuf>>,
-    policy_store_path: Option<impl Into<PathBuf>>,
-    key_grant_store_path: Option<impl Into<PathBuf>>,
-    account_store_path: Option<impl Into<PathBuf>>,
+    stores: DaemonStorePaths,
     auth: DaemonAuth,
 ) -> Result<()> {
     let socket_path = socket_path.as_ref();
     remove_stale_socket(socket_path)?;
     let listener = UnixListener::bind(socket_path)?;
-    let state = Arc::new(Mutex::new(DaemonState::with_all_store_paths(
-        object_store_path.map(Into::into),
-        ref_store_path.map(Into::into),
-        policy_store_path.map(Into::into),
-        key_grant_store_path.map(Into::into),
-        account_store_path.map(Into::into),
-    )?));
+    let state = Arc::new(Mutex::new(
+        DaemonState::with_all_store_paths_and_collaboration(
+            stores.object_store_path,
+            stores.ref_store_path,
+            stores.policy_store_path,
+            stores.key_grant_store_path,
+            stores.account_store_path,
+            stores.collaboration_store_path,
+        )?,
+    ));
     let auth = Arc::new(auth);
     for stream in listener.incoming() {
         let stream = stream?;
@@ -1390,11 +1400,7 @@ pub fn serve_unix_socket_with_stores(
 #[cfg(not(unix))]
 pub fn serve_unix_socket_with_stores_and_auth(
     _socket_path: impl AsRef<Path>,
-    _object_store_path: Option<impl Into<PathBuf>>,
-    _ref_store_path: Option<impl Into<PathBuf>>,
-    _policy_store_path: Option<impl Into<PathBuf>>,
-    _key_grant_store_path: Option<impl Into<PathBuf>>,
-    _account_store_path: Option<impl Into<PathBuf>>,
+    _stores: DaemonStorePaths,
     _auth: DaemonAuth,
 ) -> Result<()> {
     Err(DaemonError::UnsupportedPlatform)
