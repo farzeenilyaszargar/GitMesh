@@ -6,7 +6,7 @@ Currently implemented:
 
 - `gitmeshd v0-proof [payload...]`
 - `gitmeshd network-repair-proof [payload...]`
-- `gitmeshd serve [socket] [object-store] [ref-store] [policy-store] [key-grant-store] [account-store] [collaboration-store]`
+- `gitmeshd serve [socket] [object-store] [ref-store] [policy-store] [key-grant-store] [account-store] [collaboration-store] [network-store]`
 - `gitmeshd ping [socket]`
 - `gitmeshd socket-v0-proof [socket] [payload...]`
 - `gitmeshd socket-network-repair-proof [socket] [payload...]`
@@ -22,6 +22,11 @@ Currently implemented:
 - `gitmeshd object-get [socket] <oid>`
 - `gitmeshd object-list [socket]`
 - `gitmeshd repo-status [socket]`
+- `gitmeshd network-status [socket]`
+- `gitmeshd network-listen [socket] <multiaddr>`
+- `gitmeshd network-bootstrap [socket] <peer-id> <operator-id> <region> <multiaddr>`
+- `gitmeshd network-peer-add [socket] <peer-id> <operator-id> <roles-csv> <region> <protocols-csv> <addresses-csv|->`
+- `gitmeshd network-peer-list [socket]`
 - `gitmeshd collab-seed-samples [socket]`
 - `gitmeshd issue-open [socket] <owner/repo> <actor> <title-hex> <body-hex|-> <labels-hex-list|->`
 - `gitmeshd issue-list [socket] <owner/repo>`
@@ -56,14 +61,20 @@ The socket protocol is a V0 line protocol over Unix domain sockets:
 - `ISSUE_LIST <owner/repo>`
 - `PR_OPEN <owner/repo> <actor> <source-ref> <target-ref> <title-hex> <body-hex|-> <labels-hex-list|->`
 - `PR_LIST <owner/repo>`
+- `NETWORK_STATUS`
+- `NETWORK_LISTEN <multiaddr>`
+- `NETWORK_BOOTSTRAP <peer-id> <operator-id> <region> <multiaddr>`
+- `NETWORK_PEER_ADD <peer-id> <operator-id> <roles-csv> <region> <protocols-csv> <addresses-csv|->`
+- `NETWORK_PEER_LIST`
 - `REPO_STATUS`
 
 The optional store paths persist canonical Git object storage state and
-repository ref, transaction-receipt, checkpoint, policy, key-grant, account, and
-collaboration event state across daemon restarts. This is not the final daemon
-API, but it is now a real local IPC boundary. `PACK_PUT` imports full objects
-plus OFS-delta and REF-delta entries with pack checksum validation. `PACK_GET
-all` currently exports full-object packs for compatibility.
+repository ref, transaction-receipt, checkpoint, policy, key-grant, account,
+collaboration event, and network node/peer state across daemon restarts. This
+is not the final daemon API, but it is now a real local IPC boundary. `PACK_PUT`
+imports full objects plus OFS-delta and REF-delta entries with pack checksum
+validation. `PACK_GET all` currently exports full-object packs for
+compatibility.
 
 `NETWORK_REPAIR_PROOF` is a Git-object-level backend proof for the current P2P
 storage spine. It stores a blob as encrypted erasure-coded shards, publishes

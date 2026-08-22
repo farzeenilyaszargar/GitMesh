@@ -22,6 +22,11 @@ Implemented command families:
 - `gm daemon ping [socket]`
 - `gm daemon proof [socket] [payload...]`
 - `gm daemon network-proof [socket] [payload...]`
+- `gm daemon network-status [socket]`
+- `gm daemon network-listen [socket] <multiaddr>`
+- `gm daemon network-bootstrap [socket] <peer-id> <operator-id> <region> <multiaddr>`
+- `gm daemon network-peer-add [socket] <peer-id> <operator-id> <roles-csv> <region> <protocols-csv> <addresses-csv|->`
+- `gm daemon network-peer-list [socket]`
 - `gm ref list [socket]`
 - `gm ref get [socket] <ref>`
 - `gm ref update [socket] <tx> <ref> <expected|none> <new|delete> <signer>`
@@ -53,6 +58,11 @@ bare-repo bridge and native `git clone`.
 encrypted erasure-coded shards are published to providers, one provider is
 removed, the missing shard is rebuilt on a replacement peer, and the original
 Git object is verified after rediscovery.
+
+`gm daemon network-status`, `network-listen`, `network-bootstrap`, and
+`network-peer-add` operate on the daemon's persisted P2P node registry. This is
+the current bootstrap/control-plane spine for known peers before the libp2p
+runtime takes over live dialing.
 
 `signed-update-dev` uses an ephemeral certified Ed25519 device key to exercise
 the production signed `RefUpdate` path. Persistent account/device key storage is

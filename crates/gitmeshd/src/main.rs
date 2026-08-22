@@ -30,6 +30,7 @@ fn run() -> Result<(), GitMeshdError> {
             let key_grant_store_path: Option<PathBuf> = args.next().map(Into::into);
             let account_store_path: Option<PathBuf> = args.next().map(Into::into);
             let collaboration_store_path: Option<PathBuf> = args.next().map(Into::into);
+            let network_store_path: Option<PathBuf> = args.next().map(Into::into);
             println!("gitmeshd listening on {}", socket_path.display());
             if let Some(path) = &object_store_path {
                 println!("gitmeshd object store {}", path.display());
@@ -49,6 +50,9 @@ fn run() -> Result<(), GitMeshdError> {
             if let Some(path) = &collaboration_store_path {
                 println!("gitmeshd collaboration store {}", path.display());
             }
+            if let Some(path) = &network_store_path {
+                println!("gitmeshd network store {}", path.display());
+            }
             let auth = DaemonAuth::from_env()?;
             if auth.is_enabled() {
                 println!("gitmeshd admin auth enabled");
@@ -62,6 +66,7 @@ fn run() -> Result<(), GitMeshdError> {
                     key_grant_store_path,
                     account_store_path,
                     collaboration_store_path,
+                    network_store_path,
                 },
                 auth,
             )?;
@@ -275,6 +280,60 @@ fn run() -> Result<(), GitMeshdError> {
             println!("{}", request_unix_socket(socket_path, "REPO_STATUS")?);
             Ok(())
         }
+        Some("network-status") => {
+            let socket_path = args.next().map_or_else(default_socket_path, Into::into);
+            println!("{}", request_unix_socket(socket_path, "NETWORK_STATUS")?);
+            Ok(())
+        }
+        Some("network-listen") => {
+            let socket_path = args.next().map_or_else(default_socket_path, Into::into);
+            let address = args.next().ok_or_else(|| {
+                GitMeshdError::InvalidArguments("missing listen address".to_string())
+            })?;
+            println!(
+                "{}",
+                request_unix_socket(socket_path, &format!("NETWORK_LISTEN {address}"))?
+            );
+            Ok(())
+        }
+        Some("network-bootstrap") => {
+            let socket_path = args.next().map_or_else(default_socket_path, Into::into);
+            let rest = args.collect::<Vec<_>>();
+            if rest.len() != 4 {
+                return Err(GitMeshdError::InvalidArguments(
+                    "network-bootstrap requires <peer-id> <operator-id> <region> <address>"
+                        .to_string(),
+                ));
+            }
+            println!(
+                "{}",
+                request_unix_socket(
+                    socket_path,
+                    &format!("NETWORK_BOOTSTRAP {}", rest.join(" "))
+                )?
+            );
+            Ok(())
+        }
+        Some("network-peer-add") => {
+            let socket_path = args.next().map_or_else(default_socket_path, Into::into);
+            let rest = args.collect::<Vec<_>>();
+            if rest.len() != 6 {
+                return Err(GitMeshdError::InvalidArguments(
+                    "network-peer-add requires <peer-id> <operator-id> <roles-csv> <region> <protocols-csv> <addresses-csv|->"
+                        .to_string(),
+                ));
+            }
+            println!(
+                "{}",
+                request_unix_socket(socket_path, &format!("NETWORK_PEER_ADD {}", rest.join(" ")))?
+            );
+            Ok(())
+        }
+        Some("network-peer-list") => {
+            let socket_path = args.next().map_or_else(default_socket_path, Into::into);
+            println!("{}", request_unix_socket(socket_path, "NETWORK_PEER_LIST")?);
+            Ok(())
+        }
         Some("collab-seed-samples") => {
             let socket_path = args.next().map_or_else(default_socket_path, Into::into);
             println!(
@@ -432,7 +491,7 @@ fn print_help() {
     println!("  v0-proof [payload...]   run the local encrypt/erasure-code/recover proof");
     println!("  network-repair-proof [payload...]   run Git-object transport repair proof");
     println!(
-        "  serve [socket] [object-store] [ref-store] [policy-store] [key-grant-store] [account-store] [collaboration-store]   run the local daemon socket server"
+        "  serve [socket] [object-store] [ref-store] [policy-store] [key-grant-store] [account-store] [collaboration-store] [network-store]   run the local daemon socket server"
     );
     println!("  ping [socket]           ping a running local daemon");
     println!("  frame-ping [socket] [request-id]   ping using the binary frame protocol");
@@ -455,6 +514,13 @@ fn print_help() {
     println!("  object-get [socket] <oid>");
     println!("  object-list [socket]");
     println!("  repo-status [socket]");
+    println!("  network-status [socket]");
+    println!("  network-listen [socket] <multiaddr>");
+    println!("  network-bootstrap [socket] <peer-id> <operator-id> <region> <multiaddr>");
+    println!(
+        "  network-peer-add [socket] <peer-id> <operator-id> <roles-csv> <region> <protocols-csv> <addresses-csv|->"
+    );
+    println!("  network-peer-list [socket]");
     println!("  key-grant-list [socket] <repo-id> [latest|all|epoch]");
     println!("  key-grant-revoke-device [socket] <device-cid> <effective-epoch>");
     println!("  key-grant-status [socket] <repo-id>");

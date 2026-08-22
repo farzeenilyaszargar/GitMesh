@@ -6,9 +6,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::fs;
+use std::path::Path;
 
 use gitmesh_core::{Cid, shard_cid};
 use thiserror::Error;
+
+const NODE_STORE_HEADER: &str = "gitmesh-network-node-store-v0";
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct PeerId(String);
@@ -50,6 +54,41 @@ pub enum NodeRole {
     Repair,
     Indexer,
     Runner,
+}
+
+impl NodeRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Cache => "cache",
+            Self::Storage => "storage",
+            Self::Bootstrap => "bootstrap",
+            Self::Relay => "relay",
+            Self::Dht => "dht",
+            Self::Gateway => "gateway",
+            Self::Coordinator => "coordinator",
+            Self::Repair => "repair",
+            Self::Indexer => "indexer",
+            Self::Runner => "runner",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, NetworkError> {
+        match value {
+            "client" => Ok(Self::Client),
+            "cache" => Ok(Self::Cache),
+            "storage" => Ok(Self::Storage),
+            "bootstrap" => Ok(Self::Bootstrap),
+            "relay" => Ok(Self::Relay),
+            "dht" => Ok(Self::Dht),
+            "gateway" => Ok(Self::Gateway),
+            "coordinator" => Ok(Self::Coordinator),
+            "repair" => Ok(Self::Repair),
+            "indexer" => Ok(Self::Indexer),
+            "runner" => Ok(Self::Runner),
+            _ => Err(NetworkError::InvalidNodeDescriptor),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -133,6 +172,276 @@ pub enum ProtocolId {
     PingV0,
     AvailabilityV0,
     ShardTransferV0,
+}
+
+impl ProtocolId {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PingV0 => "ping-v0",
+            Self::AvailabilityV0 => "availability-v0",
+            Self::ShardTransferV0 => "shard-transfer-v0",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, NetworkError> {
+        match value {
+            "ping-v0" => Ok(Self::PingV0),
+            "availability-v0" => Ok(Self::AvailabilityV0),
+            "shard-transfer-v0" => Ok(Self::ShardTransferV0),
+            _ => Err(NetworkError::InvalidNodeDescriptor),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KnownPeerRecord {
+    pub descriptor: NodeDescriptor,
+    pub addresses: Vec<String>,
+    pub first_seen_unix: u64,
+    pub last_seen_unix: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NetworkNodeStore {
+    local_node: NodeDescriptor,
+    listen_addresses: Vec<String>,
+    known_peers: BTreeMap<PeerId, KnownPeerRecord>,
+}
+
+impl Default for NetworkNodeStore {
+    fn default() -> Self {
+        Self {
+            local_node: NodeDescriptor::new(
+                PeerId::new("local-gitmeshd").expect("static peer id is valid"),
+                OperatorId::new("local-gitmesh").expect("static operator id is valid"),
+                [
+                    NodeRole::Client,
+                    NodeRole::Gateway,
+                    NodeRole::Coordinator,
+                    NodeRole::Repair,
+                ],
+                "local",
+                [ProtocolId::PingV0, ProtocolId::AvailabilityV0],
+            )
+            .expect("static node descriptor is valid"),
+            listen_addresses: Vec::new(),
+            known_peers: BTreeMap::new(),
+        }
+    }
+}
+
+impl NetworkNodeStore {
+    pub fn local_node(&self) -> &NodeDescriptor {
+        &self.local_node
+    }
+
+    pub fn listen_addresses(&self) -> &[String] {
+        &self.listen_addresses
+    }
+
+    pub fn known_peers(&self) -> impl Iterator<Item = &KnownPeerRecord> {
+        self.known_peers.values()
+    }
+
+    pub fn known_peer_count(&self) -> usize {
+        self.known_peers.len()
+    }
+
+    pub fn storage_peer_count(&self) -> usize {
+        self.known_peers
+            .values()
+            .filter(|record| record.descriptor.has_role(NodeRole::Storage))
+            .count()
+    }
+
+    pub fn bootstrap_peer_count(&self) -> usize {
+        self.known_peers
+            .values()
+            .filter(|record| record.descriptor.has_role(NodeRole::Bootstrap))
+            .count()
+    }
+
+    pub fn add_listen_address(&mut self, address: impl Into<String>) -> Result<(), NetworkError> {
+        let address = validate_address(address.into())?;
+        if !self.listen_addresses.contains(&address) {
+            self.listen_addresses.push(address);
+            self.listen_addresses.sort();
+        }
+        Ok(())
+    }
+
+    pub fn register_peer(
+        &mut self,
+        descriptor: NodeDescriptor,
+        addresses: Vec<String>,
+        now_unix: u64,
+    ) -> Result<&KnownPeerRecord, NetworkError> {
+        if descriptor.peer_id == self.local_node.peer_id {
+            return Err(NetworkError::InvalidNodeDescriptor);
+        }
+        let mut addresses = addresses
+            .into_iter()
+            .map(validate_address)
+            .collect::<Result<Vec<_>, _>>()?;
+        addresses.sort();
+        addresses.dedup();
+
+        let peer_id = descriptor.peer_id.clone();
+        self.known_peers
+            .entry(peer_id.clone())
+            .and_modify(|record| {
+                record.descriptor = descriptor.clone();
+                record.addresses = addresses.clone();
+                record.last_seen_unix = now_unix;
+            })
+            .or_insert(KnownPeerRecord {
+                descriptor,
+                addresses,
+                first_seen_unix: now_unix,
+                last_seen_unix: now_unix,
+            });
+        self.known_peers
+            .get(&peer_id)
+            .ok_or(NetworkError::UnknownPeer)
+    }
+
+    pub fn bootstrap(
+        &mut self,
+        peer_id: impl Into<String>,
+        operator_id: impl Into<String>,
+        region: impl Into<String>,
+        address: impl Into<String>,
+        now_unix: u64,
+    ) -> Result<&KnownPeerRecord, NetworkError> {
+        let descriptor = NodeDescriptor::new(
+            PeerId::new(peer_id)?,
+            OperatorId::new(operator_id)?,
+            [NodeRole::Bootstrap, NodeRole::Dht],
+            region,
+            [ProtocolId::PingV0, ProtocolId::AvailabilityV0],
+        )?;
+        self.register_peer(descriptor, vec![address.into()], now_unix)
+    }
+
+    pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, NetworkError> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let text = fs::read_to_string(path).map_err(|err| NetworkError::Io(err.to_string()))?;
+        Self::from_snapshot(&text)
+    }
+
+    pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<(), NetworkError> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|err| NetworkError::Io(err.to_string()))?;
+        }
+        let tmp_path = path.with_extension("tmp");
+        fs::write(&tmp_path, self.to_snapshot())
+            .map_err(|err| NetworkError::Io(err.to_string()))?;
+        fs::rename(&tmp_path, path).map_err(|err| NetworkError::Io(err.to_string()))?;
+        Ok(())
+    }
+
+    pub fn to_snapshot(&self) -> String {
+        let mut output = String::from(NODE_STORE_HEADER);
+        output.push('\n');
+        output.push_str(&format!(
+            "local\t{}\t{}\t{}\t{}\t{}\n",
+            self.local_node.peer_id,
+            self.local_node.operator_id,
+            format_roles(&self.local_node.roles),
+            self.local_node.region,
+            format_protocols(&self.local_node.protocols)
+        ));
+        for address in &self.listen_addresses {
+            output.push_str(&format!("listen\t{address}\n"));
+        }
+        for record in self.known_peers.values() {
+            output.push_str(&format!(
+                "peer\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                record.descriptor.peer_id,
+                record.descriptor.operator_id,
+                format_roles(&record.descriptor.roles),
+                record.descriptor.region,
+                format_protocols(&record.descriptor.protocols),
+                format_addresses(&record.addresses),
+                record.first_seen_unix,
+                record.last_seen_unix
+            ));
+        }
+        output
+    }
+
+    pub fn from_snapshot(text: &str) -> Result<Self, NetworkError> {
+        let mut lines = text.lines();
+        if lines.next() != Some(NODE_STORE_HEADER) {
+            return Err(NetworkError::InvalidNodeStore);
+        }
+        let local_line = lines.next().ok_or(NetworkError::InvalidNodeStore)?;
+        let local_parts = local_line.split('\t').collect::<Vec<_>>();
+        if local_parts.len() != 6 || local_parts[0] != "local" {
+            return Err(NetworkError::InvalidNodeStore);
+        }
+        let local_node = NodeDescriptor::new(
+            PeerId::new(local_parts[1])?,
+            OperatorId::new(local_parts[2])?,
+            parse_roles(local_parts[3])?,
+            local_parts[4],
+            parse_protocols(local_parts[5])?,
+        )?;
+        let mut store = Self {
+            local_node,
+            listen_addresses: Vec::new(),
+            known_peers: BTreeMap::new(),
+        };
+        for line in lines {
+            let parts = line.split('\t').collect::<Vec<_>>();
+            match parts.as_slice() {
+                ["listen", address] => store.add_listen_address(*address)?,
+                [
+                    "peer",
+                    peer_id,
+                    operator_id,
+                    roles,
+                    region,
+                    protocols,
+                    addresses,
+                    first_seen_unix,
+                    last_seen_unix,
+                ] => {
+                    let descriptor = NodeDescriptor::new(
+                        PeerId::new(*peer_id)?,
+                        OperatorId::new(*operator_id)?,
+                        parse_roles(roles)?,
+                        *region,
+                        parse_protocols(protocols)?,
+                    )?;
+                    let first_seen_unix = first_seen_unix
+                        .parse::<u64>()
+                        .map_err(|_| NetworkError::InvalidNodeStore)?;
+                    let last_seen_unix = last_seen_unix
+                        .parse::<u64>()
+                        .map_err(|_| NetworkError::InvalidNodeStore)?;
+                    if last_seen_unix < first_seen_unix {
+                        return Err(NetworkError::InvalidNodeStore);
+                    }
+                    store.known_peers.insert(
+                        descriptor.peer_id.clone(),
+                        KnownPeerRecord {
+                            descriptor,
+                            addresses: parse_addresses(addresses)?,
+                            first_seen_unix,
+                            last_seen_unix,
+                        },
+                    );
+                }
+                _ => return Err(NetworkError::InvalidNodeStore),
+            }
+        }
+        Ok(store)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -723,16 +1032,100 @@ pub fn client_descriptor(peer: &str) -> Result<NodeDescriptor, NetworkError> {
     )
 }
 
+pub fn now_unix() -> Result<u64, NetworkError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| NetworkError::InvalidNodeStore)
+}
+
+pub fn parse_node_roles(value: &str) -> Result<BTreeSet<NodeRole>, NetworkError> {
+    parse_roles(value)
+}
+
+pub fn parse_protocol_ids(value: &str) -> Result<BTreeSet<ProtocolId>, NetworkError> {
+    parse_protocols(value)
+}
+
+fn validate_address(value: String) -> Result<String, NetworkError> {
+    if value.is_empty()
+        || value.len() > 256
+        || value.contains(char::is_whitespace)
+        || value.contains(',')
+        || value.contains('\t')
+    {
+        return Err(NetworkError::InvalidAddress);
+    }
+    Ok(value)
+}
+
+fn format_roles(roles: &BTreeSet<NodeRole>) -> String {
+    roles
+        .iter()
+        .map(|role| role.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn parse_roles(value: &str) -> Result<BTreeSet<NodeRole>, NetworkError> {
+    if value.is_empty() {
+        return Err(NetworkError::InvalidNodeDescriptor);
+    }
+    value.split(',').map(NodeRole::parse).collect()
+}
+
+fn format_protocols(protocols: &BTreeSet<ProtocolId>) -> String {
+    protocols
+        .iter()
+        .map(|protocol| protocol.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn parse_protocols(value: &str) -> Result<BTreeSet<ProtocolId>, NetworkError> {
+    if value.is_empty() {
+        return Err(NetworkError::InvalidNodeDescriptor);
+    }
+    value.split(',').map(ProtocolId::parse).collect()
+}
+
+fn format_addresses(addresses: &[String]) -> String {
+    if addresses.is_empty() {
+        "-".to_string()
+    } else {
+        addresses.join(",")
+    }
+}
+
+fn parse_addresses(value: &str) -> Result<Vec<String>, NetworkError> {
+    if value == "-" {
+        return Ok(Vec::new());
+    }
+    let mut addresses = value
+        .split(',')
+        .map(|address| validate_address(address.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    addresses.sort();
+    addresses.dedup();
+    Ok(addresses)
+}
+
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum NetworkError {
+    #[error("I/O failed: {0}")]
+    Io(String),
     #[error("peer id must be non-empty ASCII alphanumeric, '-' or '_'")]
     InvalidPeerId,
     #[error("operator id must be non-empty ASCII alphanumeric, '-' or '_'")]
     InvalidOperatorId,
     #[error("region must be non-empty ASCII alphanumeric, '-' or '_'")]
     InvalidRegion,
+    #[error("address must be non-empty, comma-free, tab-free, and contain no whitespace")]
+    InvalidAddress,
     #[error("node descriptor requires at least one role and protocol")]
     InvalidNodeDescriptor,
+    #[error("invalid network node store snapshot")]
+    InvalidNodeStore,
     #[error("invalid provider record")]
     InvalidProviderRecord,
     #[error("invalid shard envelope")]
@@ -1088,5 +1481,73 @@ mod tests {
         let err = plan_shard_placement(descriptors, &policy).unwrap_err();
 
         assert_eq!(err, NetworkError::InsufficientStoragePeers);
+    }
+
+    #[test]
+    fn node_store_registers_bootstrap_and_storage_peers() {
+        let mut store = NetworkNodeStore::default();
+        store.add_listen_address("/ip4/127.0.0.1/tcp/4040").unwrap();
+        store.add_listen_address("/ip4/127.0.0.1/tcp/4040").unwrap();
+        store
+            .bootstrap(
+                "bootstrap-a",
+                "operator-bootstrap",
+                "iad",
+                "/dns4/bootstrap.gitmesh.local/tcp/4001",
+                100,
+            )
+            .unwrap();
+        store
+            .register_peer(
+                storage_descriptor("storage-a", "operator-a", "sfo").unwrap(),
+                vec!["/ip4/10.0.0.2/tcp/4001".to_string()],
+                120,
+            )
+            .unwrap();
+
+        assert_eq!(store.listen_addresses(), ["/ip4/127.0.0.1/tcp/4040"]);
+        assert_eq!(store.known_peer_count(), 2);
+        assert_eq!(store.bootstrap_peer_count(), 1);
+        assert_eq!(store.storage_peer_count(), 1);
+    }
+
+    #[test]
+    fn node_store_snapshot_round_trips() {
+        let mut store = NetworkNodeStore::default();
+        store.add_listen_address("/ip4/127.0.0.1/tcp/4040").unwrap();
+        store
+            .bootstrap(
+                "bootstrap-a",
+                "operator-bootstrap",
+                "iad",
+                "/dns4/bootstrap.gitmesh.local/tcp/4001",
+                100,
+            )
+            .unwrap();
+        store
+            .register_peer(
+                storage_descriptor("storage-a", "operator-a", "sfo").unwrap(),
+                vec![
+                    "/ip4/10.0.0.2/tcp/4001".to_string(),
+                    "/ip4/10.0.0.2/tcp/4002".to_string(),
+                ],
+                120,
+            )
+            .unwrap();
+
+        let restored = NetworkNodeStore::from_snapshot(&store.to_snapshot()).unwrap();
+
+        assert_eq!(restored, store);
+    }
+
+    #[test]
+    fn node_store_rejects_whitespace_addresses() {
+        let mut store = NetworkNodeStore::default();
+
+        let err = store
+            .add_listen_address("/ip4/127.0.0.1/tcp/4040 bad")
+            .unwrap_err();
+
+        assert_eq!(err, NetworkError::InvalidAddress);
     }
 }

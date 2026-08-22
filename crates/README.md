@@ -16,14 +16,16 @@ Implemented:
   object validation.
 - `gitmesh-identity`: Ed25519 account/device identity primitives and signed
   device certificates.
-- `gitmesh-network`: V0 in-memory availability directory and provider records.
+- `gitmesh-network`: V0 node registry, availability directory, provider records,
+  transport boundary, in-memory swarm, and placement planning.
 - `gitmesh-repository`: repository object-store spine mapping canonical Git
   objects into encrypted, erasure-coded GitMesh storage records.
 - `gitmesh-storage`: V0 local storage proof using encryption, erasure coding,
   simulated nodes, shard loss, reconstruction, and exact recovery.
-- `gitmeshd`: local daemon binary skeleton exposing the V0 proof command.
-- `git-remote-gitmesh`: Git remote-helper skeleton with capabilities/options
-  handshake and V0 proof smoke command.
+- `gitmeshd`: local daemon exposing storage, refs, policy, identity grants,
+  accounts, collaboration, and persisted network-node commands.
+- `git-remote-gitmesh`: Git remote helper with capabilities/options handshake,
+  daemon-backed fetch/push, and Gen 1 cached bare-repo compatibility.
 
 Planned crate order:
 

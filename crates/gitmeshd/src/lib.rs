@@ -30,6 +30,10 @@ use gitmesh_git::{GitError, GitObject, GitSha1Oid, parse_packfile};
 use gitmesh_identity::{
     DeviceCertificate, DeviceId, IdentityError, RepoKeyGrant, RepoKeyGrantStore,
 };
+use gitmesh_network::{
+    NetworkError, NetworkNodeStore, NodeDescriptor, OperatorId, PeerId,
+    now_unix as network_now_unix, parse_node_roles, parse_protocol_ids,
+};
 use gitmesh_repository::{
     RepositoryError, RepositoryObjectAudit, RepositoryObjectStore, RepositoryRepairReport,
     RepositoryTransportRepairProof, decode_hex, encode_hex, parse_git_object_kind, parse_oid,
@@ -62,6 +66,8 @@ pub enum DaemonError {
     Identity(#[from] IdentityError),
     #[error("repository object store failed: {0}")]
     Repository(#[from] RepositoryError),
+    #[error("network node store failed: {0}")]
+    Network(#[from] NetworkError),
     #[error("account store failed: {0}")]
     Accounts(#[from] AccountError),
     #[error("collaboration store failed: {0}")]
@@ -136,6 +142,7 @@ pub struct DaemonStorePaths {
     pub key_grant_store_path: Option<PathBuf>,
     pub account_store_path: Option<PathBuf>,
     pub collaboration_store_path: Option<PathBuf>,
+    pub network_store_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -147,12 +154,14 @@ pub struct DaemonState {
     key_grants: RepoKeyGrantStore,
     accounts: AccountStore,
     collaboration: CollaborationEventStore,
+    network: NetworkNodeStore,
     object_store_path: Option<PathBuf>,
     ref_store_path: Option<PathBuf>,
     policy_store_path: Option<PathBuf>,
     key_grant_store_path: Option<PathBuf>,
     account_store_path: Option<PathBuf>,
     collaboration_store_path: Option<PathBuf>,
+    network_store_path: Option<PathBuf>,
 }
 
 impl Default for DaemonState {
@@ -165,12 +174,14 @@ impl Default for DaemonState {
             key_grants: RepoKeyGrantStore::default(),
             accounts: AccountStore::default(),
             collaboration: CollaborationEventStore::default(),
+            network: NetworkNodeStore::default(),
             object_store_path: None,
             ref_store_path: None,
             policy_store_path: None,
             key_grant_store_path: None,
             account_store_path: None,
             collaboration_store_path: None,
+            network_store_path: None,
         }
     }
 }
@@ -233,6 +244,26 @@ impl DaemonState {
         account_store_path: Option<PathBuf>,
         collaboration_store_path: Option<PathBuf>,
     ) -> Result<Self> {
+        Self::with_every_store_path(
+            object_store_path,
+            ref_store_path,
+            policy_store_path,
+            key_grant_store_path,
+            account_store_path,
+            collaboration_store_path,
+            None,
+        )
+    }
+
+    pub fn with_every_store_path(
+        object_store_path: Option<PathBuf>,
+        ref_store_path: Option<PathBuf>,
+        policy_store_path: Option<PathBuf>,
+        key_grant_store_path: Option<PathBuf>,
+        account_store_path: Option<PathBuf>,
+        collaboration_store_path: Option<PathBuf>,
+        network_store_path: Option<PathBuf>,
+    ) -> Result<Self> {
         Ok(Self {
             repo_id: RepoId::new(b"gitmeshd-v0-repo"),
             refs: if let Some(path) = &ref_store_path {
@@ -265,12 +296,18 @@ impl DaemonState {
             } else {
                 CollaborationEventStore::default()
             },
+            network: if let Some(path) = &network_store_path {
+                NetworkNodeStore::load_from_path(path)?
+            } else {
+                NetworkNodeStore::default()
+            },
             object_store_path,
             ref_store_path,
             policy_store_path,
             key_grant_store_path,
             account_store_path,
             collaboration_store_path,
+            network_store_path,
         })
     }
 
@@ -463,13 +500,33 @@ impl DaemonState {
             return self.pr_list(repo);
         }
 
+        if trimmed == "NETWORK_STATUS" {
+            return Ok(DaemonResponse::Ok(format_network_status(&self.network)));
+        }
+
+        if let Some(address) = trimmed.strip_prefix("NETWORK_LISTEN ") {
+            return self.network_listen(address);
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("NETWORK_BOOTSTRAP ") {
+            return self.network_bootstrap(rest);
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("NETWORK_PEER_ADD ") {
+            return self.network_peer_add(rest);
+        }
+
+        if trimmed == "NETWORK_PEER_LIST" {
+            return Ok(DaemonResponse::Ok(format_network_peer_list(&self.network)));
+        }
+
         if trimmed == "ACCOUNT_STATUS" {
             return Ok(DaemonResponse::Ok(format_account_status(&self.accounts)?));
         }
 
         if trimmed == "REPO_STATUS" {
             return Ok(DaemonResponse::Ok(format!(
-                "objects={} refs={} mutations={} checkpoints={} key_grants={} revoked_devices={} accounts={} active_sessions={} registered_repos={} collaboration_events={} data_shards={} parity_shards={}",
+                "objects={} refs={} mutations={} checkpoints={} key_grants={} revoked_devices={} accounts={} active_sessions={} registered_repos={} collaboration_events={} network_peers={} network_storage_peers={} data_shards={} parity_shards={}",
                 self.objects.object_count(),
                 self.refs.ref_count(),
                 self.refs.mutation_count(),
@@ -480,6 +537,8 @@ impl DaemonState {
                 self.accounts.active_session_count(now_unix()?),
                 self.accounts.repository_count(),
                 self.collaboration.event_count(),
+                self.network.known_peer_count(),
+                self.network.storage_peer_count(),
                 self.objects.policy().data_shards,
                 self.objects.policy().parity_shards
             )));
@@ -1083,6 +1142,60 @@ impl DaemonState {
         )))
     }
 
+    fn network_listen(&mut self, address: &str) -> Result<DaemonResponse> {
+        self.network.add_listen_address(address.trim())?;
+        self.save_network()?;
+        Ok(DaemonResponse::Ok(format_network_status(&self.network)))
+    }
+
+    fn network_bootstrap(&mut self, rest: &str) -> Result<DaemonResponse> {
+        let parts = rest.split_whitespace().collect::<Vec<_>>();
+        if parts.len() != 4 {
+            return Err(DaemonError::InvalidCommand(
+                "NETWORK_BOOTSTRAP requires <peer-id> <operator-id> <region> <address>".to_string(),
+            ));
+        }
+        let record =
+            self.network
+                .bootstrap(parts[0], parts[1], parts[2], parts[3], network_now_unix()?)?;
+        let peer_id = record.descriptor.peer_id.to_string();
+        let addresses = format_network_addresses(&record.addresses);
+        self.save_network()?;
+        Ok(DaemonResponse::Ok(format!(
+            "peer={peer_id} roles=bootstrap,dht addresses={addresses}"
+        )))
+    }
+
+    fn network_peer_add(&mut self, rest: &str) -> Result<DaemonResponse> {
+        let parts = rest.split_whitespace().collect::<Vec<_>>();
+        if parts.len() != 6 {
+            return Err(DaemonError::InvalidCommand(
+                "NETWORK_PEER_ADD requires <peer-id> <operator-id> <roles-csv> <region> <protocols-csv> <addresses-csv|->"
+                    .to_string(),
+            ));
+        }
+        let descriptor = NodeDescriptor::new(
+            PeerId::new(parts[0])?,
+            OperatorId::new(parts[1])?,
+            parse_node_roles(parts[2])?,
+            parts[3],
+            parse_protocol_ids(parts[4])?,
+        )?;
+        let record = self.network.register_peer(
+            descriptor,
+            parse_network_addresses(parts[5])?,
+            network_now_unix()?,
+        )?;
+        let peer_id = record.descriptor.peer_id.to_string();
+        let role_count = record.descriptor.roles.len();
+        let protocol_count = record.descriptor.protocols.len();
+        let address_count = record.addresses.len();
+        self.save_network()?;
+        Ok(DaemonResponse::Ok(format!(
+            "peer={peer_id} roles={role_count} protocols={protocol_count} addresses={address_count}"
+        )))
+    }
+
     fn save_objects(&self) -> Result<()> {
         if let Some(path) = &self.object_store_path {
             self.objects.save_to_path(path)?;
@@ -1121,6 +1234,13 @@ impl DaemonState {
     fn save_collaboration(&self) -> Result<()> {
         if let Some(path) = &self.collaboration_store_path {
             self.collaboration.save_to_path(path)?;
+        }
+        Ok(())
+    }
+
+    fn save_network(&self) -> Result<()> {
+        if let Some(path) = &self.network_store_path {
+            self.network.save_to_path(path)?;
         }
         Ok(())
     }
@@ -1244,6 +1364,9 @@ fn requires_admin_auth(command: &str) -> bool {
                 | "COLLAB_SEED_SAMPLES"
                 | "ISSUE_OPEN"
                 | "PR_OPEN"
+                | "NETWORK_LISTEN"
+                | "NETWORK_BOOTSTRAP"
+                | "NETWORK_PEER_ADD"
         )
     )
 }
@@ -1433,16 +1556,15 @@ pub fn serve_unix_socket_with_stores_and_auth(
     let socket_path = socket_path.as_ref();
     remove_stale_socket(socket_path)?;
     let listener = UnixListener::bind(socket_path)?;
-    let state = Arc::new(Mutex::new(
-        DaemonState::with_all_store_paths_and_collaboration(
-            stores.object_store_path,
-            stores.ref_store_path,
-            stores.policy_store_path,
-            stores.key_grant_store_path,
-            stores.account_store_path,
-            stores.collaboration_store_path,
-        )?,
-    ));
+    let state = Arc::new(Mutex::new(DaemonState::with_every_store_path(
+        stores.object_store_path,
+        stores.ref_store_path,
+        stores.policy_store_path,
+        stores.key_grant_store_path,
+        stores.account_store_path,
+        stores.collaboration_store_path,
+        stores.network_store_path,
+    )?));
     let auth = Arc::new(auth);
     for stream in listener.incoming() {
         let stream = stream?;
@@ -2055,6 +2177,80 @@ fn format_pr_list(repo: &str, pull_requests: &[PullRequestSummary]) -> String {
     )
 }
 
+fn format_network_status(network: &NetworkNodeStore) -> String {
+    format!(
+        "local_peer={} local_roles={} listen_addresses={} known_peers={} bootstrap_peers={} storage_peers={}",
+        network.local_node().peer_id,
+        network
+            .local_node()
+            .roles
+            .iter()
+            .map(|role| role.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+        format_network_addresses(network.listen_addresses()),
+        network.known_peer_count(),
+        network.bootstrap_peer_count(),
+        network.storage_peer_count()
+    )
+}
+
+fn format_network_peer_list(network: &NetworkNodeStore) -> String {
+    let peers = network.known_peers().collect::<Vec<_>>();
+    if peers.is_empty() {
+        return "peers=none count=0".to_string();
+    }
+    let entries = peers
+        .iter()
+        .map(|record| {
+            format!(
+                "{};{};{};{};{};{}",
+                record.descriptor.peer_id,
+                record.descriptor.operator_id,
+                record
+                    .descriptor
+                    .roles
+                    .iter()
+                    .map(|role| role.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                record.descriptor.region,
+                record
+                    .descriptor
+                    .protocols
+                    .iter()
+                    .map(|protocol| protocol.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                format_network_addresses(&record.addresses)
+            )
+        })
+        .collect::<Vec<_>>();
+    format!("peers={} count={}", entries.join("|"), peers.len())
+}
+
+fn parse_network_addresses(value: &str) -> Result<Vec<String>> {
+    if value == "-" {
+        return Ok(Vec::new());
+    }
+    value
+        .split(',')
+        .map(|address| {
+            let mut store = NetworkNodeStore::default();
+            store.add_listen_address(address)?;
+            Ok(address.to_string())
+        })
+        .collect()
+}
+
+fn format_network_addresses(addresses: &[String]) -> String {
+    if addresses.is_empty() {
+        "-".to_string()
+    } else {
+        addresses.join(",")
+    }
+}
+
 fn encode_label_list(labels: &[String]) -> String {
     if labels.is_empty() {
         return "-".to_string();
@@ -2325,6 +2521,68 @@ mod tests {
 
         assert_eq!(authorize_command(&auth, "PING").unwrap(), "PING");
         assert_eq!(authorize_command(&auth, "REF_LIST").unwrap(), "REF_LIST");
+        assert_eq!(
+            authorize_command(&auth, "NETWORK_STATUS").unwrap(),
+            "NETWORK_STATUS"
+        );
+        assert_eq!(
+            authorize_command(&auth, "NETWORK_PEER_LIST").unwrap(),
+            "NETWORK_PEER_LIST"
+        );
+    }
+
+    #[test]
+    fn auth_denies_network_mutations_without_token() {
+        let auth = DaemonAuth::from_admin_token("0123456789abcdef").unwrap();
+
+        assert!(matches!(
+            authorize_command(&auth, "NETWORK_LISTEN /ip4/127.0.0.1/tcp/4040").unwrap_err(),
+            DaemonError::Unauthorized
+        ));
+        assert!(matches!(
+            authorize_command(
+                &auth,
+                "NETWORK_PEER_ADD storage-a operator-a storage sfo ping-v0 /ip4/10.0.0.2/tcp/4001"
+            )
+            .unwrap_err(),
+            DaemonError::Unauthorized
+        ));
+    }
+
+    #[test]
+    fn network_commands_register_listen_bootstrap_and_storage_peers() {
+        let mut state = DaemonState::default();
+
+        let listen = state
+            .handle_command("NETWORK_LISTEN /ip4/127.0.0.1/tcp/4040")
+            .unwrap()
+            .into_line();
+        let bootstrap = state
+            .handle_command(
+                "NETWORK_BOOTSTRAP bootstrap-a operator-bootstrap iad /dns4/bootstrap.gitmesh.local/tcp/4001",
+            )
+            .unwrap()
+            .into_line();
+        let storage = state
+            .handle_command(
+                "NETWORK_PEER_ADD storage-a operator-a storage sfo ping-v0,availability-v0,shard-transfer-v0 /ip4/10.0.0.2/tcp/4001",
+            )
+            .unwrap()
+            .into_line();
+        let status = state.handle_command("NETWORK_STATUS").unwrap().into_line();
+        let peers = state
+            .handle_command("NETWORK_PEER_LIST")
+            .unwrap()
+            .into_line();
+
+        assert!(listen.contains("listen_addresses=/ip4/127.0.0.1/tcp/4040"));
+        assert!(bootstrap.contains("peer=bootstrap-a"));
+        assert!(storage.contains("peer=storage-a"));
+        assert!(status.contains("known_peers=2"));
+        assert!(status.contains("bootstrap_peers=1"));
+        assert!(status.contains("storage_peers=1"));
+        assert!(peers.contains("bootstrap-a;operator-bootstrap"));
+        assert!(peers.contains("storage-a;operator-a"));
     }
 
     #[test]

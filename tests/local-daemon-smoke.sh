@@ -10,6 +10,7 @@ POLICY_STORE="$TMP_DIR/policy.tsv"
 KEY_STORE="$TMP_DIR/key-grants.tsv"
 ACCOUNT_STORE="$TMP_DIR/accounts.tsv"
 COLLAB_STORE="$TMP_DIR/collaboration.tsv"
+NETWORK_STORE="$TMP_DIR/network.tsv"
 DAEMON_PID=""
 WEB_PID=""
 WEB_PORT=""
@@ -69,6 +70,7 @@ cargo run --quiet --bin gitmeshd -- serve \
   "$KEY_STORE" \
   "$ACCOUNT_STORE" \
   "$COLLAB_STORE" \
+  "$NETWORK_STORE" \
   >"$TMP_DIR/gitmeshd.log" 2>&1 &
 DAEMON_PID="$!"
 
@@ -132,6 +134,42 @@ expect_contains "$status_response" "objects=1"
 expect_contains "$status_response" "refs=1"
 expect_contains "$status_response" "collaboration_events=2"
 
+network_listen_response="$(run_gitmeshd network-listen "$SOCKET_PATH" /ip4/127.0.0.1/tcp/4040)"
+expect_contains "$network_listen_response" "listen_addresses=/ip4/127.0.0.1/tcp/4040"
+
+network_bootstrap_response="$(
+  run_gitmeshd network-bootstrap \
+    "$SOCKET_PATH" \
+    bootstrap-a \
+    operator-bootstrap \
+    iad \
+    /dns4/bootstrap.gitmesh.local/tcp/4001
+)"
+expect_contains "$network_bootstrap_response" "peer=bootstrap-a"
+expect_contains "$network_bootstrap_response" "roles=bootstrap,dht"
+
+gm_network_peer_response="$(
+  run_gm daemon network-peer-add \
+    "$SOCKET_PATH" \
+    storage-a \
+    operator-a \
+    storage \
+    sfo \
+    ping-v0,availability-v0,shard-transfer-v0 \
+    /ip4/10.0.0.2/tcp/4001
+)"
+expect_contains "$gm_network_peer_response" "peer=storage-a"
+expect_contains "$gm_network_peer_response" "addresses=1"
+
+gm_network_status="$(run_gm daemon network-status "$SOCKET_PATH")"
+expect_contains "$gm_network_status" "known_peers=2"
+expect_contains "$gm_network_status" "bootstrap_peers=1"
+expect_contains "$gm_network_status" "storage_peers=1"
+
+gm_network_peers="$(run_gm daemon network-peer-list "$SOCKET_PATH")"
+expect_contains "$gm_network_peers" "bootstrap-a;operator-bootstrap"
+expect_contains "$gm_network_peers" "storage-a;operator-a"
+
 gm_issue_response="$(run_gm issue create "CLI issue" "verifies gm writes" "cli,collaboration")"
 expect_contains "$gm_issue_response" "OK event="
 expect_contains "$gm_issue_response" "number=2"
@@ -192,8 +230,9 @@ expect_contains "$web_pulls_list" '"title":"Web pull request"'
 web_status="$(get_json "/api/gitmesh/status")"
 expect_contains "$web_status" '"ok":true'
 expect_contains "$web_status" '"collaboration_events":"6"'
+expect_contains "$web_status" '"network_peers":"2"'
 
-for store in "$OBJECT_STORE" "$REF_STORE" "$COLLAB_STORE"; do
+for store in "$OBJECT_STORE" "$REF_STORE" "$COLLAB_STORE" "$NETWORK_STORE"; do
   if [[ ! -s "$store" ]]; then
     echo "expected persisted store file: $store" >&2
     exit 1

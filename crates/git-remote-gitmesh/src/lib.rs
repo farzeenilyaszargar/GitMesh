@@ -1282,6 +1282,7 @@ mod tests {
                         key_grant_store_path: Some(key_store),
                         account_store_path: Some(account_store),
                         collaboration_store_path: None,
+                        network_store_path: None,
                     },
                     gitmeshd::DaemonAuth::disabled(),
                 );

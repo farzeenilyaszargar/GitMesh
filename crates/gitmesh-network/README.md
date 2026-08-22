@@ -12,6 +12,8 @@ Currently implemented:
 - `ShardRef`
 - `ShardEnvelope`
 - `ShardProviderRecord`
+- `KnownPeerRecord`
+- `NetworkNodeStore`
 - `InMemoryAvailabilityDirectory`
 - `NetworkRequest` / `NetworkResponse`
 - `NetworkTransport`
@@ -20,6 +22,7 @@ Currently implemented:
 - `PlacementPolicy`
 - `PlacementPlan`
 - deterministic shard placement over qualified storage descriptors
+- durable node/listen/bootstrap/known-peer snapshots for `gitmeshd`
 
 This is the V0 testable P2P architecture boundary, not production libp2p yet.
 The purpose is to make core storage flows depend on an explicit transport
@@ -28,6 +31,8 @@ interface before QUIC/TCP/Noise/Kademlia are introduced.
 The in-memory swarm supports:
 
 - peer descriptors with roles, operator identity, region, and protocol support
+- persistent local node identity, listen addresses, bootstrap peers, and known
+  peer records
 - request/response routing between peers
 - storage-role enforcement for shard writes
 - shard integrity verification before store/fetch success

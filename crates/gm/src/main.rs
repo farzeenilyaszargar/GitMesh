@@ -1117,6 +1117,60 @@ fn daemon(args: &[String]) -> Result<(), GmError> {
             println!("{}", request_unix_socket(socket_path, &command)?);
             Ok(())
         }
+        Some("network-status") => {
+            let socket_path = args.get(1).map_or_else(default_socket_path, Into::into);
+            println!("{}", request_unix_socket(socket_path, "NETWORK_STATUS")?);
+            Ok(())
+        }
+        Some("network-listen") => {
+            let socket_path = args.get(1).map_or_else(default_socket_path, Into::into);
+            let address = args.get(2).ok_or_else(|| {
+                GmError::InvalidArguments("daemon network-listen requires a multiaddr".to_string())
+            })?;
+            println!(
+                "{}",
+                request_unix_socket(socket_path, &format!("NETWORK_LISTEN {address}"))?
+            );
+            Ok(())
+        }
+        Some("network-bootstrap") => {
+            let socket_path = args.get(1).map_or_else(default_socket_path, Into::into);
+            let rest = args.iter().skip(2).cloned().collect::<Vec<_>>();
+            if rest.len() != 4 {
+                return Err(GmError::InvalidArguments(
+                    "daemon network-bootstrap requires <peer-id> <operator-id> <region> <multiaddr>"
+                        .to_string(),
+                ));
+            }
+            println!(
+                "{}",
+                request_unix_socket(
+                    socket_path,
+                    &format!("NETWORK_BOOTSTRAP {}", rest.join(" "))
+                )?
+            );
+            Ok(())
+        }
+        Some("network-peer-add") => {
+            let socket_path = args.get(1).map_or_else(default_socket_path, Into::into);
+            let rest = args.iter().skip(2).cloned().collect::<Vec<_>>();
+            if rest.len() != 6 {
+                return Err(GmError::InvalidArguments(
+                    "daemon network-peer-add requires <peer-id> <operator-id> <roles-csv> <region> <protocols-csv> <addresses-csv|->"
+                        .to_string(),
+                ));
+            }
+            println!(
+                "{}",
+                request_unix_socket(socket_path, &format!("NETWORK_PEER_ADD {}", rest.join(" ")))?
+            );
+            Ok(())
+        }
+        Some("network-peer-list") => {
+            let socket_path = args.get(1).map_or_else(default_socket_path, Into::into);
+            println!("{}", request_unix_socket(socket_path, "NETWORK_PEER_LIST")?);
+            Ok(())
+        }
         Some(command) => Err(GmError::UnknownCommand(format!("daemon {command}"))),
     }
 }
@@ -1812,6 +1866,13 @@ fn print_help() {
     println!("  daemon ping [socket]");
     println!("  daemon proof [socket] [payload...]");
     println!("  daemon network-proof [socket] [payload...]");
+    println!("  daemon network-status [socket]");
+    println!("  daemon network-listen [socket] <multiaddr>");
+    println!("  daemon network-bootstrap [socket] <peer-id> <operator-id> <region> <multiaddr>");
+    println!(
+        "  daemon network-peer-add [socket] <peer-id> <operator-id> <roles-csv> <region> <protocols-csv> <addresses-csv|->"
+    );
+    println!("  daemon network-peer-list [socket]");
     println!("  policy show [socket]");
     println!("  policy require-signed [socket] <true|false>");
     println!("  policy grant-writer [socket] <account-cid>");
