@@ -308,6 +308,10 @@ fn repo(args: &[String]) -> Result<(), GmError> {
             println!("Created repository {}", repo.name);
             println!("Visibility: {}", repo.visibility.as_str());
             println!("Remote: gitmesh://{}", repo.name);
+            match register_repo_with_daemon(default_socket_path(), &repo) {
+                Ok(response) => println!("Daemon registration: {response}"),
+                Err(err) => println!("Daemon registration: pending ({err})"),
+            }
             Ok(())
         }
         Some(command) => Err(GmError::UnknownCommand(format!("repo {command}"))),
@@ -486,7 +490,65 @@ fn print_repo(repo: &LocalRepo) {
     println!("Visibility: {}", repo.visibility.as_str());
     println!("Default branch: {}", repo.default_branch);
     println!("Remote: gitmesh://{}", repo.name);
-    println!("Status: local manifest persisted, network sync not implemented");
+    println!("Local manifest: persisted");
+    println!("Daemon registration: available through gitmeshd account repository registry");
+}
+
+fn register_repo_with_daemon(socket_path: PathBuf, repo: &LocalRepo) -> Result<String, GmError> {
+    let (owner, _) = split_repo_name(&repo.name)?;
+    let identity = LocalIdentity::load_or_create_default()?;
+    let account_command = format!(
+        "ACCOUNT_CREATE {owner} {} {} - -",
+        identity.certificate.account_id.as_cid(),
+        encode_text_arg(owner)
+    );
+    let account_response = request_unix_socket(&socket_path, &account_command)?;
+    accept_daemon_response(
+        &account_response,
+        &["username already exists", "account already exists"],
+    )?;
+    let response = request_unix_socket(socket_path, &repo_register_command(repo)?)?;
+    accept_daemon_response(&response, &[])
+}
+
+fn accept_daemon_response(response: &str, tolerated_errors: &[&str]) -> Result<String, GmError> {
+    if let Some(message) = response.strip_prefix("OK ") {
+        Ok(message.to_string())
+    } else if let Some(message) = response.strip_prefix("ERR ") {
+        if tolerated_errors
+            .iter()
+            .any(|tolerated| message.contains(tolerated))
+        {
+            Ok(message.to_string())
+        } else {
+            Err(GmError::DaemonResponse(message.to_string()))
+        }
+    } else {
+        Err(GmError::DaemonResponse(response.to_string()))
+    }
+}
+
+fn repo_register_command(repo: &LocalRepo) -> Result<String, GmError> {
+    let (owner, name) = split_repo_name(&repo.name)?;
+    Ok(format!(
+        "REPO_REGISTER {owner} {name} {} {}",
+        repo_id_for_name(&repo.name)?,
+        repo.visibility.as_str()
+    ))
+}
+
+fn split_repo_name(value: &str) -> Result<(&str, &str), GmError> {
+    validate_repo_name(value)?;
+    if let Some((owner, name)) = value.split_once('/') {
+        Ok((owner, name))
+    } else {
+        Ok(("local", value))
+    }
+}
+
+fn repo_id_for_name(value: &str) -> Result<String, GmError> {
+    validate_repo_name(value)?;
+    Ok(format!("repo:{value}"))
 }
 
 fn state_path() -> Result<PathBuf, GmError> {
@@ -1718,6 +1780,53 @@ mod tests {
         };
 
         assert_eq!(LocalRepo::decode(&repo.encode()).unwrap(), repo);
+    }
+
+    #[test]
+    fn splits_repo_names_for_daemon_registration() {
+        assert_eq!(
+            split_repo_name("farzeen/gitmesh").unwrap(),
+            ("farzeen", "gitmesh")
+        );
+        assert_eq!(
+            split_repo_name("gitmesh-local").unwrap(),
+            ("local", "gitmesh-local")
+        );
+        assert!(split_repo_name("bad/name/extra").is_err());
+    }
+
+    #[test]
+    fn builds_repo_register_command_for_daemon_registry() {
+        let repo = LocalRepo {
+            name: "farzeen/gitmesh".to_string(),
+            visibility: RepoVisibility::Private,
+            default_branch: "main".to_string(),
+            description: "GitMesh repository".to_string(),
+        };
+
+        assert_eq!(
+            repo_register_command(&repo).unwrap(),
+            "REPO_REGISTER farzeen gitmesh repo:farzeen/gitmesh private"
+        );
+        assert_eq!(
+            repo_id_for_name("farzeen/gitmesh").unwrap(),
+            "repo:farzeen/gitmesh"
+        );
+    }
+
+    #[test]
+    fn accepts_daemon_ok_and_tolerated_idempotent_errors() {
+        assert_eq!(
+            accept_daemon_response("OK owner=farzeen", &[]).unwrap(),
+            "owner=farzeen"
+        );
+        assert_eq!(
+            accept_daemon_response("ERR username already exists", &["username already exists"])
+                .unwrap(),
+            "username already exists"
+        );
+        assert!(accept_daemon_response("ERR account not found", &[]).is_err());
+        assert!(accept_daemon_response("not protocol", &[]).is_err());
     }
 
     #[test]

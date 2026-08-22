@@ -35,7 +35,10 @@ Implemented command families:
 - `gm proof [payload...]`
 
 Repository creation persists local manifests to `~/.gitmesh/gm-state.tsv` by
-default. Set `GITMESH_GM_STATE` to point at a different state file for testing.
+default. When `gitmeshd` is running, it creates or reuses the local device
+identity, ensures the owner account profile exists, and registers the repository
+with a stable `repo:<owner>/<name>` repository ID. Set `GITMESH_GM_STATE` to
+point at a different state file for testing.
 
 When paired with `gitmeshd serve [socket] [object-store] [ref-store]`, object
 and ref commands exercise the durable local repository spine. `repo
@@ -56,5 +59,5 @@ Pack import accepts full objects plus OFS-delta and REF-delta entries. Pack
 export currently writes full-object packs for compatibility.
 
 Issue and pull request commands currently read local deterministic sample
-collaboration events. Full remote-helper fetch/push, persisted auth, and network
+collaboration events. Persistent production auth and full multi-node online
 sync remain future components.
