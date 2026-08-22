@@ -14,9 +14,11 @@ Implemented command families:
 - `gm repo materialize [socket] <bare-dir>`
 - `gm issue list`
 - `gm issue view <id>`
+- `gm issue create <title> [body] [label,label]`
 - `gm pr list`
 - `gm pr status`
 - `gm pr view <id>`
+- `gm pr create <title> <source-ref> [target-ref] [body] [label,label]`
 - `gm daemon ping [socket]`
 - `gm daemon proof [socket] [payload...]`
 - `gm daemon network-proof [socket] [payload...]`
@@ -59,9 +61,10 @@ a later auth component.
 Pack import accepts full objects plus OFS-delta and REF-delta entries. Pack
 export currently writes full-object packs for compatibility.
 
-Issue and pull request commands read daemon collaboration summaries when
-`gitmeshd` has seeded or persisted collaboration events, with deterministic local
-samples as an offline fallback. Persistent production auth and full multi-node
+Issue and pull request list/view commands read daemon collaboration summaries
+when `gitmeshd` has persisted collaboration events, with deterministic local
+samples as an offline fallback. Create commands write new daemon
+collaboration-event records. Persistent production auth and full multi-node
 online sync remain future components.
 
 For local end-to-end collaboration demos, start `gitmeshd serve` with a

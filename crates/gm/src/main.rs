@@ -926,6 +926,23 @@ fn decode_hex_text_list(value: &str) -> Result<Vec<String>, GmError> {
     value.split(',').map(decode_hex_text).collect()
 }
 
+fn encode_label_arg(value: Option<&String>) -> Result<String, GmError> {
+    let Some(value) = value else {
+        return Ok("-".to_string());
+    };
+    if value.trim().is_empty() {
+        return Ok("-".to_string());
+    }
+    value
+        .split(',')
+        .map(|label| {
+            validate_state_field(label.trim())?;
+            Ok(encode_text_arg(label.trim()))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|labels| labels.join(","))
+}
+
 fn issue(args: &[String]) -> Result<(), GmError> {
     match args.first().map(String::as_str) {
         Some("list") | None => {
@@ -963,6 +980,22 @@ fn issue(args: &[String]) -> Result<(), GmError> {
             println!("Author: {}", issue.actor);
             println!("Labels: {}", issue.labels.join(", "));
             println!("Event: {}", issue.event_id);
+            Ok(())
+        }
+        Some("create") => {
+            let title = args.get(1).ok_or_else(|| {
+                GmError::InvalidArguments("issue create requires a title".to_string())
+            })?;
+            let body = args.get(2).map_or("-", |value| value.as_str());
+            validate_state_field(title)?;
+            validate_state_field(body)?;
+            let command = format!(
+                "ISSUE_OPEN farzeen/gitmesh farzeen {} {} {}",
+                encode_text_arg(title),
+                encode_text_arg(body),
+                encode_label_arg(args.get(3))?
+            );
+            println!("{}", request_unix_socket(default_socket_path(), &command)?);
             Ok(())
         }
         Some(command) => Err(GmError::UnknownCommand(format!("issue {command}"))),
@@ -1025,6 +1058,30 @@ fn pr(args: &[String]) -> Result<(), GmError> {
             println!("Refs: {} -> {}", pr.source_ref, pr.target_ref);
             println!("Labels: {}", pr.labels.join(", "));
             println!("Event: {}", pr.event_id);
+            Ok(())
+        }
+        Some("create") => {
+            let title = args.get(1).ok_or_else(|| {
+                GmError::InvalidArguments("pr create requires a title".to_string())
+            })?;
+            let source = args.get(2).ok_or_else(|| {
+                GmError::InvalidArguments("pr create requires a source ref".to_string())
+            })?;
+            let target = args.get(3).map_or("refs/heads/main", String::as_str);
+            let body = args.get(4).map_or("-", String::as_str);
+            validate_state_field(title)?;
+            validate_state_field(source)?;
+            validate_state_field(target)?;
+            validate_state_field(body)?;
+            let command = format!(
+                "PR_OPEN farzeen/gitmesh farzeen {} {} {} {} {}",
+                source,
+                target,
+                encode_text_arg(title),
+                encode_text_arg(body),
+                encode_label_arg(args.get(5))?
+            );
+            println!("{}", request_unix_socket(default_socket_path(), &command)?);
             Ok(())
         }
         Some(command) => Err(GmError::UnknownCommand(format!("pr {command}"))),
@@ -1748,8 +1805,10 @@ fn print_help() {
     println!("  repo clone <gitmesh-url> [directory]");
     println!("  repo create [owner/repo] [--public|--private] [-d description]");
     println!("  repo materialize [socket] <bare-dir>");
-    println!("  issue list | issue view <id>");
-    println!("  pr list | pr status | pr view <id>");
+    println!("  issue list | issue view <id> | issue create <title> [body] [label,label]");
+    println!(
+        "  pr list | pr status | pr view <id> | pr create <title> <source-ref> [target-ref] [body] [label,label]"
+    );
     println!("  daemon ping [socket]");
     println!("  daemon proof [socket] [payload...]");
     println!("  daemon network-proof [socket] [payload...]");
@@ -2021,6 +2080,16 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn encodes_collaboration_label_arguments() {
+        assert_eq!(encode_label_arg(None).unwrap(), "-");
+        assert_eq!(
+            encode_label_arg(Some(&"storage, correctness".to_string())).unwrap(),
+            "73746f72616765,636f72726563746e657373"
+        );
+        assert!(encode_label_arg(Some(&"bad\nlabel".to_string())).is_err());
     }
 
     #[test]

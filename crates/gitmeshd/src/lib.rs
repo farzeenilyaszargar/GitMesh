@@ -18,8 +18,9 @@ use gitmesh_accounts::{
     now_unix,
 };
 use gitmesh_collaboration::{
-    CollaborationError, CollaborationEventStore, IssueSummary, PullRequestSummary,
-    sample_issue_events, sample_pull_request_events,
+    CollaborationError, CollaborationEvent, CollaborationEventKind, CollaborationEventStore,
+    CollaborationPayload, IssueSummary, PullRequestSummary, sample_issue_events,
+    sample_pull_request_events,
 };
 use gitmesh_coordination::{
     CoordinationError, RefName, RefStore, RefUpdate, RefUpdateActor, RejectionReason, RepoId,
@@ -446,8 +447,16 @@ impl DaemonState {
             return self.collab_seed_samples();
         }
 
+        if let Some(rest) = trimmed.strip_prefix("ISSUE_OPEN ") {
+            return self.issue_open(rest);
+        }
+
         if let Some(repo) = trimmed.strip_prefix("ISSUE_LIST ") {
             return self.issue_list(repo);
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("PR_OPEN ") {
+            return self.pr_open(rest);
         }
 
         if let Some(repo) = trimmed.strip_prefix("PR_LIST ") {
@@ -986,11 +995,83 @@ impl DaemonState {
         )))
     }
 
+    fn issue_open(&mut self, rest: &str) -> Result<DaemonResponse> {
+        let parts = rest.split_whitespace().collect::<Vec<_>>();
+        if parts.len() != 5 {
+            return Err(DaemonError::InvalidCommand(
+                "ISSUE_OPEN requires <repo> <actor> <title-hex> <body-hex|-> <labels-hex-list|->"
+                    .to_string(),
+            ));
+        }
+        validate_repo_selector(parts[0])?;
+        validate_collaboration_actor(parts[1])?;
+        let event = CollaborationEvent::new(
+            parts[0],
+            CollaborationEventKind::IssueOpened,
+            parts[1],
+            Vec::new(),
+            now_unix()?,
+            CollaborationPayload::issue(
+                decode_text_arg(parts[2])?,
+                decode_text_arg(parts[3])?,
+                decode_label_arg(parts[4])?,
+            ),
+        )?;
+        let event_id = event.event_id;
+        let inserted = self.collaboration.insert(event);
+        self.save_collaboration()?;
+        let number = self.collaboration.issue_summaries(parts[0]).len();
+        Ok(DaemonResponse::Ok(format!(
+            "event={} repo={} number={} inserted={}",
+            event_id.as_hex(),
+            parts[0],
+            number,
+            inserted
+        )))
+    }
+
     fn issue_list(&self, repo: &str) -> Result<DaemonResponse> {
         validate_repo_selector(repo.trim())?;
         Ok(DaemonResponse::Ok(format_issue_list(
             repo.trim(),
             &self.collaboration.issue_summaries(repo.trim()),
+        )))
+    }
+
+    fn pr_open(&mut self, rest: &str) -> Result<DaemonResponse> {
+        let parts = rest.split_whitespace().collect::<Vec<_>>();
+        if parts.len() != 7 {
+            return Err(DaemonError::InvalidCommand(
+                "PR_OPEN requires <repo> <actor> <source-ref> <target-ref> <title-hex> <body-hex|-> <labels-hex-list|->"
+                    .to_string(),
+            ));
+        }
+        validate_repo_selector(parts[0])?;
+        validate_collaboration_actor(parts[1])?;
+        let event = CollaborationEvent::new(
+            parts[0],
+            CollaborationEventKind::PullRequestOpened,
+            parts[1],
+            Vec::new(),
+            now_unix()?,
+            CollaborationPayload::pull_request(
+                decode_text_arg(parts[4])?,
+                decode_text_arg(parts[5])?,
+                decode_label_arg(parts[6])?,
+                parts[2],
+                parts[3],
+            ),
+        )?;
+        let event_id = event.event_id;
+        let inserted = self.collaboration.insert(event);
+        self.save_collaboration()?;
+        let number = self.collaboration.pull_request_summaries(parts[0]).len();
+        Ok(DaemonResponse::Ok(format!(
+            "event={} repo={} number={} inserted={}",
+            event_id.as_hex(),
+            parts[0],
+            number,
+            inserted
         )))
     }
 
@@ -1161,6 +1242,8 @@ fn requires_admin_auth(command: &str) -> bool {
                 | "SESSION_REVOKE"
                 | "REPO_REGISTER"
                 | "COLLAB_SEED_SAMPLES"
+                | "ISSUE_OPEN"
+                | "PR_OPEN"
         )
     )
 }
@@ -1666,6 +1749,13 @@ fn decode_optional_text_arg(value: &str) -> Result<Option<String>> {
     }
 }
 
+fn decode_label_arg(value: &str) -> Result<Vec<String>> {
+    if value == "-" {
+        return Ok(Vec::new());
+    }
+    value.split(',').map(decode_text_arg).collect()
+}
+
 fn decode_fixed_hex<const N: usize>(value: &str) -> Result<[u8; N]> {
     let bytes = decode_hex(value)?;
     bytes
@@ -1702,6 +1792,20 @@ fn validate_repo_selector(value: &str) -> Result<()> {
     {
         return Err(DaemonError::InvalidCommand(
             "repository selector must be owner/repo".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_collaboration_actor(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 160
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/'))
+    {
+        return Err(DaemonError::InvalidCommand(
+            "collaboration actor must be an account or device label".to_string(),
         ));
     }
     Ok(())
@@ -2422,6 +2526,39 @@ mod tests {
         assert!(prs.contains("count=2"));
         assert!(prs.contains("refs/heads/collaboration-cli"));
         assert!(status.contains("collaboration_events=4"));
+    }
+
+    #[test]
+    fn collaboration_commands_open_issue_and_pull_request_events() {
+        let mut state = DaemonState::default();
+
+        let issue = state
+            .handle_command(
+                "ISSUE_OPEN farzeen/gitmesh farzeen 46697820726570616972 626f6479 73746f72616765,636f72726563746e657373",
+            )
+            .unwrap()
+            .into_line();
+        let pr = state
+            .handle_command(
+                "PR_OPEN farzeen/gitmesh farzeen refs/heads/fix-repair refs/heads/main 46697820726570616972 626f6479 636c69",
+            )
+            .unwrap()
+            .into_line();
+        let issues = state
+            .handle_command("ISSUE_LIST farzeen/gitmesh")
+            .unwrap()
+            .into_line();
+        let prs = state
+            .handle_command("PR_LIST farzeen/gitmesh")
+            .unwrap()
+            .into_line();
+
+        assert!(issue.contains("number=1"));
+        assert!(issue.contains("inserted=true"));
+        assert!(pr.contains("number=1"));
+        assert!(issues.contains("46697820726570616972"));
+        assert!(issues.contains("73746f72616765,636f72726563746e657373"));
+        assert!(prs.contains("refs/heads/fix-repair"));
     }
 
     #[test]

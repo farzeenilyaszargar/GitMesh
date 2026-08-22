@@ -294,6 +294,21 @@ fn run() -> Result<(), GitMeshdError> {
             );
             Ok(())
         }
+        Some("issue-open") => {
+            let socket_path = args.next().map_or_else(default_socket_path, Into::into);
+            let rest = args.collect::<Vec<_>>();
+            if rest.len() != 5 {
+                return Err(GitMeshdError::InvalidArguments(
+                    "issue-open requires <repo> <actor> <title-hex> <body-hex|-> <labels-hex-list|->"
+                        .to_string(),
+                ));
+            }
+            println!(
+                "{}",
+                request_unix_socket(socket_path, &format!("ISSUE_OPEN {}", rest.join(" ")))?
+            );
+            Ok(())
+        }
         Some("pr-list") => {
             let socket_path = args.next().map_or_else(default_socket_path, Into::into);
             let repo = args
@@ -302,6 +317,21 @@ fn run() -> Result<(), GitMeshdError> {
             println!(
                 "{}",
                 request_unix_socket(socket_path, &format!("PR_LIST {repo}"))?
+            );
+            Ok(())
+        }
+        Some("pr-open") => {
+            let socket_path = args.next().map_or_else(default_socket_path, Into::into);
+            let rest = args.collect::<Vec<_>>();
+            if rest.len() != 7 {
+                return Err(GitMeshdError::InvalidArguments(
+                    "pr-open requires <repo> <actor> <source-ref> <target-ref> <title-hex> <body-hex|-> <labels-hex-list|->"
+                        .to_string(),
+                ));
+            }
+            println!(
+                "{}",
+                request_unix_socket(socket_path, &format!("PR_OPEN {}", rest.join(" ")))?
             );
             Ok(())
         }
@@ -429,7 +459,13 @@ fn print_help() {
     println!("  key-grant-revoke-device [socket] <device-cid> <effective-epoch>");
     println!("  key-grant-status [socket] <repo-id>");
     println!("  collab-seed-samples [socket]");
+    println!(
+        "  issue-open [socket] <owner/repo> <actor> <title-hex> <body-hex|-> <labels-hex-list|->"
+    );
     println!("  issue-list [socket] <owner/repo>");
+    println!(
+        "  pr-open [socket] <owner/repo> <actor> <source-ref> <target-ref> <title-hex> <body-hex|-> <labels-hex-list|->"
+    );
     println!("  pr-list [socket] <owner/repo>");
 }
 

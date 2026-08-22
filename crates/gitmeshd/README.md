@@ -23,7 +23,9 @@ Currently implemented:
 - `gitmeshd object-list [socket]`
 - `gitmeshd repo-status [socket]`
 - `gitmeshd collab-seed-samples [socket]`
+- `gitmeshd issue-open [socket] <owner/repo> <actor> <title-hex> <body-hex|-> <labels-hex-list|->`
 - `gitmeshd issue-list [socket] <owner/repo>`
+- `gitmeshd pr-open [socket] <owner/repo> <actor> <source-ref> <target-ref> <title-hex> <body-hex|-> <labels-hex-list|->`
 - `gitmeshd pr-list [socket] <owner/repo>`
 - `gitmeshd key-grant-list [socket] <repo-id> [latest|all|epoch]`
 - `gitmeshd key-grant-revoke-device [socket] <device-cid> <effective-epoch>`
@@ -50,7 +52,9 @@ The socket protocol is a V0 line protocol over Unix domain sockets:
 - `KEY_GRANT_REVOKE_DEVICE <device-cid> <effective-epoch>`
 - `KEY_GRANT_STATUS <repo-id>`
 - `COLLAB_SEED_SAMPLES`
+- `ISSUE_OPEN <owner/repo> <actor> <title-hex> <body-hex|-> <labels-hex-list|->`
 - `ISSUE_LIST <owner/repo>`
+- `PR_OPEN <owner/repo> <actor> <source-ref> <target-ref> <title-hex> <body-hex|-> <labels-hex-list|->`
 - `PR_LIST <owner/repo>`
 - `REPO_STATUS`
 
