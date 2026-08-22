@@ -121,6 +121,16 @@ export function encodeOptionalTextArg(value: unknown) {
   return encodeTextArg(value);
 }
 
+export function encodeLabelArg(value: unknown) {
+  if (!Array.isArray(value) || value.length === 0) {
+    return "-";
+  }
+  const labels = value
+    .filter((label): label is string => typeof label === "string" && label.trim().length > 0)
+    .map((label) => encodeTextArg(label.trim()));
+  return labels.length === 0 ? "-" : labels.join(",");
+}
+
 export function decodeHexField(value: string | undefined) {
   if (!value) {
     return "";
@@ -130,6 +140,19 @@ export function decodeHexField(value: string | undefined) {
 
 export function safeDaemonText(value: string) {
   return value.length <= 4096 && !/[\r\n]/.test(value);
+}
+
+export function safeLabelList(value: unknown) {
+  return (
+    value === undefined ||
+    (Array.isArray(value) &&
+      value.every(
+        (label) =>
+          typeof label === "string" &&
+          label.length <= 96 &&
+          !/[\r\n,]/.test(label)
+      ))
+  );
 }
 
 export function parseNumberList(value: string | undefined) {

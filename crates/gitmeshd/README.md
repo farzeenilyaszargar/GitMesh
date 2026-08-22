@@ -82,7 +82,9 @@ infrastructure is exposed through server-side JSON routes for local development:
 - `GET /api/gitmesh/network-repair-proof`
 - `POST /api/gitmesh/network-repair-proof`
 - `GET /api/gitmesh/issues`
+- `POST /api/gitmesh/issues`
 - `GET /api/gitmesh/pulls`
+- `POST /api/gitmesh/pulls`
 - `GET /api/gitmesh/accounts`
 - `POST /api/gitmesh/accounts`
 - `GET /api/gitmesh/accounts/:username`
