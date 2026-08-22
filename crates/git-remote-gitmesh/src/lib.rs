@@ -190,6 +190,12 @@ impl HelperState {
         if self.fetch_requested {
             self.install_fetch_pack()?;
             if self.check_connectivity {
+                let git_dir = self
+                    .config
+                    .git_dir
+                    .as_ref()
+                    .ok_or(HelperError::MissingGitDir)?;
+                verify_git_connectivity(git_dir)?;
                 writeln!(output, "connectivity-ok")?;
             }
             writeln!(output)?;
@@ -515,6 +521,21 @@ fn resolve_git_oid(git_dir: &Path, rev: &str) -> Result<String> {
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn verify_git_connectivity(git_dir: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .arg("fsck")
+        .arg("--connectivity-only")
+        .output()?;
+    if !output.status.success() {
+        return Err(HelperError::GitCommandFailed(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn import_reachable_objects(git_dir: &Path, rev: &str, daemon_socket: &Path) -> Result<()> {
@@ -884,6 +905,29 @@ mod tests {
     fn decodes_pack_hex_payloads() {
         assert_eq!(decode_hex("5041434b").unwrap(), b"PACK");
         assert!(decode_hex("xyz").is_err());
+    }
+
+    #[test]
+    fn verifies_connectivity_for_empty_bare_repository() {
+        let git_dir = std::env::temp_dir().join(format!(
+            "gitmesh-helper-connectivity-{}.git",
+            std::process::id()
+        ));
+        let output = Command::new("git")
+            .arg("init")
+            .arg("--bare")
+            .arg(&git_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        verify_git_connectivity(&git_dir).unwrap();
+
+        let _ = fs::remove_dir_all(git_dir);
     }
 
     #[test]
