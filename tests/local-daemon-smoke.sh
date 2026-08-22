@@ -31,6 +31,10 @@ run_gitmeshd() {
   cargo run --quiet --bin gitmeshd -- "$@"
 }
 
+run_gm() {
+  GITMESHD_SOCKET="$SOCKET_PATH" cargo run --quiet --bin gm -- "$@"
+}
+
 expect_contains() {
   local haystack="$1"
   local needle="$2"
@@ -128,6 +132,22 @@ expect_contains "$status_response" "objects=1"
 expect_contains "$status_response" "refs=1"
 expect_contains "$status_response" "collaboration_events=2"
 
+gm_issue_response="$(run_gm issue create "CLI issue" "verifies gm writes" "cli,collaboration")"
+expect_contains "$gm_issue_response" "OK event="
+expect_contains "$gm_issue_response" "number=2"
+
+gm_pr_response="$(run_gm pr create "CLI pull request" refs/heads/gm-smoke refs/heads/main "verifies gm pr writes" "cli")"
+expect_contains "$gm_pr_response" "OK event="
+expect_contains "$gm_pr_response" "number=2"
+
+gm_issues_list="$(run_gm issue list)"
+expect_contains "$gm_issues_list" "Showing 2 open issues"
+expect_contains "$gm_issues_list" "CLI issue"
+
+gm_prs_list="$(run_gm pr list)"
+expect_contains "$gm_prs_list" "Showing 2 open pull requests"
+expect_contains "$gm_prs_list" "refs/heads/gm-smoke"
+
 npm --prefix apps/web run build >/dev/null
 WEB_PORT="$(
   node -e "const net=require('net'); const s=net.createServer(); s.listen(0,'127.0.0.1',()=>{console.log(s.address().port); s.close();});"
@@ -151,7 +171,7 @@ web_issue_response="$(
     '{"repo":"farzeen/gitmesh","actor":"farzeen","title":"Web issue","body":"verifies api writes","labels":["web","collaboration"]}'
 )"
 expect_contains "$web_issue_response" '"ok":true'
-expect_contains "$web_issue_response" '"number":"2"'
+expect_contains "$web_issue_response" '"number":"3"'
 
 web_pr_response="$(
   post_json \
@@ -159,7 +179,7 @@ web_pr_response="$(
     '{"repo":"farzeen/gitmesh","actor":"farzeen","sourceRef":"refs/heads/web-smoke","targetRef":"refs/heads/main","title":"Web pull request","body":"verifies api pr writes","labels":["web"]}'
 )"
 expect_contains "$web_pr_response" '"ok":true'
-expect_contains "$web_pr_response" '"number":"2"'
+expect_contains "$web_pr_response" '"number":"3"'
 
 web_issues_list="$(get_json "/api/gitmesh/issues?repo=farzeen/gitmesh")"
 expect_contains "$web_issues_list" '"issues"'
@@ -171,7 +191,7 @@ expect_contains "$web_pulls_list" '"title":"Web pull request"'
 
 web_status="$(get_json "/api/gitmesh/status")"
 expect_contains "$web_status" '"ok":true'
-expect_contains "$web_status" '"collaboration_events":"4"'
+expect_contains "$web_status" '"collaboration_events":"6"'
 
 for store in "$OBJECT_STORE" "$REF_STORE" "$COLLAB_STORE"; do
   if [[ ! -s "$store" ]]; then

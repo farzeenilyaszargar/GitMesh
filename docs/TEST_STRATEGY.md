@@ -47,7 +47,8 @@ Fuzz every externally reachable parser:
 Run multi-node tests with real protocol networking:
 
 - local daemon smoke: socket server, persisted stores, collaboration writes, Git
-  object storage, ref publication, web-gateway API reads/writes, and status reads
+  object storage, ref publication, `gm` CLI reads/writes, web-gateway API
+  reads/writes, and status reads
 - local 5-node and 20-node networks
 - public push/fetch/clone
 - lease renewal and expiry
