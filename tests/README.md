@@ -9,5 +9,5 @@ Implemented:
   collaboration events, stores a Git object, publishes a ref, registers
   network listen/bootstrap/storage peer state, verifies `gm` issue/PR/network
   reads and writes, starts the built Next.js gateway against the same socket,
-  verifies HTTP issue/PR writes and reads, and checks the
+  verifies HTTP issue/PR writes and reads plus network reads, and checks the
   object/ref/collaboration/network stores were written.

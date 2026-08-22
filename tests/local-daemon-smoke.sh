@@ -227,6 +227,11 @@ web_pulls_list="$(get_json "/api/gitmesh/pulls?repo=farzeen/gitmesh")"
 expect_contains "$web_pulls_list" '"pullRequests"'
 expect_contains "$web_pulls_list" '"title":"Web pull request"'
 
+web_network="$(get_json "/api/gitmesh/network")"
+expect_contains "$web_network" '"ok":true'
+expect_contains "$web_network" '"peerId":"storage-a"'
+expect_contains "$web_network" '"peerId":"bootstrap-a"'
+
 web_status="$(get_json "/api/gitmesh/status")"
 expect_contains "$web_status" '"ok":true'
 expect_contains "$web_status" '"collaboration_events":"6"'

@@ -41,6 +41,15 @@ export type GatewayPullRequest = {
   eventId?: string;
 };
 
+export type GatewayNetworkPeer = {
+  peerId: string;
+  operatorId: string;
+  roles: string[];
+  region: string;
+  protocols: string[];
+  addresses: string[];
+};
+
 const COMMAND_TIMEOUT_MS = 1200;
 const DEFAULT_REPO_ID = "repo:farzeen/gitmesh";
 const DEFAULT_REPO_NAME = "farzeen/gitmesh";
@@ -275,6 +284,24 @@ export function parseRefs(value: string | undefined) {
   });
 }
 
+export function networkPeersFromFields(fields: Record<string, string>): GatewayNetworkPeer[] {
+  const value = fields.peers;
+  if (!value || value === "none") {
+    return [];
+  }
+  return value.split("|").filter(Boolean).map((entry) => {
+    const [peerId, operatorId, roles, region, protocols, addresses] = entry.split(";");
+    return {
+      peerId,
+      operatorId,
+      roles: parseCsv(roles),
+      region,
+      protocols: parseCsv(protocols),
+      addresses: parseCsv(addresses)
+    };
+  });
+}
+
 function decodeHexList(value: string | undefined) {
   if (!value || value === "-") {
     return [];
@@ -284,6 +311,13 @@ function decodeHexList(value: string | undefined) {
 
 function shortRef(value: string | undefined) {
   return value?.replace(/^refs\/heads\//, "") ?? "";
+}
+
+function parseCsv(value: string | undefined) {
+  if (!value || value === "-") {
+    return [];
+  }
+  return value.split(",").filter(Boolean);
 }
 
 function adminWrap(command: string) {

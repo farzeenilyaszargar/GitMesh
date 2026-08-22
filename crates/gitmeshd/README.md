@@ -90,6 +90,7 @@ infrastructure is exposed through server-side JSON routes for local development:
 - `GET /api/gitmesh/status`
 - `GET /api/gitmesh/refs`
 - `GET /api/gitmesh/key-grants`
+- `GET /api/gitmesh/network`
 - `GET /api/gitmesh/network-repair-proof`
 - `POST /api/gitmesh/network-repair-proof`
 - `GET /api/gitmesh/issues`
