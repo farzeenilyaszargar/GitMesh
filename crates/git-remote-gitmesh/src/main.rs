@@ -22,6 +22,10 @@ fn run() -> Result<(), MainError> {
         args.remove(0);
         return run_v0_proof(args);
     }
+    if args.first().is_some_and(|arg| arg == "--network-proof") {
+        args.remove(0);
+        return run_network_repair_proof(args);
+    }
     if args
         .first()
         .is_some_and(|arg| matches!(arg.as_str(), "--help" | "-h"))
@@ -59,10 +63,33 @@ fn run_v0_proof(words: Vec<String>) -> Result<(), MainError> {
     } else {
         words.join(" ")
     };
-    let response = request_unix_socket(default_socket_path(), &format!("V0_PROOF {payload}"))?;
+    let response = request_unix_socket(default_socket_path(), &v0_proof_command(&payload))?;
 
     println!("{response}");
     Ok(())
+}
+
+fn run_network_repair_proof(words: Vec<String>) -> Result<(), MainError> {
+    let payload = if words.is_empty() {
+        "git-remote-gitmesh network repair proof".to_string()
+    } else {
+        words.join(" ")
+    };
+    let response = request_unix_socket(
+        default_socket_path(),
+        &network_repair_proof_command(&payload),
+    )?;
+
+    println!("{response}");
+    Ok(())
+}
+
+fn v0_proof_command(payload: &str) -> String {
+    format!("V0_PROOF {payload}")
+}
+
+fn network_repair_proof_command(payload: &str) -> String {
+    format!("NETWORK_REPAIR_PROOF {payload}")
 }
 
 fn print_help() {
@@ -70,6 +97,25 @@ fn print_help() {
     println!();
     println!("Development commands:");
     println!("  --v0-proof [payload...]   run the local storage proof");
+    println!("  --network-proof [payload...]   run the Git-object network repair proof");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_v0_proof_command() {
+        assert_eq!(v0_proof_command("hello"), "V0_PROOF hello");
+    }
+
+    #[test]
+    fn builds_network_repair_proof_command() {
+        assert_eq!(
+            network_repair_proof_command("hello network"),
+            "NETWORK_REPAIR_PROOF hello network"
+        );
+    }
 }
 
 #[derive(Debug, Error)]

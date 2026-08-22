@@ -16,6 +16,8 @@ Currently implemented:
   available
 - `--v0-proof` smoke command for exercising the storage pipeline through this
   binary and a running local `gitmeshd`
+- `--network-proof` smoke command for exercising the Git-object P2P repair proof
+  through this binary and a running local `gitmeshd`
 
 This now supports the first Gen 1 clone/fetch/push path through a running local
 `gitmeshd`. Push certs and incremental negotiation are still future work.
