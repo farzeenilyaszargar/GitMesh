@@ -16,10 +16,15 @@ use gitmesh_git::{
     GitError, GitObject, GitObjectKind, GitSha1Oid, GitTreeEntryTarget, parse_canonical_object,
     parse_commit_links, parse_tree_entries, write_packfile,
 };
+use gitmesh_network::{
+    InMemoryPeer, InMemorySwarm, PeerId, PlacementPolicy, client_descriptor, storage_descriptor,
+};
 use gitmesh_storage::{
     EncryptedSegment, RepairOutcome, Shard, ShardAuditReport, SimulatedNetwork, StoragePolicy,
-    StoredShard, audit_segment_shards, decrypt_segment, encrypt_segment, erasure_encode,
-    reconstruct_ciphertext, repair_segment_shards,
+    StoredShard, TransportRepairRequest, audit_segment_shards, decrypt_segment,
+    discover_providers_via_transport, encrypt_segment, erasure_encode, fetch_shards_via_transport,
+    plan_and_distribute_shards, publish_providers_via_transport, reconstruct_ciphertext,
+    repair_segment_shards, repair_shards_via_transport,
 };
 use thiserror::Error;
 
@@ -46,6 +51,18 @@ pub struct RepositoryRepairReport {
     pub oid: GitSha1Oid,
     pub kind: GitObjectKind,
     pub outcome: RepairOutcome,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepositoryTransportRepairProof {
+    pub oid: GitSha1Oid,
+    pub recovered_exactly: bool,
+    pub repaired_shards: Vec<usize>,
+    pub original_peer: PeerId,
+    pub replacement_peer: PeerId,
+    pub provider_count: usize,
+    pub verified_after_repair: usize,
+    pub durability_satisfied: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -576,6 +593,131 @@ impl Default for RepositoryObjectStore {
     }
 }
 
+pub fn run_repository_transport_repair_proof(
+    payload: &[u8],
+) -> Result<RepositoryTransportRepairProof> {
+    let policy = StoragePolicy {
+        data_shards: 3,
+        parity_shards: 2,
+    };
+    let placement_policy =
+        PlacementPolicy::new(policy.total_shards(), policy.total_shards(), 2, true)
+            .map_err(|err| RepositoryError::Network(err.to_string()))?;
+    let object = GitObject::new(GitObjectKind::Blob, payload);
+    let oid = object.sha1_oid();
+    let mut store = RepositoryObjectStore::new(policy.clone());
+    store.put_git_object(object.clone())?;
+    let stored = store
+        .objects
+        .get(&oid)
+        .ok_or(RepositoryError::MissingObject(oid))?
+        .clone();
+
+    let client =
+        PeerId::new("repo-client").map_err(|err| RepositoryError::Network(err.to_string()))?;
+    let directory =
+        PeerId::new("repo-directory").map_err(|err| RepositoryError::Network(err.to_string()))?;
+    let mut swarm = InMemorySwarm::default();
+    swarm
+        .add_peer(InMemoryPeer::new(
+            client_descriptor("repo-client")
+                .map_err(|err| RepositoryError::Network(err.to_string()))?,
+        ))
+        .map_err(|err| RepositoryError::Network(err.to_string()))?;
+    swarm
+        .add_peer(InMemoryPeer::new(
+            gitmesh_network::NodeDescriptor::new(
+                directory.clone(),
+                gitmesh_network::OperatorId::new("repo-directory-operator")
+                    .map_err(|err| RepositoryError::Network(err.to_string()))?,
+                [gitmesh_network::NodeRole::Dht],
+                "iad",
+                [
+                    gitmesh_network::ProtocolId::PingV0,
+                    gitmesh_network::ProtocolId::AvailabilityV0,
+                ],
+            )
+            .map_err(|err| RepositoryError::Network(err.to_string()))?,
+        ))
+        .map_err(|err| RepositoryError::Network(err.to_string()))?;
+    for index in 0..=policy.total_shards() {
+        let peer = format!("repo-storage-{index}");
+        let operator = format!("repo-operator-{index}");
+        let region = if index % 2 == 0 { "iad" } else { "sfo" };
+        swarm
+            .add_peer(InMemoryPeer::new(
+                storage_descriptor(&peer, &operator, region)
+                    .map_err(|err| RepositoryError::Network(err.to_string()))?,
+            ))
+            .map_err(|err| RepositoryError::Network(err.to_string()))?;
+    }
+
+    let descriptors = swarm.descriptors();
+    let (_plan, providers) = plan_and_distribute_shards(
+        &mut swarm,
+        &client,
+        descriptors.clone(),
+        &placement_policy,
+        &stored.shards,
+        1,
+        1_000,
+    )?;
+    publish_providers_via_transport(&mut swarm, &client, &directory, &providers)?;
+    let vanished_provider = providers[policy.data_shards].clone();
+    swarm
+        .remove_peer(&vanished_provider.peer_id)
+        .map_err(|err| RepositoryError::Network(err.to_string()))?;
+
+    let repair = repair_shards_via_transport(
+        &mut swarm,
+        TransportRepairRequest {
+            client_peer: &client,
+            directory_peer: Some(&directory),
+            segment: &stored.segment,
+            policy: &policy,
+            providers: &providers,
+            replacement_descriptors: &descriptors,
+            now_unix: 100,
+            lease_epoch: 2,
+            expires_at_unix: 2_000,
+        },
+    )?;
+    let replacement_provider = repair
+        .providers_after_repair
+        .iter()
+        .find(|provider| provider.shard_index == vanished_provider.shard_index)
+        .ok_or(RepositoryError::InvalidStore(
+            "missing replacement provider",
+        ))?;
+    let discovered = discover_providers_via_transport(
+        &mut swarm,
+        &client,
+        &directory,
+        stored.segment.cid,
+        1_500,
+    )?;
+    let fetched = fetch_shards_via_transport(
+        &mut swarm,
+        &client,
+        &discovered[..policy.data_shards],
+        1_500,
+    )?;
+    let ciphertext = reconstruct_ciphertext(&stored.segment, &policy, &fetched)?;
+    let canonical = decrypt_segment(&stored.segment, &ciphertext)?;
+    let recovered = parse_canonical_object(&canonical)?;
+
+    Ok(RepositoryTransportRepairProof {
+        oid,
+        recovered_exactly: recovered == object,
+        repaired_shards: repair.repaired_shards,
+        original_peer: vanished_provider.peer_id,
+        replacement_peer: replacement_provider.peer_id.clone(),
+        provider_count: discovered.len(),
+        verified_after_repair: repair.audit_after.verified_shards.len(),
+        durability_satisfied: repair.durability_satisfied,
+    })
+}
+
 struct StoredObjectBuilder {
     oid: GitSha1Oid,
     kind: GitObjectKind,
@@ -614,6 +756,8 @@ pub enum RepositoryError {
     UnknownKind(String),
     #[error("repository store is invalid: {0}")]
     InvalidStore(&'static str),
+    #[error("network failed: {0}")]
+    Network(String),
     #[error("I/O failed: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -836,6 +980,18 @@ mod tests {
                 required: 10
             })
         ));
+    }
+
+    #[test]
+    fn transport_repair_proof_recovers_git_object_after_provider_loss() {
+        let proof = run_repository_transport_repair_proof(b"repository transport repair").unwrap();
+
+        assert!(proof.recovered_exactly);
+        assert_eq!(proof.repaired_shards, vec![3]);
+        assert_ne!(proof.original_peer, proof.replacement_peer);
+        assert_eq!(proof.provider_count, 5);
+        assert_eq!(proof.verified_after_repair, 5);
+        assert!(proof.durability_satisfied);
     }
 
     #[test]

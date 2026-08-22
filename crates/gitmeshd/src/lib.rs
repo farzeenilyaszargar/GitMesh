@@ -27,7 +27,8 @@ use gitmesh_identity::{
 };
 use gitmesh_repository::{
     RepositoryError, RepositoryObjectAudit, RepositoryObjectStore, RepositoryRepairReport,
-    decode_hex, encode_hex, parse_git_object_kind, parse_oid,
+    RepositoryTransportRepairProof, decode_hex, encode_hex, parse_git_object_kind, parse_oid,
+    run_repository_transport_repair_proof,
 };
 use gitmesh_storage::{StoragePolicy, run_v0_local_storage_proof};
 use thiserror::Error;
@@ -252,6 +253,17 @@ impl DaemonState {
                 result.available_shards,
                 result.segment_cid
             )));
+        }
+
+        if let Some(payload) = trimmed.strip_prefix("NETWORK_REPAIR_PROOF") {
+            let payload = payload.trim_start();
+            let payload = if payload.is_empty() {
+                b"gitmeshd transport repair proof".to_vec()
+            } else {
+                payload.as_bytes().to_vec()
+            };
+            let proof = run_repository_transport_repair_proof(&payload)?;
+            return Ok(DaemonResponse::Ok(format_transport_repair_proof(&proof)));
         }
 
         if let Some(ref_name) = trimmed.strip_prefix("REF_GET ") {
@@ -1799,6 +1811,25 @@ fn format_repair_reports(reports: &[RepositoryRepairReport]) -> String {
     )
 }
 
+fn format_transport_repair_proof(proof: &RepositoryTransportRepairProof) -> String {
+    format!(
+        "oid={} recovered_exactly={} repaired_shards={} original_peer={} replacement_peer={} providers={} verified_after_repair={} durability_satisfied={}",
+        proof.oid,
+        proof.recovered_exactly,
+        proof
+            .repaired_shards
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        proof.original_peer,
+        proof.replacement_peer,
+        proof.provider_count,
+        proof.verified_after_repair,
+        proof.durability_satisfied
+    )
+}
+
 fn remove_stale_socket(socket_path: &Path) -> Result<()> {
     if fs::symlink_metadata(socket_path).is_ok() {
         fs::remove_file(socket_path)?;
@@ -1884,6 +1915,20 @@ mod tests {
         assert!(response.starts_with("OK "));
         assert!(response.contains("recovered_exactly=true"));
         assert!(response.contains("segment_cid=gitmesh:v0:EncryptedSegment"));
+    }
+
+    #[test]
+    fn network_repair_proof_reports_replacement_recovery() {
+        let response = handle_daemon_command("NETWORK_REPAIR_PROOF hello network")
+            .unwrap()
+            .into_line();
+
+        assert!(response.starts_with("OK "));
+        assert!(response.contains("recovered_exactly=true"));
+        assert!(response.contains("repaired_shards=3"));
+        assert!(response.contains("original_peer=repo-storage-3"));
+        assert!(response.contains("replacement_peer=repo-storage-5"));
+        assert!(response.contains("durability_satisfied=true"));
     }
 
     #[test]

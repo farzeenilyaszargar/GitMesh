@@ -5,9 +5,11 @@ Local GitMesh daemon entrypoint.
 Currently implemented:
 
 - `gitmeshd v0-proof [payload...]`
+- `gitmeshd network-repair-proof [payload...]`
 - `gitmeshd serve [socket] [object-store] [ref-store] [policy-store] [key-grant-store]`
 - `gitmeshd ping [socket]`
 - `gitmeshd socket-v0-proof [socket] [payload...]`
+- `gitmeshd socket-network-repair-proof [socket] [payload...]`
 - `gitmeshd ref-get [socket] <ref>`
 - `gitmeshd ref-list [socket]`
 - `gitmeshd ref-update [socket] <tx> <ref> <expected|none> <new|delete> <signer>`
@@ -28,6 +30,7 @@ The socket protocol is a V0 line protocol over Unix domain sockets:
 
 - `PING`
 - `V0_PROOF [payload...]`
+- `NETWORK_REPAIR_PROOF [payload...]`
 - `REF_GET <ref>`
 - `REF_LIST`
 - `REF_UPDATE <tx> <ref> <expected|none> <new|delete> <signer>`
@@ -51,6 +54,11 @@ restarts. This is not the final daemon API, but it is now a real local IPC
 boundary. `PACK_PUT` imports full objects plus OFS-delta and REF-delta entries
 with pack checksum validation. `PACK_GET all` currently exports full-object
 packs for compatibility.
+
+`NETWORK_REPAIR_PROOF` is a Git-object-level backend proof for the current P2P
+storage spine. It stores a blob as encrypted erasure-coded shards, publishes
+providers, removes a storage provider, repairs the missing shard to a
+replacement peer, and verifies that the original Git object is recovered exactly.
 
 The Next.js web app exposes read-only gateway routes under `/api/gitmesh/*`.
 Those routes translate HTTP JSON requests into local `gitmeshd` socket reads for

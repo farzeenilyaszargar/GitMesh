@@ -6,3 +6,9 @@ This crate connects canonical Git objects to the GitMesh storage layer. It is
 the first non-demo backend boundary for repository contents: ingest a Git
 object, segment/encrypt/erasure-code it through `gitmesh-storage`, retain an
 object record, and verify read-back by reconstructing and decrypting shards.
+
+It also exposes `run_repository_transport_repair_proof`, which exercises a Git
+object through the current P2P storage boundary: distribute encrypted shards to
+storage peers, publish provider leases, remove one provider, repair the missing
+shard onto a replacement peer, rediscover providers, reconstruct, decrypt, and
+verify the original Git object.

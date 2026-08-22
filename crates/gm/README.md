@@ -19,6 +19,7 @@ Implemented command families:
 - `gm pr view <id>`
 - `gm daemon ping [socket]`
 - `gm daemon proof [socket] [payload...]`
+- `gm daemon network-proof [socket] [payload...]`
 - `gm ref list [socket]`
 - `gm ref get [socket] <ref>`
 - `gm ref update [socket] <tx> <ref> <expected|none> <new|delete> <signer>`
@@ -41,6 +42,11 @@ and ref commands exercise the durable local repository spine. `repo
 materialize` exports daemon objects/refs into a native bare Git repository using
 `git index-pack` and `git update-ref`; `repo clone` uses that same Gen 1 cached
 bare-repo bridge and native `git clone`.
+
+`gm daemon network-proof` calls the daemon's Git-object transport repair proof:
+encrypted erasure-coded shards are published to providers, one provider is
+removed, the missing shard is rebuilt on a replacement peer, and the original
+Git object is verified after rediscovery.
 
 `signed-update-dev` uses an ephemeral certified Ed25519 device key to exercise
 the production signed `RefUpdate` path. Persistent account/device key storage is

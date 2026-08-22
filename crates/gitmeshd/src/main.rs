@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf, process::ExitCode};
 
-use gitmesh_repository::encode_hex;
+use gitmesh_repository::{RepositoryError, encode_hex, run_repository_transport_repair_proof};
 use gitmesh_storage::{StoragePolicy, run_v0_local_storage_proof};
 use gitmeshd::{
     DaemonAuth, default_socket_path, request_unix_socket, request_unix_socket_frame,
@@ -84,6 +84,18 @@ fn run() -> Result<(), GitMeshdError> {
                 "V0_PROOF".to_string()
             } else {
                 format!("V0_PROOF {payload}")
+            };
+            println!("{}", request_unix_socket(socket_path, &command)?);
+            Ok(())
+        }
+        Some("network-repair-proof") => run_network_repair_proof(args.collect()),
+        Some("socket-network-repair-proof") => {
+            let socket_path = args.next().map_or_else(default_socket_path, Into::into);
+            let payload = args.collect::<Vec<_>>().join(" ");
+            let command = if payload.is_empty() {
+                "NETWORK_REPAIR_PROOF".to_string()
+            } else {
+                format!("NETWORK_REPAIR_PROOF {payload}")
             };
             println!("{}", request_unix_socket(socket_path, &command)?);
             Ok(())
@@ -326,17 +338,39 @@ fn run_v0_proof(words: Vec<String>) -> Result<(), GitMeshdError> {
     Ok(())
 }
 
+fn run_network_repair_proof(words: Vec<String>) -> Result<(), GitMeshdError> {
+    let payload = if words.is_empty() {
+        b"gitmeshd repository transport repair proof".to_vec()
+    } else {
+        words.join(" ").into_bytes()
+    };
+    let proof = run_repository_transport_repair_proof(&payload)?;
+
+    println!("gitmeshd repository transport repair proof");
+    println!("oid={}", proof.oid);
+    println!("recovered_exactly={}", proof.recovered_exactly);
+    println!("repaired_shards={:?}", proof.repaired_shards);
+    println!("original_peer={}", proof.original_peer);
+    println!("replacement_peer={}", proof.replacement_peer);
+    println!("providers={}", proof.provider_count);
+    println!("verified_after_repair={}", proof.verified_after_repair);
+    println!("durability_satisfied={}", proof.durability_satisfied);
+    Ok(())
+}
+
 fn print_help() {
     println!("gitmeshd");
     println!();
     println!("Commands:");
     println!("  v0-proof [payload...]   run the local encrypt/erasure-code/recover proof");
+    println!("  network-repair-proof [payload...]   run Git-object transport repair proof");
     println!(
         "  serve [socket] [object-store] [ref-store] [policy-store] [key-grant-store] [account-store]   run the local daemon socket server"
     );
     println!("  ping [socket]           ping a running local daemon");
     println!("  frame-ping [socket] [request-id]   ping using the binary frame protocol");
     println!("  socket-v0-proof [socket] [payload...]");
+    println!("  socket-network-repair-proof [socket] [payload...]");
     println!("  ref-get [socket] <ref>");
     println!("  ref-list [socket]");
     println!("  ref-update [socket] <tx> <ref> <expected|none> <new|delete> <signer>");
@@ -363,6 +397,8 @@ fn print_help() {
 enum GitMeshdError {
     #[error("unknown command '{0}'")]
     UnknownCommand(String),
+    #[error(transparent)]
+    Repository(#[from] RepositoryError),
     #[error(transparent)]
     Storage(#[from] gitmesh_storage::StorageError),
     #[error(transparent)]

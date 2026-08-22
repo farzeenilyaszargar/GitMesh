@@ -9,5 +9,6 @@ repository.workspace = true
 gitmesh-core.workspace = true
 gitmesh-crypto.workspace = true
 gitmesh-git.workspace = true
+gitmesh-network.workspace = true
 gitmesh-storage.workspace = true
 thiserror.workspace = true

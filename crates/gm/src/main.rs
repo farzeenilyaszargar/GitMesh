@@ -893,6 +893,17 @@ fn daemon(args: &[String]) -> Result<(), GmError> {
             println!("{}", request_unix_socket(socket_path, &command)?);
             Ok(())
         }
+        Some("network-proof") => {
+            let socket_path = args.get(1).map_or_else(default_socket_path, Into::into);
+            let payload = args.iter().skip(2).cloned().collect::<Vec<_>>().join(" ");
+            let command = if payload.is_empty() {
+                "NETWORK_REPAIR_PROOF".to_string()
+            } else {
+                format!("NETWORK_REPAIR_PROOF {payload}")
+            };
+            println!("{}", request_unix_socket(socket_path, &command)?);
+            Ok(())
+        }
         Some(command) => Err(GmError::UnknownCommand(format!("daemon {command}"))),
     }
 }
@@ -1573,6 +1584,7 @@ fn print_help() {
     println!("  pr list | pr status | pr view <id>");
     println!("  daemon ping [socket]");
     println!("  daemon proof [socket] [payload...]");
+    println!("  daemon network-proof [socket] [payload...]");
     println!("  policy show [socket]");
     println!("  policy require-signed [socket] <true|false>");
     println!("  policy grant-writer [socket] <account-cid>");

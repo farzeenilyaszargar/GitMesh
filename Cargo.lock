@@ -382,6 +382,7 @@ dependencies = [
  "gitmesh-core",
  "gitmesh-crypto",
  "gitmesh-git",
+ "gitmesh-network",
  "gitmesh-storage",
  "thiserror",
 ]
