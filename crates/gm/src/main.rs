@@ -1508,6 +1508,31 @@ fn policy(args: &[String]) -> Result<(), GmError> {
             );
             Ok(())
         }
+        Some("storage-show") => {
+            let socket_path = args.get(1).map_or_else(default_socket_path, Into::into);
+            println!(
+                "{}",
+                request_unix_socket(socket_path, "STORAGE_POLICY_SHOW")?
+            );
+            Ok(())
+        }
+        Some("storage-set") => {
+            let (socket_path, values) = storage_policy_args(args)?;
+            let data_shards = parse_positive_usize_arg(values[0], "data shards")?;
+            let parity_shards = parse_positive_usize_arg(values[1], "parity shards")?;
+            let min_operators = parse_positive_usize_arg(values[2], "minimum operators")?;
+            let min_regions = parse_positive_usize_arg(values[3], "minimum regions")?;
+            println!(
+                "{}",
+                request_unix_socket(
+                    socket_path,
+                    &format!(
+                        "STORAGE_POLICY_SET {data_shards} {parity_shards} {min_operators} {min_regions}"
+                    )
+                )?
+            );
+            Ok(())
+        }
         Some("grant-writer") => {
             let socket_path = args.get(1).map_or_else(default_socket_path, Into::into);
             let account_id = args.get(2).ok_or_else(|| {
@@ -1549,6 +1574,44 @@ fn policy(args: &[String]) -> Result<(), GmError> {
         }
         Some(command) => Err(GmError::UnknownCommand(format!("policy {command}"))),
     }
+}
+
+fn storage_policy_args(args: &[String]) -> Result<(PathBuf, [&str; 4]), GmError> {
+    match args.len() {
+        5 => Ok((
+            default_socket_path(),
+            [
+                args[1].as_str(),
+                args[2].as_str(),
+                args[3].as_str(),
+                args[4].as_str(),
+            ],
+        )),
+        6 => Ok((
+            PathBuf::from(&args[1]),
+            [
+                args[2].as_str(),
+                args[3].as_str(),
+                args[4].as_str(),
+                args[5].as_str(),
+            ],
+        )),
+        _ => Err(GmError::InvalidArguments(
+            "policy storage-set requires [socket] <data-shards> <parity-shards> <min-operators> <min-regions>".to_string(),
+        )),
+    }
+}
+
+fn parse_positive_usize_arg(value: &str, name: &str) -> Result<usize, GmError> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| GmError::InvalidArguments(format!("{name} must be a positive integer")))?;
+    if parsed == 0 {
+        return Err(GmError::InvalidArguments(format!(
+            "{name} must be a positive integer"
+        )));
+    }
+    Ok(parsed)
 }
 
 fn refs(args: &[String]) -> Result<(), GmError> {
@@ -2222,6 +2285,10 @@ fn print_help() {
     println!("  daemon network-provider-find [socket] <segment-cid>");
     println!("  policy show [socket]");
     println!("  policy require-signed [socket] <true|false>");
+    println!("  policy storage-show [socket]");
+    println!(
+        "  policy storage-set [socket] <data-shards> <parity-shards> <min-operators> <min-regions>"
+    );
     println!("  policy grant-writer [socket] <account-cid>");
     println!("  policy grant-force [socket] <account-cid>");
     println!("  policy protect [socket] <ref>");
@@ -2360,6 +2427,26 @@ mod tests {
         };
 
         assert_eq!(LocalRepo::decode(&repo.encode()).unwrap(), repo);
+    }
+
+    #[test]
+    fn storage_policy_args_accept_default_and_explicit_socket() {
+        let default_args = args(&["storage-set", "4", "2", "3", "2"]);
+        let explicit_args = args(&["storage-set", "/tmp/gitmeshd.sock", "4", "2", "3", "2"]);
+        let (default_socket, default_values) = storage_policy_args(&default_args).unwrap();
+        let (explicit_socket, explicit_values) = storage_policy_args(&explicit_args).unwrap();
+
+        assert_eq!(default_socket, default_socket_path());
+        assert_eq!(default_values, ["4", "2", "3", "2"]);
+        assert_eq!(explicit_socket, PathBuf::from("/tmp/gitmeshd.sock"));
+        assert_eq!(explicit_values, ["4", "2", "3", "2"]);
+    }
+
+    #[test]
+    fn storage_policy_arg_validation_rejects_zero_or_missing_fields() {
+        assert!(storage_policy_args(&args(&["storage-set", "4", "2", "3"])).is_err());
+        assert!(parse_positive_usize_arg("0", "data shards").is_err());
+        assert!(parse_positive_usize_arg("four", "data shards").is_err());
     }
 
     #[test]

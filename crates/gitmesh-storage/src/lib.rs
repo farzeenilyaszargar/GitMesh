@@ -50,8 +50,33 @@ pub struct StoragePolicy {
 }
 
 impl StoragePolicy {
+    pub fn new(
+        data_shards: usize,
+        parity_shards: usize,
+        min_distinct_operators: usize,
+        min_distinct_regions: usize,
+    ) -> std::result::Result<Self, NetworkError> {
+        let policy = Self {
+            data_shards,
+            parity_shards,
+            min_distinct_operators,
+            min_distinct_regions,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
     pub fn total_shards(&self) -> usize {
         self.data_shards + self.parity_shards
+    }
+
+    pub fn validate(&self) -> std::result::Result<(), NetworkError> {
+        if self.data_shards == 0 || self.parity_shards == 0 {
+            return Err(NetworkError::InvalidAvailabilityRequirement);
+        }
+        self.availability_requirement()?;
+        self.placement_policy()?;
+        Ok(())
     }
 
     pub fn availability_requirement(
@@ -1412,7 +1437,7 @@ mod tests {
         let storage_policy = StoragePolicy {
             data_shards: 3,
             parity_shards: 2,
-            min_distinct_operators: 5,
+            min_distinct_operators: 3,
             min_distinct_regions: 2,
         };
         let placement_policy = storage_policy.placement_policy().unwrap();
@@ -1470,7 +1495,7 @@ mod tests {
         let storage_policy = StoragePolicy {
             data_shards: 3,
             parity_shards: 2,
-            min_distinct_operators: 5,
+            min_distinct_operators: 3,
             min_distinct_regions: 2,
         };
         let placement_policy = storage_policy.placement_policy().unwrap();
@@ -1533,7 +1558,7 @@ mod tests {
         let storage_policy = StoragePolicy {
             data_shards: 3,
             parity_shards: 2,
-            min_distinct_operators: 5,
+            min_distinct_operators: 3,
             min_distinct_regions: 2,
         };
         let placement_policy = storage_policy.placement_policy().unwrap();
@@ -1601,7 +1626,7 @@ mod tests {
         let storage_policy = StoragePolicy {
             data_shards: 3,
             parity_shards: 2,
-            min_distinct_operators: 5,
+            min_distinct_operators: 3,
             min_distinct_regions: 2,
         };
         let placement_policy = storage_policy.placement_policy().unwrap();
@@ -1665,7 +1690,7 @@ mod tests {
         let storage_policy = StoragePolicy {
             data_shards: 3,
             parity_shards: 2,
-            min_distinct_operators: 5,
+            min_distinct_operators: 3,
             min_distinct_regions: 2,
         };
         let placement_policy = storage_policy.placement_policy().unwrap();
@@ -1721,7 +1746,7 @@ mod tests {
         let storage_policy = StoragePolicy {
             data_shards: 3,
             parity_shards: 2,
-            min_distinct_operators: 5,
+            min_distinct_operators: 3,
             min_distinct_regions: 2,
         };
         let placement_policy = storage_policy.placement_policy().unwrap();
@@ -1812,7 +1837,7 @@ mod tests {
         let storage_policy = StoragePolicy {
             data_shards: 3,
             parity_shards: 2,
-            min_distinct_operators: 5,
+            min_distinct_operators: 3,
             min_distinct_regions: 2,
         };
         let placement_policy = storage_policy.placement_policy().unwrap();
@@ -1901,7 +1926,7 @@ mod tests {
         let storage_policy = StoragePolicy {
             data_shards: 3,
             parity_shards: 2,
-            min_distinct_operators: 5,
+            min_distinct_operators: 3,
             min_distinct_regions: 2,
         };
         let placement_policy = storage_policy.placement_policy().unwrap();

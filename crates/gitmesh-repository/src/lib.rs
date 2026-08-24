@@ -92,6 +92,17 @@ impl RepositoryObjectStore {
         &self.policy
     }
 
+    pub fn set_storage_policy(&mut self, policy: StoragePolicy) -> Result<()> {
+        if !self.objects.is_empty() {
+            return Err(RepositoryError::StoragePolicyLocked);
+        }
+        policy
+            .validate()
+            .map_err(|err| RepositoryError::Network(err.to_string()))?;
+        self.policy = policy;
+        Ok(())
+    }
+
     pub fn object_count(&self) -> usize {
         self.objects.len()
     }
@@ -438,6 +449,9 @@ impl RepositoryObjectStore {
                 .transpose()?
                 .unwrap_or(2),
         };
+        policy
+            .validate()
+            .map_err(|err| RepositoryError::Network(err.to_string()))?;
         let mut builders = BTreeMap::<GitSha1Oid, StoredObjectBuilder>::new();
 
         for line in lines {
@@ -697,7 +711,7 @@ pub fn run_repository_transport_repair_proof(
     let policy = StoragePolicy {
         data_shards: 3,
         parity_shards: 2,
-        min_distinct_operators: 5,
+        min_distinct_operators: 3,
         min_distinct_regions: 2,
     };
     let placement_policy = policy
@@ -856,6 +870,8 @@ pub enum RepositoryError {
     UnknownKind(String),
     #[error("repository store is invalid: {0}")]
     InvalidStore(&'static str),
+    #[error("storage policy cannot change after objects are stored")]
+    StoragePolicyLocked,
     #[error("availability evidence does not match stored object shards")]
     InvalidAvailabilityEvidence,
     #[error("network failed: {0}")]

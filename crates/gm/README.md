@@ -29,6 +29,8 @@ Implemented command families:
 - `gm daemon network-peer-list [socket]`
 - `gm daemon network-provider-publish [socket] <segment-cid> <shard-cid> <shard-index> <peer-id> <operator-id> <region> <roles-csv> <lease-epoch> <expires-at>`
 - `gm daemon network-provider-find [socket] <segment-cid>`
+- `gm policy storage-show [socket]`
+- `gm policy storage-set [socket] <data-shards> <parity-shards> <min-operators> <min-regions>`
 - `gm ref list [socket]`
 - `gm ref get [socket] <ref>`
 - `gm ref update [socket] <tx> <ref> <expected|none> <new|delete> <signer>`

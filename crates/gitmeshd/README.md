@@ -72,6 +72,8 @@ The socket protocol is a V0 line protocol over Unix domain sockets:
 - `NETWORK_PEER_LIST`
 - `NETWORK_PROVIDER_PUBLISH_SIGNED <segment-cid> <shard-cid> <shard-index> <peer-id> <operator-id> <region> <roles-csv> <lease-epoch> <expires-at> <label-hex> <account-key-hex> <device-key-hex> <cert-signature-hex> <provider-signature-hex>`
 - `NETWORK_PROVIDER_FIND <segment-cid>`
+- `STORAGE_POLICY_SHOW`
+- `STORAGE_POLICY_SET <data-shards> <parity-shards> <min-operators> <min-regions>`
 - `REPO_STATUS`
 
 The optional store paths persist canonical Git object storage state and
@@ -81,6 +83,11 @@ is not the final daemon API, but it is now a real local IPC boundary. `PACK_PUT`
 imports full objects plus OFS-delta and REF-delta entries with pack checksum
 validation. `PACK_GET all` currently exports full-object packs for
 compatibility.
+
+`STORAGE_POLICY_SET` is accepted only before repository objects exist in the
+local store. Existing objects are encoded with the current shard layout, so
+changing the policy after object ingest is rejected until a future migration
+flow can re-pack and re-place stored objects safely.
 
 `NETWORK_REPAIR_PROOF` is a Git-object-level backend proof for the current P2P
 storage spine. It stores a blob as encrypted erasure-coded shards, publishes

@@ -121,19 +121,26 @@ prs_response="$(run_gitmeshd pr-list "$SOCKET_PATH" farzeen/gitmesh)"
 expect_contains "$prs_response" "count=1"
 expect_contains "$prs_response" "refs/heads/smoke"
 
+storage_policy_response="$(run_gm policy storage-set 4 2 3 2)"
+expect_contains "$storage_policy_response" "data_shards=4"
+expect_contains "$storage_policy_response" "parity_shards=2"
+expect_contains "$storage_policy_response" "total_shards=6"
+expect_contains "$storage_policy_response" "min_operators=3"
+expect_contains "$storage_policy_response" "min_regions=2"
+
 object_response="$(run_gitmeshd object-put "$SOCKET_PATH" blob 736d6f6b65206f626a656374)"
 expect_contains "$object_response" "OK oid="
-expect_contains "$object_response" "provider_records=16"
+expect_contains "$object_response" "provider_records=6"
 oid="$(sed -n 's/.*oid=\([0-9a-f]\{40\}\).*/\1/p' <<<"$object_response")"
 if [[ -z "$oid" ]]; then
   echo "failed to parse object oid from: $object_response" >&2
   exit 1
 fi
 
-availability_response="$(run_gm object availability "$SOCKET_PATH" "$oid" 10 3 2)"
+availability_response="$(run_gm object availability "$SOCKET_PATH" "$oid" 4 3 2)"
 expect_contains "$availability_response" "OK segment="
 expect_contains "$availability_response" "satisfied=true"
-expect_contains "$availability_response" "required_shards=10"
+expect_contains "$availability_response" "required_shards=4"
 
 ref_response="$(run_gitmeshd ref-update "$SOCKET_PATH" tx-smoke refs/tags/smoke none "$oid" smoke)"
 expect_contains "$ref_response" "status=committed"
@@ -146,6 +153,10 @@ status_response="$(run_gitmeshd repo-status "$SOCKET_PATH")"
 expect_contains "$status_response" "objects=1"
 expect_contains "$status_response" "refs=1"
 expect_contains "$status_response" "collaboration_events=2"
+expect_contains "$status_response" "data_shards=4"
+expect_contains "$status_response" "parity_shards=2"
+expect_contains "$status_response" "min_operators=3"
+expect_contains "$status_response" "min_regions=2"
 
 network_listen_response="$(run_gitmeshd network-listen "$SOCKET_PATH" /ip4/127.0.0.1/tcp/4040)"
 expect_contains "$network_listen_response" "listen_addresses=/ip4/127.0.0.1/tcp/4040"

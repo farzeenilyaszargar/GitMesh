@@ -416,6 +416,16 @@ impl DaemonState {
             return self.policy_protect_ref(rest);
         }
 
+        if trimmed == "STORAGE_POLICY_SHOW" {
+            return Ok(DaemonResponse::Ok(format_storage_policy(
+                self.objects.policy(),
+            )));
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("STORAGE_POLICY_SET ") {
+            return self.storage_policy_set(rest);
+        }
+
         if let Some(rest) = trimmed.strip_prefix("PACK_PUT ") {
             return self.pack_put(rest);
         }
@@ -819,6 +829,27 @@ impl DaemonState {
         self.policy.protect_ref(RefName::new(rest.trim())?);
         self.save_policy()?;
         Ok(DaemonResponse::Ok(format_policy(&self.policy)))
+    }
+
+    fn storage_policy_set(&mut self, rest: &str) -> Result<DaemonResponse> {
+        let parts = rest.split_whitespace().collect::<Vec<_>>();
+        if parts.len() != 4 {
+            return Err(DaemonError::InvalidCommand(
+                "STORAGE_POLICY_SET requires <data-shards> <parity-shards> <min-operators> <min-regions>".to_string(),
+            ));
+        }
+        let policy = StoragePolicy::new(
+            parse_usize_arg(parts[0], "data shards")?,
+            parse_usize_arg(parts[1], "parity shards")?,
+            parse_usize_arg(parts[2], "minimum operators")?,
+            parse_usize_arg(parts[3], "minimum regions")?,
+        )
+        .map_err(DaemonError::Network)?;
+        self.objects.set_storage_policy(policy)?;
+        self.save_objects()?;
+        Ok(DaemonResponse::Ok(format_storage_policy(
+            self.objects.policy(),
+        )))
     }
 
     fn object_put(&mut self, rest: &str) -> Result<DaemonResponse> {
@@ -2387,6 +2418,17 @@ fn format_policy(policy: &RepoPolicy) -> String {
         policy.writer_count(),
         policy.force_pusher_count(),
         policy.protected_ref_count()
+    )
+}
+
+fn format_storage_policy(policy: &StoragePolicy) -> String {
+    format!(
+        "data_shards={} parity_shards={} total_shards={} min_operators={} min_regions={}",
+        policy.data_shards,
+        policy.parity_shards,
+        policy.total_shards(),
+        policy.min_distinct_operators,
+        policy.min_distinct_regions
     )
 }
 
@@ -4001,6 +4043,50 @@ mod tests {
         assert!(response.contains("require_signed_refs=true"));
         assert!(response.contains("protected_refs=1"));
         let _ = fs::remove_file(policy_path);
+    }
+
+    #[test]
+    fn storage_policy_set_persists_before_objects_exist() {
+        let object_path = std::env::temp_dir().join(format!(
+            "gitmeshd-test-objects-policy-{}.txt",
+            std::process::id()
+        ));
+        let mut state = DaemonState::with_store_paths(Some(object_path.clone()), None, None)
+            .expect("state should load");
+
+        let response = state
+            .handle_command("STORAGE_POLICY_SET 4 2 3 2")
+            .unwrap()
+            .into_line();
+        let mut restored = DaemonState::with_store_paths(Some(object_path.clone()), None, None)
+            .expect("state should reload");
+        let restored_policy = restored
+            .handle_command("STORAGE_POLICY_SHOW")
+            .unwrap()
+            .into_line();
+
+        assert!(response.contains("data_shards=4"));
+        assert!(response.contains("parity_shards=2"));
+        assert!(response.contains("total_shards=6"));
+        assert!(response.contains("min_operators=3"));
+        assert!(response.contains("min_regions=2"));
+        assert_eq!(restored_policy, response);
+        let _ = fs::remove_file(object_path);
+    }
+
+    #[test]
+    fn storage_policy_set_rejects_changes_after_objects_exist() {
+        let mut state = DaemonState::default();
+        state.handle_command("OBJECT_PUT blob 6869").unwrap();
+
+        let err = state
+            .handle_command("STORAGE_POLICY_SET 4 2 3 2")
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            DaemonError::Repository(RepositoryError::StoragePolicyLocked)
+        ));
     }
 
     #[test]
