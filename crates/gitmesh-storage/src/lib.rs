@@ -11,10 +11,10 @@ use gitmesh_crypto::{
     encrypt_segment as crypto_encrypt_segment,
 };
 use gitmesh_network::{
-    InMemoryAvailabilityDirectory, NetworkError, NetworkRequest, NetworkResponse, NetworkTransport,
-    NodeDescriptor, NodeRole, OperatorId, PeerId, PlacementPlan, PlacementPolicy, ProviderLease,
-    ShardAuditChallenge, ShardEnvelope, ShardProviderRecord, ShardRef, SignedShardProviderRecord,
-    plan_shard_placement,
+    AvailabilityRequirement, InMemoryAvailabilityDirectory, NetworkError, NetworkRequest,
+    NetworkResponse, NetworkTransport, NodeDescriptor, NodeRole, OperatorId, PeerId, PlacementPlan,
+    PlacementPolicy, ProviderLease, ShardAuditChallenge, ShardEnvelope, ShardProviderRecord,
+    ShardRef, SignedShardProviderRecord, plan_shard_placement,
 };
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use thiserror::Error;
@@ -45,11 +45,32 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 pub struct StoragePolicy {
     pub data_shards: usize,
     pub parity_shards: usize,
+    pub min_distinct_operators: usize,
+    pub min_distinct_regions: usize,
 }
 
 impl StoragePolicy {
     pub fn total_shards(&self) -> usize {
         self.data_shards + self.parity_shards
+    }
+
+    pub fn availability_requirement(
+        &self,
+    ) -> std::result::Result<AvailabilityRequirement, NetworkError> {
+        AvailabilityRequirement::new(
+            self.data_shards,
+            self.min_distinct_operators,
+            self.min_distinct_regions,
+        )
+    }
+
+    pub fn placement_policy(&self) -> std::result::Result<PlacementPolicy, NetworkError> {
+        PlacementPolicy::new(
+            self.total_shards(),
+            self.min_distinct_operators,
+            self.min_distinct_regions,
+            true,
+        )
     }
 }
 
@@ -58,6 +79,8 @@ impl Default for StoragePolicy {
         Self {
             data_shards: 10,
             parity_shards: 6,
+            min_distinct_operators: 3,
+            min_distinct_regions: 2,
         }
     }
 }
@@ -1389,14 +1412,10 @@ mod tests {
         let storage_policy = StoragePolicy {
             data_shards: 3,
             parity_shards: 2,
+            min_distinct_operators: 5,
+            min_distinct_regions: 2,
         };
-        let placement_policy = PlacementPolicy::new(
-            storage_policy.total_shards(),
-            storage_policy.total_shards(),
-            2,
-            true,
-        )
-        .unwrap();
+        let placement_policy = storage_policy.placement_policy().unwrap();
         let encrypted = encrypt_segment(plaintext).unwrap();
         let shards = erasure_encode(&encrypted, &storage_policy).unwrap();
         let client = PeerId::new("client-a").unwrap();
@@ -1451,9 +1470,10 @@ mod tests {
         let storage_policy = StoragePolicy {
             data_shards: 3,
             parity_shards: 2,
+            min_distinct_operators: 5,
+            min_distinct_regions: 2,
         };
-        let placement_policy =
-            PlacementPolicy::new(storage_policy.total_shards(), 5, 2, true).unwrap();
+        let placement_policy = storage_policy.placement_policy().unwrap();
         let encrypted = encrypt_segment(plaintext).unwrap();
         let shards = erasure_encode(&encrypted, &storage_policy).unwrap();
         let client = PeerId::new("client-a").unwrap();
@@ -1513,9 +1533,10 @@ mod tests {
         let storage_policy = StoragePolicy {
             data_shards: 3,
             parity_shards: 2,
+            min_distinct_operators: 5,
+            min_distinct_regions: 2,
         };
-        let placement_policy =
-            PlacementPolicy::new(storage_policy.total_shards(), 5, 2, true).unwrap();
+        let placement_policy = storage_policy.placement_policy().unwrap();
         let encrypted = encrypt_segment(plaintext).unwrap();
         let shards = erasure_encode(&encrypted, &storage_policy).unwrap();
         let client = PeerId::new("client-a").unwrap();
@@ -1580,9 +1601,10 @@ mod tests {
         let storage_policy = StoragePolicy {
             data_shards: 3,
             parity_shards: 2,
+            min_distinct_operators: 5,
+            min_distinct_regions: 2,
         };
-        let placement_policy =
-            PlacementPolicy::new(storage_policy.total_shards(), 5, 2, true).unwrap();
+        let placement_policy = storage_policy.placement_policy().unwrap();
         let encrypted = encrypt_segment(b"remote audit catches repair targets").unwrap();
         let shards = erasure_encode(&encrypted, &storage_policy).unwrap();
         let client = PeerId::new("client-a").unwrap();
@@ -1643,9 +1665,10 @@ mod tests {
         let storage_policy = StoragePolicy {
             data_shards: 3,
             parity_shards: 2,
+            min_distinct_operators: 5,
+            min_distinct_regions: 2,
         };
-        let placement_policy =
-            PlacementPolicy::new(storage_policy.total_shards(), 5, 2, true).unwrap();
+        let placement_policy = storage_policy.placement_policy().unwrap();
         let encrypted =
             encrypt_segment(b"challenge audit samples shard bytes without fetching all").unwrap();
         let shards = erasure_encode(&encrypted, &storage_policy).unwrap();
@@ -1698,9 +1721,10 @@ mod tests {
         let storage_policy = StoragePolicy {
             data_shards: 3,
             parity_shards: 2,
+            min_distinct_operators: 5,
+            min_distinct_regions: 2,
         };
-        let placement_policy =
-            PlacementPolicy::new(storage_policy.total_shards(), 5, 2, true).unwrap();
+        let placement_policy = storage_policy.placement_policy().unwrap();
         let encrypted = encrypt_segment(plaintext).unwrap();
         let shards = erasure_encode(&encrypted, &storage_policy).unwrap();
         let client = PeerId::new("client-a").unwrap();
@@ -1788,9 +1812,10 @@ mod tests {
         let storage_policy = StoragePolicy {
             data_shards: 3,
             parity_shards: 2,
+            min_distinct_operators: 5,
+            min_distinct_regions: 2,
         };
-        let placement_policy =
-            PlacementPolicy::new(storage_policy.total_shards(), 5, 2, true).unwrap();
+        let placement_policy = storage_policy.placement_policy().unwrap();
         let encrypted = encrypt_segment(plaintext).unwrap();
         let shards = erasure_encode(&encrypted, &storage_policy).unwrap();
         let client = PeerId::new("client-a").unwrap();
@@ -1876,9 +1901,10 @@ mod tests {
         let storage_policy = StoragePolicy {
             data_shards: 3,
             parity_shards: 2,
+            min_distinct_operators: 5,
+            min_distinct_regions: 2,
         };
-        let placement_policy =
-            PlacementPolicy::new(storage_policy.total_shards(), 5, 2, true).unwrap();
+        let placement_policy = storage_policy.placement_policy().unwrap();
         let encrypted = encrypt_segment(b"too many remote shards are gone").unwrap();
         let shards = erasure_encode(&encrypted, &storage_policy).unwrap();
         let client = PeerId::new("client-a").unwrap();

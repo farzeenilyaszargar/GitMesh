@@ -568,7 +568,7 @@ impl DaemonState {
             let now = network_now_unix()?;
             let availability = self.repo_availability_status(now)?;
             return Ok(DaemonResponse::Ok(format!(
-                "objects={} refs={} mutations={} checkpoints={} key_grants={} revoked_devices={} accounts={} active_sessions={} registered_repos={} collaboration_events={} network_peers={} network_storage_peers={} availability_records={} available_objects={} unavailable_objects={} data_shards={} parity_shards={}",
+                "objects={} refs={} mutations={} checkpoints={} key_grants={} revoked_devices={} accounts={} active_sessions={} registered_repos={} collaboration_events={} network_peers={} network_storage_peers={} availability_records={} available_objects={} unavailable_objects={} data_shards={} parity_shards={} min_operators={} min_regions={}",
                 self.objects.object_count(),
                 self.refs.ref_count(),
                 self.refs.mutation_count(),
@@ -585,7 +585,9 @@ impl DaemonState {
                 availability.available_objects,
                 availability.unavailable_objects,
                 self.objects.policy().data_shards,
-                self.objects.policy().parity_shards
+                self.objects.policy().parity_shards,
+                self.objects.policy().min_distinct_operators,
+                self.objects.policy().min_distinct_regions
             )));
         }
 
@@ -720,7 +722,9 @@ impl DaemonState {
     }
 
     fn default_availability_requirement(&self) -> Result<AvailabilityRequirement> {
-        AvailabilityRequirement::new(self.objects.policy().data_shards, 3, 2)
+        self.objects
+            .policy()
+            .availability_requirement()
             .map_err(DaemonError::Network)
     }
 
@@ -4279,6 +4283,8 @@ mod tests {
         assert!(status.contains("available_objects=1"));
         assert!(status.contains("unavailable_objects=0"));
         assert!(status.contains("data_shards=10"));
+        assert!(status.contains("min_operators=3"));
+        assert!(status.contains("min_regions=2"));
     }
 
     #[test]

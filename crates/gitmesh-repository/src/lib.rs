@@ -18,8 +18,8 @@ use gitmesh_git::{
 };
 use gitmesh_network::{
     AvailabilityReport, AvailabilityRequirement, InMemoryAvailabilityDirectory, InMemoryPeer,
-    InMemorySwarm, NodeRole, OperatorId, PeerId, PlacementPolicy, ProviderLease,
-    ShardProviderRecord, ShardRef, client_descriptor, storage_descriptor,
+    InMemorySwarm, NodeRole, OperatorId, PeerId, ProviderLease, ShardProviderRecord, ShardRef,
+    client_descriptor, storage_descriptor,
 };
 use gitmesh_storage::{
     EncryptedSegment, RepairOutcome, Shard, ShardAuditReport, SimulatedNetwork, StoragePolicy,
@@ -364,8 +364,11 @@ impl RepositoryObjectStore {
         let mut snapshot = String::new();
         snapshot.push_str("gitmesh-repository-store-v0\n");
         snapshot.push_str(&format!(
-            "policy\t{}\t{}\n",
-            self.policy.data_shards, self.policy.parity_shards
+            "policy\t{}\t{}\t{}\t{}\n",
+            self.policy.data_shards,
+            self.policy.parity_shards,
+            self.policy.min_distinct_operators,
+            self.policy.min_distinct_regions
         ));
         for stored in self.objects.values() {
             snapshot.push_str(&format!(
@@ -418,12 +421,22 @@ impl RepositoryObjectStore {
             .next()
             .ok_or(RepositoryError::InvalidStore("missing storage policy"))?;
         let policy_parts = policy_line.split('\t').collect::<Vec<_>>();
-        if policy_parts.len() != 3 || policy_parts[0] != "policy" {
+        if !matches!(policy_parts.len(), 3 | 5) || policy_parts[0] != "policy" {
             return Err(RepositoryError::InvalidStore("invalid storage policy"));
         }
         let policy = StoragePolicy {
             data_shards: parse_usize(policy_parts[1])?,
             parity_shards: parse_usize(policy_parts[2])?,
+            min_distinct_operators: policy_parts
+                .get(3)
+                .map(|value| parse_usize(value))
+                .transpose()?
+                .unwrap_or(3),
+            min_distinct_regions: policy_parts
+                .get(4)
+                .map(|value| parse_usize(value))
+                .transpose()?
+                .unwrap_or(2),
         };
         let mut builders = BTreeMap::<GitSha1Oid, StoredObjectBuilder>::new();
 
@@ -684,10 +697,12 @@ pub fn run_repository_transport_repair_proof(
     let policy = StoragePolicy {
         data_shards: 3,
         parity_shards: 2,
+        min_distinct_operators: 5,
+        min_distinct_regions: 2,
     };
-    let placement_policy =
-        PlacementPolicy::new(policy.total_shards(), policy.total_shards(), 2, true)
-            .map_err(|err| RepositoryError::Network(err.to_string()))?;
+    let placement_policy = policy
+        .placement_policy()
+        .map_err(|err| RepositoryError::Network(err.to_string()))?;
     let object = GitObject::new(GitObjectKind::Blob, payload);
     let oid = object.sha1_oid();
     let mut store = RepositoryObjectStore::new(policy.clone());
@@ -1057,7 +1072,7 @@ mod tests {
         let providers = store
             .local_provider_records_for_object(record.oid, 1, 500)
             .unwrap();
-        let requirement = AvailabilityRequirement::new(store.policy().data_shards, 3, 2).unwrap();
+        let requirement = store.policy().availability_requirement().unwrap();
 
         let report = store
             .object_availability_report(record.oid, &providers, requirement, 100)
@@ -1083,7 +1098,7 @@ mod tests {
         let record = store.put_git_object(object).unwrap();
         let mut providers = providers_for_record(&record, store.policy().data_shards);
         providers[0].shard_cid = shard_cid(record.segment_cid, 0, b"forged");
-        let requirement = AvailabilityRequirement::new(store.policy().data_shards, 3, 2).unwrap();
+        let requirement = store.policy().availability_requirement().unwrap();
 
         let err = store
             .object_availability_report(record.oid, &providers, requirement, 100)
@@ -1366,6 +1381,29 @@ mod tests {
 
         assert_eq!(restored.object_count(), 1);
         assert_eq!(restored.get_git_object(oid).unwrap(), object);
+        assert_eq!(restored.policy().min_distinct_operators, 3);
+        assert_eq!(restored.policy().min_distinct_regions, 2);
+    }
+
+    #[test]
+    fn snapshot_round_trips_storage_policy_diversity_thresholds() {
+        let policy = StoragePolicy {
+            data_shards: 4,
+            parity_shards: 2,
+            min_distinct_operators: 4,
+            min_distinct_regions: 3,
+        };
+        let store = RepositoryObjectStore::new(policy.clone());
+        let path = std::env::temp_dir().join(format!(
+            "gitmesh-repository-policy-{}.snapshot",
+            std::process::id()
+        ));
+
+        store.save_to_path(&path).unwrap();
+        let restored = RepositoryObjectStore::load_from_path(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(restored.policy(), &policy);
     }
 
     #[test]

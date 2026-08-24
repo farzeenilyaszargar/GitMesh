@@ -90,13 +90,21 @@ storage nodes cannot enumerate content.
 Initial default: Reed-Solomon-style coding with `k = 10` data shards and `m = 6`
 parity shards for V0 experiments only. These numbers are not protocol constants.
 
-Repository `StoragePolicy` declares:
+Repository `StoragePolicy` currently persists the correctness-critical shard and
+diversity thresholds:
 
 ```text
 data_shards
 parity_shards
 minimum_storage_operators
 minimum_regions
+```
+
+The same policy object is used to derive placement requirements and
+availability requirements for durability-before-ref-publication checks. Later
+policy revisions add:
+
+```text
 maximum_shards_per_operator
 maximum_shards_per_asn
 audit_policy
