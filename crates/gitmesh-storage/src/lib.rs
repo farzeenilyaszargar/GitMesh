@@ -640,11 +640,15 @@ pub fn distribute_shards_via_transport<T: NetworkTransport>(
             .request(
                 client_peer,
                 peer,
-                NetworkRequest::PutShard {
-                    envelope: shard.to_network_envelope()?,
-                    lease_epoch,
-                    expires_at_unix,
-                },
+                NetworkRequest::idempotent(
+                    shard_put_transaction_id(shard, lease_epoch, expires_at_unix),
+                    NetworkRequest::PutShard {
+                        envelope: shard.to_network_envelope()?,
+                        lease_epoch,
+                        expires_at_unix,
+                    },
+                )
+                .map_err(|err| StorageError::Network(err.to_string()))?,
             )
             .map_err(|err| StorageError::Network(err.to_string()))?;
         let NetworkResponse::ShardStored { shard_ref } = response else {
@@ -773,7 +777,11 @@ pub fn publish_providers_via_transport<T: NetworkTransport>(
             .request(
                 client_peer,
                 directory_peer,
-                NetworkRequest::PublishProvider(provider.clone()),
+                NetworkRequest::idempotent(
+                    provider_publish_transaction_id(provider),
+                    NetworkRequest::PublishProvider(provider.clone()),
+                )
+                .map_err(|err| StorageError::Network(err.to_string()))?,
             )
             .map_err(|err| StorageError::Network(err.to_string()))?;
         if response != NetworkResponse::Ack {
@@ -797,10 +805,14 @@ pub fn publish_signed_providers_via_transport<T: NetworkTransport>(
             .request(
                 client_peer,
                 directory_peer,
-                NetworkRequest::PublishSignedProvider {
-                    signed: Box::new(provider.clone()),
-                    now_unix,
-                },
+                NetworkRequest::idempotent(
+                    signed_provider_publish_transaction_id(provider),
+                    NetworkRequest::PublishSignedProvider {
+                        signed: Box::new(provider.clone()),
+                        now_unix,
+                    },
+                )
+                .map_err(|err| StorageError::Network(err.to_string()))?,
             )
             .map_err(|err| StorageError::Network(err.to_string()))?;
         if response != NetworkResponse::Ack {
@@ -835,6 +847,32 @@ pub fn discover_providers_via_transport<T: NetworkTransport>(
         ));
     };
     Ok(providers)
+}
+
+fn shard_put_transaction_id(shard: &Shard, lease_epoch: u64, expires_at_unix: u64) -> String {
+    format!(
+        "put-shard:{}:{}:{}:{}",
+        shard.segment_cid, shard.cid, lease_epoch, expires_at_unix
+    )
+}
+
+fn provider_publish_transaction_id(provider: &ShardProviderRecord) -> String {
+    format!(
+        "publish-provider:{}:{}:{}:{}:{}",
+        provider.segment_cid,
+        provider.shard_cid,
+        provider.peer_id,
+        provider.lease_epoch,
+        provider.expires_at_unix
+    )
+}
+
+fn signed_provider_publish_transaction_id(provider: &SignedShardProviderRecord) -> String {
+    format!(
+        "publish-signed-provider:{}:{}",
+        provider_publish_transaction_id(&provider.record),
+        hex(&provider.signature[..8])
+    )
 }
 
 pub fn audit_shards_via_transport<T: NetworkTransport>(
@@ -1429,6 +1467,43 @@ mod tests {
         assert_eq!(providers.len(), policy.total_shards());
         assert_eq!(fetched.len(), policy.data_shards);
         assert_eq!(recovered, plaintext);
+    }
+
+    #[test]
+    fn transport_distribution_retries_are_idempotent() {
+        let plaintext = b"network transport retry should not duplicate shard writes";
+        let policy = StoragePolicy::default();
+        let encrypted = encrypt_segment(plaintext).unwrap();
+        let shards = erasure_encode(&encrypted, &policy).unwrap();
+        let client = PeerId::new("client-a").unwrap();
+        let mut swarm = InMemorySwarm::default();
+        swarm
+            .add_peer(InMemoryPeer::new(client_descriptor("client-a").unwrap()))
+            .unwrap();
+        let storage_peers = (0..policy.total_shards())
+            .map(|index| {
+                let peer_id = PeerId::new(format!("storage-{index}")).unwrap();
+                swarm
+                    .add_peer(InMemoryPeer::new(
+                        storage_descriptor(peer_id.as_str(), &format!("operator-{index}"), "iad")
+                            .unwrap(),
+                    ))
+                    .unwrap();
+                peer_id
+            })
+            .collect::<Vec<_>>();
+
+        let first =
+            distribute_shards_via_transport(&mut swarm, &client, &storage_peers, &shards, 1, 1_000)
+                .unwrap();
+        let second =
+            distribute_shards_via_transport(&mut swarm, &client, &storage_peers, &shards, 1, 1_000)
+                .unwrap();
+
+        assert_eq!(first, second);
+        for peer in &storage_peers {
+            assert_eq!(swarm.peer(peer).unwrap().stored_shard_count(), 1);
+        }
     }
 
     #[test]

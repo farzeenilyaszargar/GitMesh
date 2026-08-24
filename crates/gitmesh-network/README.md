@@ -40,6 +40,8 @@ The in-memory swarm supports:
 - persistent local node identity, listen addresses, bootstrap peers, and known
   peer records
 - request/response routing between peers
+- idempotent wrappers for mutating requests, so identical transaction retries
+  replay the cached response and conflicting replays fail
 - storage-role enforcement for shard writes
 - shard integrity verification before store/fetch success
 - unsigned and signed provider publication with lease expiry

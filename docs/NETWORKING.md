@@ -33,6 +33,12 @@ storage role set, lease epoch, and expiry time. Directories may cache these
 records, but clients verify signatures, expiry, shard CIDs, and placement policy
 before counting a shard toward durability.
 
+Mutating request/response operations carry an idempotency transaction ID. Peers
+cache successful responses for identical transaction IDs, replay the cached
+response for identical retries, and reject the same ID if it is later attached
+to different request bytes. This applies to shard writes and provider
+publication so transport retries do not create ambiguous side effects.
+
 ## DHT Usage
 
 The DHT is not an application database. It is used for:

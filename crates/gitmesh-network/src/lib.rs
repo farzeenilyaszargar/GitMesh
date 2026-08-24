@@ -1357,6 +1357,10 @@ pub fn plan_shard_placement(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NetworkRequest {
     Ping,
+    Idempotent {
+        transaction_id: String,
+        request: Box<NetworkRequest>,
+    },
     PublishProvider(ShardProviderRecord),
     PublishSignedProvider {
         signed: Box<SignedShardProviderRecord>,
@@ -1380,6 +1384,33 @@ pub enum NetworkRequest {
     ChallengeShard {
         challenge: ShardAuditChallenge,
     },
+}
+
+impl NetworkRequest {
+    pub fn idempotent(
+        transaction_id: impl Into<String>,
+        request: NetworkRequest,
+    ) -> Result<Self, NetworkError> {
+        let transaction_id = transaction_id.into();
+        validate_network_transaction_id(&transaction_id)?;
+        if !request.is_mutating() || matches!(request, NetworkRequest::Idempotent { .. }) {
+            return Err(NetworkError::InvalidNetworkTransaction);
+        }
+        Ok(Self::Idempotent {
+            transaction_id,
+            request: Box::new(request),
+        })
+    }
+
+    pub fn is_mutating(&self) -> bool {
+        matches!(
+            self,
+            Self::PublishProvider(_)
+                | Self::PublishSignedProvider { .. }
+                | Self::PutShard { .. }
+                | Self::Idempotent { .. }
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1419,6 +1450,7 @@ pub struct InMemoryPeer {
     descriptor: NodeDescriptor,
     shards: BTreeMap<Cid, ShardEnvelope>,
     directory: InMemoryAvailabilityDirectory,
+    receipts: BTreeMap<String, (NetworkRequest, NetworkResponse)>,
 }
 
 impl InMemoryPeer {
@@ -1427,6 +1459,7 @@ impl InMemoryPeer {
             descriptor,
             shards: BTreeMap::new(),
             directory: InMemoryAvailabilityDirectory::default(),
+            receipts: BTreeMap::new(),
         }
     }
 
@@ -1440,6 +1473,10 @@ impl InMemoryPeer {
 
     fn handle(&mut self, request: NetworkRequest) -> Result<NetworkResponse, NetworkError> {
         match request {
+            NetworkRequest::Idempotent {
+                transaction_id,
+                request,
+            } => self.handle_idempotent(transaction_id, *request),
             NetworkRequest::Ping => Ok(NetworkResponse::Pong {
                 peer_id: self.descriptor.peer_id.clone(),
             }),
@@ -1522,6 +1559,27 @@ impl InMemoryPeer {
                 })
             }
         }
+    }
+
+    fn handle_idempotent(
+        &mut self,
+        transaction_id: String,
+        request: NetworkRequest,
+    ) -> Result<NetworkResponse, NetworkError> {
+        validate_network_transaction_id(&transaction_id)?;
+        if !request.is_mutating() || matches!(request, NetworkRequest::Idempotent { .. }) {
+            return Err(NetworkError::InvalidNetworkTransaction);
+        }
+        if let Some((existing_request, response)) = self.receipts.get(&transaction_id) {
+            if existing_request == &request {
+                return Ok(response.clone());
+            }
+            return Err(NetworkError::NetworkTransactionConflict);
+        }
+        let response = self.handle(request.clone())?;
+        self.receipts
+            .insert(transaction_id, (request, response.clone()));
+        Ok(response)
     }
 
     fn require_role(&self, role: NodeRole) -> Result<(), NetworkError> {
@@ -1726,6 +1784,18 @@ fn parse_u64(value: &str) -> Result<u64, NetworkError> {
         .map_err(|_| NetworkError::InvalidAvailabilityDirectory)
 }
 
+fn validate_network_transaction_id(value: &str) -> Result<(), NetworkError> {
+    if value.is_empty()
+        || value.len() > 512
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err(NetworkError::InvalidNetworkTransaction);
+    }
+    Ok(())
+}
+
 fn decode_utf8_hex(value: &str) -> Result<String, NetworkError> {
     String::from_utf8(decode_hex(value)?).map_err(|_| NetworkError::InvalidAvailabilityDirectory)
 }
@@ -1884,6 +1954,10 @@ pub enum NetworkError {
     InvalidPlacementPolicy,
     #[error("invalid availability requirement")]
     InvalidAvailabilityRequirement,
+    #[error("invalid network transaction")]
+    InvalidNetworkTransaction,
+    #[error("network transaction id was replayed with different request bytes")]
+    NetworkTransactionConflict,
     #[error("not enough qualified independent storage peers")]
     InsufficientStoragePeers,
 }
@@ -2280,6 +2354,104 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err, NetworkError::UnsupportedRole);
+    }
+
+    #[test]
+    fn idempotent_mutating_request_replays_cached_response() {
+        let client = PeerId::new("client-a").unwrap();
+        let storage = PeerId::new("storage-a").unwrap();
+        let envelope =
+            ShardEnvelope::new(cid(CidKind::EncryptedSegment, 7), 0, 16, 10, b"x".to_vec())
+                .unwrap();
+        let request = NetworkRequest::idempotent(
+            "put-shard-test",
+            NetworkRequest::PutShard {
+                envelope: envelope.clone(),
+                lease_epoch: 1,
+                expires_at_unix: 500,
+            },
+        )
+        .unwrap();
+        let mut swarm = InMemorySwarm::default();
+        swarm
+            .add_peer(InMemoryPeer::new(client_descriptor("client-a").unwrap()))
+            .unwrap();
+        swarm
+            .add_peer(InMemoryPeer::new(
+                storage_descriptor("storage-a", "operator-a", "iad").unwrap(),
+            ))
+            .unwrap();
+
+        let first = swarm.request(&client, &storage, request.clone()).unwrap();
+        let second = swarm.request(&client, &storage, request).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            swarm.peer(&storage).unwrap().stored_shard_count(),
+            1,
+            "duplicate replay must not duplicate storage side effects"
+        );
+    }
+
+    #[test]
+    fn idempotent_transaction_rejects_conflicting_replay() {
+        let client = PeerId::new("client-a").unwrap();
+        let storage = PeerId::new("storage-a").unwrap();
+        let first_envelope =
+            ShardEnvelope::new(cid(CidKind::EncryptedSegment, 7), 0, 16, 10, b"x".to_vec())
+                .unwrap();
+        let second_envelope =
+            ShardEnvelope::new(cid(CidKind::EncryptedSegment, 8), 0, 16, 10, b"y".to_vec())
+                .unwrap();
+        let mut swarm = InMemorySwarm::default();
+        swarm
+            .add_peer(InMemoryPeer::new(client_descriptor("client-a").unwrap()))
+            .unwrap();
+        swarm
+            .add_peer(InMemoryPeer::new(
+                storage_descriptor("storage-a", "operator-a", "iad").unwrap(),
+            ))
+            .unwrap();
+
+        swarm
+            .request(
+                &client,
+                &storage,
+                NetworkRequest::idempotent(
+                    "put-shard-test",
+                    NetworkRequest::PutShard {
+                        envelope: first_envelope,
+                        lease_epoch: 1,
+                        expires_at_unix: 500,
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let err = swarm
+            .request(
+                &client,
+                &storage,
+                NetworkRequest::idempotent(
+                    "put-shard-test",
+                    NetworkRequest::PutShard {
+                        envelope: second_envelope,
+                        lease_epoch: 1,
+                        expires_at_unix: 500,
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap_err();
+
+        assert_eq!(err, NetworkError::NetworkTransactionConflict);
+    }
+
+    #[test]
+    fn idempotent_transaction_rejects_read_only_request() {
+        let err = NetworkRequest::idempotent("read-replay", NetworkRequest::Ping).unwrap_err();
+
+        assert_eq!(err, NetworkError::InvalidNetworkTransaction);
     }
 
     #[test]
