@@ -11,6 +11,7 @@ KEY_STORE="$TMP_DIR/key-grants.tsv"
 ACCOUNT_STORE="$TMP_DIR/accounts.tsv"
 COLLAB_STORE="$TMP_DIR/collaboration.tsv"
 NETWORK_STORE="$TMP_DIR/network.tsv"
+IDENTITY_STORE="$TMP_DIR/identity.tsv"
 DAEMON_PID=""
 WEB_PID=""
 WEB_PORT=""
@@ -33,7 +34,7 @@ run_gitmeshd() {
 }
 
 run_gm() {
-  GITMESHD_SOCKET="$SOCKET_PATH" cargo run --quiet --bin gm -- "$@"
+  GITMESHD_SOCKET="$SOCKET_PATH" GITMESH_IDENTITY="$IDENTITY_STORE" cargo run --quiet --bin gm -- "$@"
 }
 
 expect_contains() {
@@ -178,13 +179,25 @@ gm_pr_response="$(run_gm pr create "CLI pull request" refs/heads/gm-smoke refs/h
 expect_contains "$gm_pr_response" "OK event="
 expect_contains "$gm_pr_response" "number=2"
 
+gm_signed_issue_response="$(run_gm issue create "Signed CLI issue" "verifies signed gm writes" "cli,security" --signed)"
+expect_contains "$gm_signed_issue_response" "OK event="
+expect_contains "$gm_signed_issue_response" "signed=true"
+expect_contains "$gm_signed_issue_response" "number=3"
+
+gm_signed_pr_response="$(run_gm pr create "Signed CLI pull request" refs/heads/gm-signed-smoke refs/heads/main "verifies signed gm pr writes" "cli,security" --signed)"
+expect_contains "$gm_signed_pr_response" "OK event="
+expect_contains "$gm_signed_pr_response" "signed=true"
+expect_contains "$gm_signed_pr_response" "number=3"
+
 gm_issues_list="$(run_gm issue list)"
-expect_contains "$gm_issues_list" "Showing 2 open issues"
+expect_contains "$gm_issues_list" "Showing 3 open issues"
 expect_contains "$gm_issues_list" "CLI issue"
+expect_contains "$gm_issues_list" "Signed CLI issue"
 
 gm_prs_list="$(run_gm pr list)"
-expect_contains "$gm_prs_list" "Showing 2 open pull requests"
+expect_contains "$gm_prs_list" "Showing 3 open pull requests"
 expect_contains "$gm_prs_list" "refs/heads/gm-smoke"
+expect_contains "$gm_prs_list" "refs/heads/gm-signed-smoke"
 
 npm --prefix apps/web run build >/dev/null
 WEB_PORT="$(
@@ -209,7 +222,7 @@ web_issue_response="$(
     '{"repo":"farzeen/gitmesh","actor":"farzeen","title":"Web issue","body":"verifies api writes","labels":["web","collaboration"]}'
 )"
 expect_contains "$web_issue_response" '"ok":true'
-expect_contains "$web_issue_response" '"number":"3"'
+expect_contains "$web_issue_response" '"number":"4"'
 
 web_pr_response="$(
   post_json \
@@ -217,7 +230,7 @@ web_pr_response="$(
     '{"repo":"farzeen/gitmesh","actor":"farzeen","sourceRef":"refs/heads/web-smoke","targetRef":"refs/heads/main","title":"Web pull request","body":"verifies api pr writes","labels":["web"]}'
 )"
 expect_contains "$web_pr_response" '"ok":true'
-expect_contains "$web_pr_response" '"number":"3"'
+expect_contains "$web_pr_response" '"number":"4"'
 
 web_issues_list="$(get_json "/api/gitmesh/issues?repo=farzeen/gitmesh")"
 expect_contains "$web_issues_list" '"issues"'
@@ -234,7 +247,7 @@ expect_contains "$web_network" '"peerId":"bootstrap-a"'
 
 web_status="$(get_json "/api/gitmesh/status")"
 expect_contains "$web_status" '"ok":true'
-expect_contains "$web_status" '"collaboration_events":"6"'
+expect_contains "$web_status" '"collaboration_events":"8"'
 expect_contains "$web_status" '"network_peers":"2"'
 
 for store in "$OBJECT_STORE" "$REF_STORE" "$COLLAB_STORE" "$NETWORK_STORE"; do

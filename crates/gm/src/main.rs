@@ -6,7 +6,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use gitmesh_collaboration::{sample_issues, sample_pull_requests};
+use gitmesh_collaboration::{
+    CollaborationEvent, CollaborationEventKind, CollaborationPayload, sample_issues,
+    sample_pull_requests,
+};
 use gitmesh_coordination::{RefName, RefUpdate, RepoId, TransactionId};
 use gitmesh_core::{Cid, CidKind, HashAlgorithm, hex};
 use gitmesh_crypto::RepoContentKey;
@@ -191,6 +194,74 @@ impl LocalIdentity {
             hex(&self.certificate.device_verifying_key),
             hex(&self.certificate.signature),
             hex(&update_signature)
+        ))
+    }
+
+    fn signed_issue_open_command(
+        &self,
+        repo: &str,
+        title: &str,
+        body: &str,
+        labels: Vec<String>,
+    ) -> Result<String, GmError> {
+        let timestamp = now_unix()?;
+        let event = CollaborationEvent::new(
+            repo,
+            CollaborationEventKind::IssueOpened,
+            self.certificate.device_id.as_cid().as_hex(),
+            Vec::new(),
+            timestamp,
+            CollaborationPayload::issue(title, body, labels),
+        )?;
+        let event_signature = self.device.sign(&event.signing_transcript());
+        Ok(format!(
+            "ISSUE_OPEN_SIGNED {} {} {} {} {} {} {} {} {} {}",
+            repo,
+            timestamp,
+            encode_text_arg(title),
+            encode_text_arg(body),
+            encode_label_list_arg(&event.payload.labels),
+            hex(self.certificate.label.as_bytes()),
+            hex(&self.certificate.account_verifying_key),
+            hex(&self.certificate.device_verifying_key),
+            hex(&self.certificate.signature),
+            hex(&event_signature)
+        ))
+    }
+
+    fn signed_pr_open_command(
+        &self,
+        repo: &str,
+        source_ref: &str,
+        target_ref: &str,
+        title: &str,
+        body: &str,
+        labels: Vec<String>,
+    ) -> Result<String, GmError> {
+        let timestamp = now_unix()?;
+        let event = CollaborationEvent::new(
+            repo,
+            CollaborationEventKind::PullRequestOpened,
+            self.certificate.device_id.as_cid().as_hex(),
+            Vec::new(),
+            timestamp,
+            CollaborationPayload::pull_request(title, body, labels, source_ref, target_ref),
+        )?;
+        let event_signature = self.device.sign(&event.signing_transcript());
+        Ok(format!(
+            "PR_OPEN_SIGNED {} {} {} {} {} {} {} {} {} {} {} {}",
+            repo,
+            timestamp,
+            source_ref,
+            target_ref,
+            encode_text_arg(title),
+            encode_text_arg(body),
+            encode_label_list_arg(&event.payload.labels),
+            hex(self.certificate.label.as_bytes()),
+            hex(&self.certificate.account_verifying_key),
+            hex(&self.certificate.device_verifying_key),
+            hex(&self.certificate.signature),
+            hex(&event_signature)
         ))
     }
 }
@@ -943,6 +1014,41 @@ fn encode_label_arg(value: Option<&String>) -> Result<String, GmError> {
         .map(|labels| labels.join(","))
 }
 
+fn parse_label_values(value: Option<&String>) -> Result<Vec<String>, GmError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    value
+        .split(',')
+        .map(|label| {
+            let label = label.trim();
+            validate_state_field(label)?;
+            Ok(label.to_string())
+        })
+        .collect()
+}
+
+fn encode_label_list_arg(labels: &[String]) -> String {
+    if labels.is_empty() {
+        return "-".to_string();
+    }
+    labels
+        .iter()
+        .map(|label| encode_text_arg(label))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn now_unix() -> Result<u64, GmError> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| GmError::InvalidArguments("system time is before UNIX_EPOCH".to_string()))?
+        .as_secs())
+}
+
 fn issue(args: &[String]) -> Result<(), GmError> {
     match args.first().map(String::as_str) {
         Some("list") | None => {
@@ -983,18 +1089,33 @@ fn issue(args: &[String]) -> Result<(), GmError> {
             Ok(())
         }
         Some("create") => {
-            let title = args.get(1).ok_or_else(|| {
+            let signed = args.iter().any(|arg| arg == "--signed");
+            let create_args = args
+                .iter()
+                .skip(1)
+                .filter(|arg| arg.as_str() != "--signed")
+                .collect::<Vec<_>>();
+            let title = create_args.first().ok_or_else(|| {
                 GmError::InvalidArguments("issue create requires a title".to_string())
             })?;
-            let body = args.get(2).map_or("-", |value| value.as_str());
+            let body = create_args.get(1).map_or("-", |value| value.as_str());
             validate_state_field(title)?;
             validate_state_field(body)?;
-            let command = format!(
-                "ISSUE_OPEN farzeen/gitmesh farzeen {} {} {}",
-                encode_text_arg(title),
-                encode_text_arg(body),
-                encode_label_arg(args.get(3))?
-            );
+            let command = if signed {
+                LocalIdentity::load_or_create_default()?.signed_issue_open_command(
+                    "farzeen/gitmesh",
+                    title,
+                    body,
+                    parse_label_values(create_args.get(2).copied())?,
+                )?
+            } else {
+                format!(
+                    "ISSUE_OPEN farzeen/gitmesh farzeen {} {} {}",
+                    encode_text_arg(title),
+                    encode_text_arg(body),
+                    encode_label_arg(create_args.get(2).copied())?
+                )
+            };
             println!("{}", request_unix_socket(default_socket_path(), &command)?);
             Ok(())
         }
@@ -1061,26 +1182,45 @@ fn pr(args: &[String]) -> Result<(), GmError> {
             Ok(())
         }
         Some("create") => {
-            let title = args.get(1).ok_or_else(|| {
+            let signed = args.iter().any(|arg| arg == "--signed");
+            let create_args = args
+                .iter()
+                .skip(1)
+                .filter(|arg| arg.as_str() != "--signed")
+                .collect::<Vec<_>>();
+            let title = create_args.first().ok_or_else(|| {
                 GmError::InvalidArguments("pr create requires a title".to_string())
             })?;
-            let source = args.get(2).ok_or_else(|| {
+            let source = create_args.get(1).ok_or_else(|| {
                 GmError::InvalidArguments("pr create requires a source ref".to_string())
             })?;
-            let target = args.get(3).map_or("refs/heads/main", String::as_str);
-            let body = args.get(4).map_or("-", String::as_str);
+            let target = create_args
+                .get(2)
+                .map_or("refs/heads/main", |value| value.as_str());
+            let body = create_args.get(3).map_or("-", |value| value.as_str());
             validate_state_field(title)?;
             validate_state_field(source)?;
             validate_state_field(target)?;
             validate_state_field(body)?;
-            let command = format!(
-                "PR_OPEN farzeen/gitmesh farzeen {} {} {} {} {}",
-                source,
-                target,
-                encode_text_arg(title),
-                encode_text_arg(body),
-                encode_label_arg(args.get(5))?
-            );
+            let command = if signed {
+                LocalIdentity::load_or_create_default()?.signed_pr_open_command(
+                    "farzeen/gitmesh",
+                    source,
+                    target,
+                    title,
+                    body,
+                    parse_label_values(create_args.get(4).copied())?,
+                )?
+            } else {
+                format!(
+                    "PR_OPEN farzeen/gitmesh farzeen {} {} {} {} {}",
+                    source,
+                    target,
+                    encode_text_arg(title),
+                    encode_text_arg(body),
+                    encode_label_arg(create_args.get(4).copied())?
+                )
+            };
             println!("{}", request_unix_socket(default_socket_path(), &command)?);
             Ok(())
         }
@@ -1859,9 +1999,11 @@ fn print_help() {
     println!("  repo clone <gitmesh-url> [directory]");
     println!("  repo create [owner/repo] [--public|--private] [-d description]");
     println!("  repo materialize [socket] <bare-dir>");
-    println!("  issue list | issue view <id> | issue create <title> [body] [label,label]");
     println!(
-        "  pr list | pr status | pr view <id> | pr create <title> <source-ref> [target-ref] [body] [label,label]"
+        "  issue list | issue view <id> | issue create <title> [body] [label,label] [--signed]"
+    );
+    println!(
+        "  pr list | pr status | pr view <id> | pr create <title> <source-ref> [target-ref] [body] [label,label] [--signed]"
     );
     println!("  daemon ping [socket]");
     println!("  daemon proof [socket] [payload...]");
@@ -1931,6 +2073,8 @@ enum GmError {
     Identity(#[from] gitmesh_identity::IdentityError),
     #[error(transparent)]
     Coordination(#[from] gitmesh_coordination::CoordinationError),
+    #[error(transparent)]
+    Collaboration(#[from] gitmesh_collaboration::CollaborationError),
     #[error(transparent)]
     Git(#[from] gitmesh_git::GitError),
     #[error("daemon returned an error response: {0}")]

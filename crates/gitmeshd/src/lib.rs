@@ -19,8 +19,8 @@ use gitmesh_accounts::{
 };
 use gitmesh_collaboration::{
     CollaborationError, CollaborationEvent, CollaborationEventKind, CollaborationEventStore,
-    CollaborationPayload, IssueSummary, PullRequestSummary, sample_issue_events,
-    sample_pull_request_events,
+    CollaborationPayload, IssueSummary, PullRequestSummary, SignedCollaborationEvent,
+    sample_issue_events, sample_pull_request_events,
 };
 use gitmesh_coordination::{
     CoordinationError, RefName, RefStore, RefUpdate, RefUpdateActor, RejectionReason, RepoId,
@@ -488,12 +488,20 @@ impl DaemonState {
             return self.issue_open(rest);
         }
 
+        if let Some(rest) = trimmed.strip_prefix("ISSUE_OPEN_SIGNED ") {
+            return self.issue_open_signed(rest);
+        }
+
         if let Some(repo) = trimmed.strip_prefix("ISSUE_LIST ") {
             return self.issue_list(repo);
         }
 
         if let Some(rest) = trimmed.strip_prefix("PR_OPEN ") {
             return self.pr_open(rest);
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("PR_OPEN_SIGNED ") {
+            return self.pr_open_signed(rest);
         }
 
         if let Some(repo) = trimmed.strip_prefix("PR_LIST ") {
@@ -1089,6 +1097,55 @@ impl DaemonState {
         )))
     }
 
+    fn issue_open_signed(&mut self, rest: &str) -> Result<DaemonResponse> {
+        let parts = rest.split_whitespace().collect::<Vec<_>>();
+        if parts.len() != 10 {
+            return Err(DaemonError::InvalidCommand(
+                "ISSUE_OPEN_SIGNED requires <repo> <timestamp-unix> <title-hex> <body-hex|-> <labels-hex-list|-> <label-hex> <account-key-hex> <device-key-hex> <cert-signature-hex> <event-signature-hex>".to_string(),
+            ));
+        }
+        validate_repo_selector(parts[0])?;
+        let certificate = DeviceCertificate::from_key_bytes(
+            decode_label(parts[5])?,
+            decode_fixed_hex::<32>(parts[6])?,
+            decode_fixed_hex::<32>(parts[7])?,
+            decode_fixed_hex::<64>(parts[8])?,
+        )?;
+        let event = CollaborationEvent::new(
+            parts[0],
+            CollaborationEventKind::IssueOpened,
+            certificate.device_id.as_cid().as_hex(),
+            Vec::new(),
+            parse_unix_timestamp(parts[1])?,
+            CollaborationPayload::issue(
+                decode_text_arg(parts[2])?,
+                decode_text_arg(parts[3])?,
+                decode_label_arg(parts[4])?,
+            ),
+        )?;
+        let event_id = event.event_id;
+        let signature =
+            decode_fixed_hex::<64>(parts.get(9).ok_or_else(|| {
+                DaemonError::InvalidCommand("missing event signature".to_string())
+            })?)?;
+        let verified =
+            SignedCollaborationEvent::new(event, certificate, signature).verify_with_identity()?;
+        let account_id = verified.account_id.as_cid().to_string();
+        let device_id = verified.device_id.as_cid().to_string();
+        let inserted = self.collaboration.insert(verified.event);
+        self.save_collaboration()?;
+        let number = self.collaboration.issue_summaries(parts[0]).len();
+        Ok(DaemonResponse::Ok(format!(
+            "event={} repo={} number={} inserted={} signed=true account={} device={}",
+            event_id.as_hex(),
+            parts[0],
+            number,
+            inserted,
+            account_id,
+            device_id
+        )))
+    }
+
     fn issue_list(&self, repo: &str) -> Result<DaemonResponse> {
         validate_repo_selector(repo.trim())?;
         Ok(DaemonResponse::Ok(format_issue_list(
@@ -1131,6 +1188,57 @@ impl DaemonState {
             parts[0],
             number,
             inserted
+        )))
+    }
+
+    fn pr_open_signed(&mut self, rest: &str) -> Result<DaemonResponse> {
+        let parts = rest.split_whitespace().collect::<Vec<_>>();
+        if parts.len() != 12 {
+            return Err(DaemonError::InvalidCommand(
+                "PR_OPEN_SIGNED requires <repo> <timestamp-unix> <source-ref> <target-ref> <title-hex> <body-hex|-> <labels-hex-list|-> <label-hex> <account-key-hex> <device-key-hex> <cert-signature-hex> <event-signature-hex>".to_string(),
+            ));
+        }
+        validate_repo_selector(parts[0])?;
+        let certificate = DeviceCertificate::from_key_bytes(
+            decode_label(parts[7])?,
+            decode_fixed_hex::<32>(parts[8])?,
+            decode_fixed_hex::<32>(parts[9])?,
+            decode_fixed_hex::<64>(parts[10])?,
+        )?;
+        let event = CollaborationEvent::new(
+            parts[0],
+            CollaborationEventKind::PullRequestOpened,
+            certificate.device_id.as_cid().as_hex(),
+            Vec::new(),
+            parse_unix_timestamp(parts[1])?,
+            CollaborationPayload::pull_request(
+                decode_text_arg(parts[4])?,
+                decode_text_arg(parts[5])?,
+                decode_label_arg(parts[6])?,
+                parts[2],
+                parts[3],
+            ),
+        )?;
+        let event_id = event.event_id;
+        let signature =
+            decode_fixed_hex::<64>(parts.get(11).ok_or_else(|| {
+                DaemonError::InvalidCommand("missing event signature".to_string())
+            })?)?;
+        let verified =
+            SignedCollaborationEvent::new(event, certificate, signature).verify_with_identity()?;
+        let account_id = verified.account_id.as_cid().to_string();
+        let device_id = verified.device_id.as_cid().to_string();
+        let inserted = self.collaboration.insert(verified.event);
+        self.save_collaboration()?;
+        let number = self.collaboration.pull_request_summaries(parts[0]).len();
+        Ok(DaemonResponse::Ok(format!(
+            "event={} repo={} number={} inserted={} signed=true account={} device={}",
+            event_id.as_hex(),
+            parts[0],
+            number,
+            inserted,
+            account_id,
+            device_id
         )))
     }
 
@@ -1363,7 +1471,9 @@ fn requires_admin_auth(command: &str) -> bool {
                 | "REPO_REGISTER"
                 | "COLLAB_SEED_SAMPLES"
                 | "ISSUE_OPEN"
+                | "ISSUE_OPEN_SIGNED"
                 | "PR_OPEN"
+                | "PR_OPEN_SIGNED"
                 | "NETWORK_LISTEN"
                 | "NETWORK_BOOTSTRAP"
                 | "NETWORK_PEER_ADD"
@@ -1883,6 +1993,12 @@ fn decode_fixed_hex<const N: usize>(value: &str) -> Result<[u8; N]> {
     bytes
         .try_into()
         .map_err(|_| DaemonError::InvalidCommand(format!("expected {N} bytes encoded as hex")))
+}
+
+fn parse_unix_timestamp(value: &str) -> Result<u64> {
+    value
+        .parse()
+        .map_err(|_| DaemonError::InvalidCommand("timestamp must be a u64".to_string()))
 }
 
 fn parse_bool_arg(value: &str) -> Result<bool> {
@@ -2817,6 +2933,82 @@ mod tests {
         assert!(issues.contains("46697820726570616972"));
         assert!(issues.contains("73746f72616765,636f72726563746e657373"));
         assert!(prs.contains("refs/heads/fix-repair"));
+    }
+
+    #[test]
+    fn signed_collaboration_issue_open_verifies_before_insert() {
+        let mut state = DaemonState::default();
+        let account = AccountRootKey::generate();
+        let device = DeviceKey::generate();
+        let certificate = account.certify_device(&device, "gm-dev-device");
+        let timestamp = 1_787_166_000;
+        let event = CollaborationEvent::new(
+            "farzeen/gitmesh",
+            CollaborationEventKind::IssueOpened,
+            certificate.device_id.as_cid().as_hex(),
+            Vec::new(),
+            timestamp,
+            CollaborationPayload::issue(
+                "Signed issue",
+                "verified body",
+                vec!["security".to_string()],
+            ),
+        )
+        .unwrap();
+        let event_signature = device.sign(&event.signing_transcript());
+        let command = format!(
+            "ISSUE_OPEN_SIGNED farzeen/gitmesh {} {} {} {} {} {} {} {} {}",
+            timestamp,
+            encode_hex("Signed issue".as_bytes()),
+            encode_hex("verified body".as_bytes()),
+            encode_hex("security".as_bytes()),
+            encode_hex(certificate.label.as_bytes()),
+            encode_hex(&certificate.account_verifying_key),
+            encode_hex(&certificate.device_verifying_key),
+            encode_hex(&certificate.signature),
+            encode_hex(&event_signature)
+        );
+
+        let response = state.handle_command(&command).unwrap().into_line();
+        let issues = state
+            .handle_command("ISSUE_LIST farzeen/gitmesh")
+            .unwrap()
+            .into_line();
+
+        assert!(response.contains("signed=true"));
+        assert!(response.contains("number=1"));
+        assert!(issues.contains("5369676e6564206973737565"));
+    }
+
+    #[test]
+    fn signed_collaboration_issue_open_rejects_bad_signature() {
+        let mut state = DaemonState::default();
+        let account = AccountRootKey::generate();
+        let device = DeviceKey::generate();
+        let certificate = account.certify_device(&device, "gm-dev-device");
+        let timestamp = 1_787_166_000;
+        let bad_signature = [9_u8; 64];
+        let command = format!(
+            "ISSUE_OPEN_SIGNED farzeen/gitmesh {} {} {} - {} {} {} {} {}",
+            timestamp,
+            encode_hex("Signed issue".as_bytes()),
+            encode_hex("verified body".as_bytes()),
+            encode_hex(certificate.label.as_bytes()),
+            encode_hex(&certificate.account_verifying_key),
+            encode_hex(&certificate.device_verifying_key),
+            encode_hex(&certificate.signature),
+            encode_hex(&bad_signature)
+        );
+
+        let err = state.handle_command(&command).unwrap_err();
+
+        assert!(matches!(
+            err,
+            DaemonError::Collaboration(CollaborationError::Identity(
+                IdentityError::InvalidSignature
+            ))
+        ));
+        assert_eq!(state.collaboration.event_count(), 0);
     }
 
     #[test]
