@@ -13,7 +13,7 @@ use gitmesh_crypto::{
 use gitmesh_network::{
     InMemoryAvailabilityDirectory, NetworkError, NetworkRequest, NetworkResponse, NetworkTransport,
     NodeDescriptor, NodeRole, OperatorId, PeerId, PlacementPlan, PlacementPolicy, ProviderLease,
-    ShardEnvelope, ShardProviderRecord, ShardRef, plan_shard_placement,
+    ShardEnvelope, ShardProviderRecord, ShardRef, SignedShardProviderRecord, plan_shard_placement,
 };
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use thiserror::Error;
@@ -720,6 +720,33 @@ pub fn publish_providers_via_transport<T: NetworkTransport>(
     Ok(providers.len())
 }
 
+pub fn publish_signed_providers_via_transport<T: NetworkTransport>(
+    transport: &mut T,
+    client_peer: &PeerId,
+    directory_peer: &PeerId,
+    providers: &[SignedShardProviderRecord],
+    now_unix: u64,
+) -> Result<usize> {
+    for provider in providers {
+        let response = transport
+            .request(
+                client_peer,
+                directory_peer,
+                NetworkRequest::PublishSignedProvider {
+                    signed: Box::new(provider.clone()),
+                    now_unix,
+                },
+            )
+            .map_err(|err| StorageError::Network(err.to_string()))?;
+        if response != NetworkResponse::Ack {
+            return Err(StorageError::Network(
+                "unexpected response to PublishSignedProvider".to_string(),
+            ));
+        }
+    }
+    Ok(providers.len())
+}
+
 pub fn discover_providers_via_transport<T: NetworkTransport>(
     transport: &mut T,
     client_peer: &PeerId,
@@ -1382,6 +1409,74 @@ mod tests {
         assert_eq!(published, storage_policy.total_shards());
         assert_eq!(discovered.len(), storage_policy.total_shards());
         assert_eq!(recovered, plaintext);
+    }
+
+    #[test]
+    fn publishes_signed_providers_through_availability_peer() {
+        let plaintext = b"signed availability records should verify before discovery";
+        let storage_policy = StoragePolicy {
+            data_shards: 3,
+            parity_shards: 2,
+        };
+        let placement_policy =
+            PlacementPolicy::new(storage_policy.total_shards(), 5, 2, true).unwrap();
+        let encrypted = encrypt_segment(plaintext).unwrap();
+        let shards = erasure_encode(&encrypted, &storage_policy).unwrap();
+        let client = PeerId::new("client-a").unwrap();
+        let directory = PeerId::new("directory-a").unwrap();
+        let mut swarm = InMemorySwarm::default();
+        swarm
+            .add_peer(InMemoryPeer::new(client_descriptor("client-a").unwrap()))
+            .unwrap();
+        swarm
+            .add_peer(InMemoryPeer::new(directory_descriptor("directory-a")))
+            .unwrap();
+        for index in 0..storage_policy.total_shards() {
+            let peer = format!("storage-{index}");
+            let operator = format!("operator-{index}");
+            let region = if index % 2 == 0 { "iad" } else { "sfo" };
+            swarm
+                .add_peer(InMemoryPeer::new(
+                    storage_descriptor(&peer, &operator, region).unwrap(),
+                ))
+                .unwrap();
+        }
+        let account = gitmesh_identity::AccountRootKey::generate();
+        let device = gitmesh_identity::DeviceKey::generate();
+        let certificate = account.certify_device(&device, "storage-provider");
+
+        let descriptors = swarm.descriptors();
+        let (_plan, providers) = plan_and_distribute_shards(
+            &mut swarm,
+            &client,
+            descriptors,
+            &placement_policy,
+            &shards,
+            3,
+            1_000,
+        )
+        .unwrap();
+        let signed_providers = providers
+            .iter()
+            .cloned()
+            .map(|provider| {
+                SignedShardProviderRecord::sign(provider, certificate.clone(), &device).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let published = publish_signed_providers_via_transport(
+            &mut swarm,
+            &client,
+            &directory,
+            &signed_providers,
+            100,
+        )
+        .unwrap();
+        let discovered =
+            discover_providers_via_transport(&mut swarm, &client, &directory, encrypted.cid, 100)
+                .unwrap();
+
+        assert_eq!(published, storage_policy.total_shards());
+        assert_eq!(discovered, providers);
     }
 
     #[test]

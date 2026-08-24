@@ -964,6 +964,10 @@ pub fn plan_shard_placement(
 pub enum NetworkRequest {
     Ping,
     PublishProvider(ShardProviderRecord),
+    PublishSignedProvider {
+        signed: Box<SignedShardProviderRecord>,
+        now_unix: u64,
+    },
     FindProviders {
         segment_cid: Cid,
         now_unix: u64,
@@ -1042,6 +1046,11 @@ impl InMemoryPeer {
             NetworkRequest::PublishProvider(record) => {
                 self.require_protocol(ProtocolId::AvailabilityV0)?;
                 self.directory.publish(record)?;
+                Ok(NetworkResponse::Ack)
+            }
+            NetworkRequest::PublishSignedProvider { signed, now_unix } => {
+                self.require_protocol(ProtocolId::AvailabilityV0)?;
+                self.directory.publish_signed(&signed, now_unix)?;
                 Ok(NetworkResponse::Ack)
             }
             NetworkRequest::FindProviders {
@@ -1662,6 +1671,110 @@ mod tests {
         };
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].peer_id, PeerId::new("storage-a").unwrap());
+    }
+
+    #[test]
+    fn provider_discovery_accepts_signed_publish_requests() {
+        let account = gitmesh_identity::AccountRootKey::generate();
+        let device = gitmesh_identity::DeviceKey::generate();
+        let certificate = account.certify_device(&device, "storage-provider");
+        let client = PeerId::new("client-a").unwrap();
+        let directory = PeerId::new("directory-a").unwrap();
+        let segment = cid(CidKind::EncryptedSegment, 3);
+        let signed = SignedShardProviderRecord::sign(
+            provider(segment, 0, "storage-a", "op-a", 500),
+            certificate,
+            &device,
+        )
+        .unwrap();
+        let mut swarm = InMemorySwarm::default();
+        swarm
+            .add_peer(InMemoryPeer::new(client_descriptor("client-a").unwrap()))
+            .unwrap();
+        swarm
+            .add_peer(InMemoryPeer::new(
+                NodeDescriptor::new(
+                    directory.clone(),
+                    OperatorId::new("operator-directory").unwrap(),
+                    [NodeRole::Dht],
+                    "iad",
+                    [ProtocolId::PingV0, ProtocolId::AvailabilityV0],
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+
+        swarm
+            .request(
+                &client,
+                &directory,
+                NetworkRequest::PublishSignedProvider {
+                    signed: Box::new(signed),
+                    now_unix: 100,
+                },
+            )
+            .unwrap();
+        let response = swarm
+            .request(
+                &client,
+                &directory,
+                NetworkRequest::FindProviders {
+                    segment_cid: segment,
+                    now_unix: 100,
+                },
+            )
+            .unwrap();
+
+        let NetworkResponse::Providers(records) = response else {
+            panic!("expected providers response");
+        };
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].peer_id, PeerId::new("storage-a").unwrap());
+    }
+
+    #[test]
+    fn provider_discovery_rejects_expired_signed_publish_requests() {
+        let account = gitmesh_identity::AccountRootKey::generate();
+        let device = gitmesh_identity::DeviceKey::generate();
+        let certificate = account.certify_device(&device, "storage-provider");
+        let client = PeerId::new("client-a").unwrap();
+        let directory = PeerId::new("directory-a").unwrap();
+        let segment = cid(CidKind::EncryptedSegment, 3);
+        let signed = SignedShardProviderRecord::sign(
+            provider(segment, 0, "storage-a", "op-a", 500),
+            certificate,
+            &device,
+        )
+        .unwrap();
+        let mut swarm = InMemorySwarm::default();
+        swarm
+            .add_peer(InMemoryPeer::new(client_descriptor("client-a").unwrap()))
+            .unwrap();
+        swarm
+            .add_peer(InMemoryPeer::new(
+                NodeDescriptor::new(
+                    directory.clone(),
+                    OperatorId::new("operator-directory").unwrap(),
+                    [NodeRole::Dht],
+                    "iad",
+                    [ProtocolId::PingV0, ProtocolId::AvailabilityV0],
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let err = swarm
+            .request(
+                &client,
+                &directory,
+                NetworkRequest::PublishSignedProvider {
+                    signed: Box::new(signed),
+                    now_unix: 500,
+                },
+            )
+            .unwrap_err();
+
+        assert_eq!(err, NetworkError::ExpiredProviderRecord);
     }
 
     #[test]

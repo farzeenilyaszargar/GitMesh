@@ -394,6 +394,7 @@ version = "0.1.0"
 dependencies = [
  "gitmesh-core",
  "gitmesh-crypto",
+ "gitmesh-identity",
  "gitmesh-network",
  "reed-solomon-erasure",
  "thiserror",

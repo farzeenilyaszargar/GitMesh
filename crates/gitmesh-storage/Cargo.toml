@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 gitmesh-core.workspace = true
 gitmesh-crypto.workspace = true
+gitmesh-identity.workspace = true
 gitmesh-network.workspace = true
 reed-solomon-erasure.workspace = true
 thiserror.workspace = true

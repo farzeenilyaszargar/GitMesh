@@ -40,7 +40,7 @@ The in-memory swarm supports:
 - request/response routing between peers
 - storage-role enforcement for shard writes
 - shard integrity verification before store/fetch success
-- provider publication and lease expiry
+- unsigned and signed provider publication with lease expiry
 - signed provider records with device-certificate verification and expiry
 - provider discovery through the availability protocol
 - placement across qualified storage peers with operator and region constraints
