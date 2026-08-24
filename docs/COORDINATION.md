@@ -91,9 +91,11 @@ R101 main B -> C force=false
 R102 main C -> Z force=true
 ```
 
-Periodic `RefCheckpoint` records chain to prior checkpoints and commit to the
-current ref map plus mutation history root. Clients detect stale checkpoints,
-rollback, replay, coordinator equivocation, and invalid force pushes.
+Periodic signed `RefCheckpoint` records chain to prior checkpoints and commit to
+the current ref map plus mutation history root. Clients verify the checkpoint
+CID, parent sequence, coordinator device certificate, and signature before using
+a checkpoint to detect stale state, rollback, replay, coordinator equivocation,
+and invalid force pushes.
 
 ## Coordinator Modes
 

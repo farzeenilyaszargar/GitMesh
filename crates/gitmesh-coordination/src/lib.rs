@@ -10,7 +10,7 @@ use std::str::FromStr;
 
 use gitmesh_core::{Cid, CidKind, HashAlgorithm};
 use gitmesh_git::GitSha1Oid;
-use gitmesh_identity::{AccountId, DeviceCertificate, DeviceId, IdentityError};
+use gitmesh_identity::{AccountId, DeviceCertificate, DeviceId, DeviceKey, IdentityError};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -382,6 +382,92 @@ pub struct RefCheckpoint {
     pub checkpoint_cid: Cid,
 }
 
+impl RefCheckpoint {
+    pub fn signing_transcript(&self) -> Vec<u8> {
+        let mut transcript = Vec::new();
+        transcript.extend_from_slice(b"gitmesh.v0.signed-ref-checkpoint");
+        transcript.extend_from_slice(&self.sequence.to_be_bytes());
+        put_transcript_field(&mut transcript, format_optional_cid(self.parent).as_bytes());
+        put_transcript_field(&mut transcript, self.refs_root.as_hex().as_bytes());
+        put_transcript_field(&mut transcript, self.history_root.as_hex().as_bytes());
+        put_transcript_field(&mut transcript, self.checkpoint_cid.to_string().as_bytes());
+        transcript
+    }
+
+    pub fn verify_cid(&self) -> Result<(), CoordinationError> {
+        let expected = compute_checkpoint_cid(
+            self.sequence,
+            self.parent,
+            self.refs_root,
+            self.history_root,
+        );
+        if self.checkpoint_cid != expected {
+            return Err(CoordinationError::InvalidSnapshot);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignedRefCheckpoint {
+    pub checkpoint: RefCheckpoint,
+    pub certificate: DeviceCertificate,
+    pub signature: [u8; 64],
+}
+
+impl SignedRefCheckpoint {
+    pub fn sign(
+        checkpoint: RefCheckpoint,
+        certificate: DeviceCertificate,
+        device: &DeviceKey,
+    ) -> Result<Self, CoordinationError> {
+        if certificate.device_id != device.device_id() {
+            return Err(CoordinationError::CheckpointSignerMismatch);
+        }
+        checkpoint.verify_cid()?;
+        let signature = device.sign(&checkpoint.signing_transcript());
+        Ok(Self {
+            checkpoint,
+            certificate,
+            signature,
+        })
+    }
+
+    pub fn new(
+        checkpoint: RefCheckpoint,
+        certificate: DeviceCertificate,
+        signature: [u8; 64],
+    ) -> Self {
+        Self {
+            checkpoint,
+            certificate,
+            signature,
+        }
+    }
+
+    pub fn verify(
+        &self,
+        previous: Option<&RefCheckpoint>,
+    ) -> Result<VerifiedRefCheckpoint, CoordinationError> {
+        validate_checkpoint_chain(previous, &self.checkpoint)?;
+        self.checkpoint.verify_cid()?;
+        self.certificate
+            .verify_device_signature(&self.checkpoint.signing_transcript(), &self.signature)?;
+        Ok(VerifiedRefCheckpoint {
+            checkpoint: self.checkpoint.clone(),
+            account_id: self.certificate.account_id.clone(),
+            device_id: self.certificate.device_id.clone(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedRefCheckpoint {
+    pub checkpoint: RefCheckpoint,
+    pub account_id: AccountId,
+    pub device_id: DeviceId,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RefMutation {
     pub sequence: u64,
@@ -714,6 +800,8 @@ pub enum CoordinationError {
     InvalidSnapshot,
     #[error("ref update signer does not match the device certificate")]
     SignerMismatch,
+    #[error("ref checkpoint signer does not match the device certificate")]
+    CheckpointSignerMismatch,
     #[error("unsigned ref update denied by repository policy")]
     UnsignedRefUpdateDenied,
     #[error("ref update is not authorized by repository policy")]
@@ -1172,6 +1260,59 @@ mod tests {
         assert_eq!(second.parent, Some(first.checkpoint_cid));
         assert_ne!(first.refs_root, second.refs_root);
         assert_ne!(first.history_root, second.history_root);
+    }
+
+    #[test]
+    fn signed_ref_checkpoint_verifies_chain_and_identity() {
+        let account = AccountRootKey::generate();
+        let device = DeviceKey::generate();
+        let certificate = account.certify_device(&device, "coordinator");
+        let mut store = RefStore::default();
+        store.apply(update("tx1", None, Some(oid(1))));
+        let checkpoint = store.latest_checkpoint().unwrap().clone();
+        let account_id = certificate.account_id.clone();
+        let device_id = certificate.device_id.clone();
+
+        let signed = SignedRefCheckpoint::sign(checkpoint.clone(), certificate, &device).unwrap();
+        let verified = signed.verify(None).unwrap();
+
+        assert_eq!(verified.checkpoint, checkpoint);
+        assert_eq!(verified.account_id, account_id);
+        assert_eq!(verified.device_id, device_id);
+    }
+
+    #[test]
+    fn signed_ref_checkpoint_rejects_tampering() {
+        let account = AccountRootKey::generate();
+        let device = DeviceKey::generate();
+        let certificate = account.certify_device(&device, "coordinator");
+        let mut store = RefStore::default();
+        store.apply(update("tx1", None, Some(oid(1))));
+        let mut checkpoint = store.latest_checkpoint().unwrap().clone();
+        let signed = SignedRefCheckpoint::sign(checkpoint.clone(), certificate, &device).unwrap();
+        checkpoint.refs_root = RepoId::new(b"tampered").cid();
+        let tampered = SignedRefCheckpoint::new(checkpoint, signed.certificate, signed.signature);
+
+        let err = tampered.verify(None).unwrap_err();
+
+        assert!(matches!(err, CoordinationError::InvalidSnapshot));
+    }
+
+    #[test]
+    fn signed_ref_checkpoint_rejects_wrong_parent_chain() {
+        let account = AccountRootKey::generate();
+        let device = DeviceKey::generate();
+        let certificate = account.certify_device(&device, "coordinator");
+        let mut store = RefStore::default();
+        store.apply(update("tx1", None, Some(oid(1))));
+        store.apply(update("tx2", Some(oid(1)), Some(oid(2))));
+        let first = store.checkpoints[0].clone();
+        let second = store.checkpoints[1].clone();
+        let signed = SignedRefCheckpoint::sign(first.clone(), certificate, &device).unwrap();
+
+        let err = signed.verify(Some(&second)).unwrap_err();
+
+        assert!(matches!(err, CoordinationError::InvalidSnapshot));
     }
 
     #[test]
