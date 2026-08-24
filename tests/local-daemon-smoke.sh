@@ -121,6 +121,7 @@ expect_contains "$prs_response" "refs/heads/smoke"
 
 object_response="$(run_gitmeshd object-put "$SOCKET_PATH" blob 736d6f6b65206f626a656374)"
 expect_contains "$object_response" "OK oid="
+expect_contains "$object_response" "provider_records=16"
 oid="$(sed -n 's/.*oid=\([0-9a-f]\{40\}\).*/\1/p' <<<"$object_response")"
 if [[ -z "$oid" ]]; then
   echo "failed to parse object oid from: $object_response" >&2

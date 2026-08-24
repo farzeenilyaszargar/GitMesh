@@ -762,15 +762,17 @@ impl DaemonState {
             decode_hex(parts[1])?
         };
         let record = self.objects.put_git_object(GitObject::new(kind, payload))?;
+        let provider_records = self.publish_local_provider_records_for_object(record.oid, 1)?;
         self.save_objects()?;
         Ok(DaemonResponse::Ok(format!(
-            "oid={} kind={:?} canonical_bytes={} segment_cid={} shards={} available_shards={} durability_satisfied={}",
+            "oid={} kind={:?} canonical_bytes={} segment_cid={} shards={} available_shards={} provider_records={} durability_satisfied={}",
             record.oid,
             record.kind,
             record.canonical_len,
             record.segment_cid,
             record.shard_cids.len(),
             record.available_shards,
+            provider_records,
             record.durability_satisfied
         )))
     }
@@ -779,17 +781,20 @@ impl DaemonState {
         let bytes = decode_hex(rest.trim())?;
         let pack = parse_packfile(&bytes)?;
         let mut imported = 0_usize;
+        let mut provider_records = 0_usize;
         let mut oids = Vec::new();
         for object in pack.objects {
             let record = self.objects.put_git_object(object)?;
+            provider_records += self.publish_local_provider_records_for_object(record.oid, 1)?;
             imported += 1;
             oids.push(record.oid.to_string());
         }
         self.save_objects()?;
         Ok(DaemonResponse::Ok(format!(
-            "pack_version={} imported={} objects={}",
+            "pack_version={} imported={} provider_records={} objects={}",
             pack.version,
             imported,
+            provider_records,
             if oids.is_empty() {
                 "none".to_string()
             } else {
@@ -861,9 +866,19 @@ impl DaemonState {
         )
         .map_err(DaemonError::Network)?;
         let now = now_unix()?;
-        let providers =
+        let record = self
+            .objects
+            .get_record(oid)
+            .ok_or(DaemonError::Repository(RepositoryError::MissingObject(oid)))?;
+        let providers = self
+            .availability
+            .active_records_for_segment(record.segment_cid, now);
+        let providers = if providers.is_empty() {
             self.objects
-                .local_provider_records_for_object(oid, 1, now.saturating_add(86_400))?;
+                .local_provider_records_for_object(oid, 1, now.saturating_add(86_400))?
+        } else {
+            providers
+        };
         let report = self
             .objects
             .object_availability_report(oid, &providers, requirement, now)?;
@@ -1447,6 +1462,24 @@ impl DaemonState {
             .availability
             .active_records_for_segment(segment_cid, network_now_unix()?);
         Ok(DaemonResponse::Ok(format_provider_records(&providers)))
+    }
+
+    fn publish_local_provider_records_for_object(
+        &mut self,
+        oid: GitSha1Oid,
+        lease_epoch: u64,
+    ) -> Result<usize> {
+        let now = network_now_unix()?;
+        let records = self.objects.local_provider_records_for_object(
+            oid,
+            lease_epoch,
+            now.saturating_add(86_400),
+        )?;
+        let count = records.len();
+        for record in records {
+            self.availability.publish(record)?;
+        }
+        Ok(count)
     }
 
     fn save_objects(&self) -> Result<()> {
@@ -3924,6 +3957,33 @@ mod tests {
         assert!(report.contains("required_shards=10"));
         assert!(report.contains("required_operators=3"));
         assert!(report.contains("required_regions=2"));
+    }
+
+    #[test]
+    fn object_put_publishes_local_provider_records_to_directory() {
+        let mut state = DaemonState::default();
+        let put = state
+            .handle_command(&format!(
+                "OBJECT_PUT blob {}",
+                encode_hex(b"directory-backed availability")
+            ))
+            .unwrap()
+            .into_line();
+        let segment_cid = put
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix("segment_cid="))
+            .unwrap()
+            .to_string();
+
+        let providers = state
+            .handle_command(&format!("NETWORK_PROVIDER_FIND {segment_cid}"))
+            .unwrap()
+            .into_line();
+
+        assert!(put.contains("provider_records=16"));
+        assert!(providers.contains("count=16"));
+        assert!(providers.contains("v0-node-0"));
+        assert!(providers.contains("v0-operator-0"));
     }
 
     #[test]
