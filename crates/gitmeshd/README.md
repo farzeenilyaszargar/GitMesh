@@ -27,6 +27,7 @@ Currently implemented:
 - `gitmeshd network-bootstrap [socket] <peer-id> <operator-id> <region> <multiaddr>`
 - `gitmeshd network-peer-add [socket] <peer-id> <operator-id> <roles-csv> <region> <protocols-csv> <addresses-csv|->`
 - `gitmeshd network-peer-list [socket]`
+- `gitmeshd network-peer-prune-expired [socket] [now-unix]`
 - `gitmeshd collab-seed-samples [socket]`
 - `gitmeshd issue-open [socket] <owner/repo> <actor> <title-hex> <body-hex|-> <labels-hex-list|->`
 - `gitmeshd issue-list [socket] <owner/repo>`
@@ -70,6 +71,7 @@ The socket protocol is a V0 line protocol over Unix domain sockets:
 - `NETWORK_BOOTSTRAP <peer-id> <operator-id> <region> <multiaddr>`
 - `NETWORK_PEER_ADD <peer-id> <operator-id> <roles-csv> <region> <protocols-csv> <addresses-csv|->`
 - `NETWORK_PEER_LIST`
+- `NETWORK_PEER_PRUNE_EXPIRED [now-unix]`
 - `NETWORK_PROVIDER_PUBLISH_SIGNED <segment-cid> <shard-cid> <shard-index> <peer-id> <operator-id> <region> <roles-csv> <lease-epoch> <expires-at> <label-hex> <account-key-hex> <device-key-hex> <cert-signature-hex> <provider-signature-hex>`
 - `NETWORK_PROVIDER_FIND <segment-cid>`
 - `NETWORK_PROVIDER_PRUNE_EXPIRED [now-unix]`

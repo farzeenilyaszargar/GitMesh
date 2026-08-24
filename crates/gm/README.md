@@ -27,6 +27,7 @@ Implemented command families:
 - `gm daemon network-bootstrap [socket] <peer-id> <operator-id> <region> <multiaddr>`
 - `gm daemon network-peer-add [socket] <peer-id> <operator-id> <roles-csv> <region> <protocols-csv> <addresses-csv|->`
 - `gm daemon network-peer-list [socket]`
+- `gm daemon network-peer-prune-expired [socket] [now-unix]`
 - `gm daemon network-provider-publish [socket] <segment-cid> <shard-cid> <shard-index> <peer-id> <operator-id> <region> <roles-csv> <lease-epoch> <expires-at>`
 - `gm daemon network-provider-find [socket] <segment-cid>`
 - `gm daemon network-provider-prune-expired [socket] [now-unix]`
@@ -70,10 +71,10 @@ encrypted erasure-coded shards are published to providers, one provider is
 removed, the missing shard is rebuilt on a replacement peer, and the original
 Git object is verified after rediscovery.
 
-`gm daemon network-status`, `network-listen`, `network-bootstrap`, and
-`network-peer-add` operate on the daemon's persisted P2P node registry. This is
-the current bootstrap/control-plane spine for known peers before the libp2p
-runtime takes over live dialing.
+`gm daemon network-status`, `network-listen`, `network-bootstrap`,
+`network-peer-add`, and `network-peer-prune-expired` operate on the daemon's
+persisted P2P node registry. This is the current bootstrap/control-plane spine
+for known peers before the libp2p runtime takes over live dialing.
 
 `signed-update` and `signed-update-dev` fetch the daemon's current repository
 policy epoch and bind it into the signed `RefUpdate`. `signed-update-dev` uses

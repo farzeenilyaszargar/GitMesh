@@ -1462,6 +1462,17 @@ fn daemon(args: &[String]) -> Result<(), GmError> {
             println!("{}", request_unix_socket(socket_path, "NETWORK_PEER_LIST")?);
             Ok(())
         }
+        Some("network-peer-prune-expired") => {
+            let socket_path = args.get(1).map_or_else(default_socket_path, Into::into);
+            let timestamp = args.get(2).map_or("", String::as_str);
+            let command = if timestamp.is_empty() {
+                "NETWORK_PEER_PRUNE_EXPIRED".to_string()
+            } else {
+                format!("NETWORK_PEER_PRUNE_EXPIRED {timestamp}")
+            };
+            println!("{}", request_unix_socket(socket_path, &command)?);
+            Ok(())
+        }
         Some("network-provider-publish") => {
             let socket_path = args.get(1).map_or_else(default_socket_path, Into::into);
             let rest = args.iter().skip(2).cloned().collect::<Vec<_>>();
@@ -2320,6 +2331,7 @@ fn print_help() {
         "  daemon network-peer-add [socket] <peer-id> <operator-id> <roles-csv> <region> <protocols-csv> <addresses-csv|->"
     );
     println!("  daemon network-peer-list [socket]");
+    println!("  daemon network-peer-prune-expired [socket] [now-unix]");
     println!(
         "  daemon network-provider-publish [socket] <segment-cid> <shard-cid> <shard-index> <peer-id> <operator-id> <region> <roles-csv> <lease-epoch> <expires-at>"
     );

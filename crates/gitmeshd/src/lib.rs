@@ -574,6 +574,14 @@ impl DaemonState {
             return self.network_provider_prune_expired(rest);
         }
 
+        if trimmed == "NETWORK_PEER_PRUNE_EXPIRED" {
+            return self.network_peer_prune_expired("");
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("NETWORK_PEER_PRUNE_EXPIRED ") {
+            return self.network_peer_prune_expired(rest);
+        }
+
         if trimmed == "NETWORK_PEER_LIST" {
             return Ok(DaemonResponse::Ok(format_network_peer_list(&self.network)));
         }
@@ -1602,6 +1610,20 @@ impl DaemonState {
         )))
     }
 
+    fn network_peer_prune_expired(&mut self, rest: &str) -> Result<DaemonResponse> {
+        let now_unix = if rest.trim().is_empty() {
+            network_now_unix()?
+        } else {
+            parse_u64_arg(rest.trim(), "prune timestamp")?
+        };
+        let removed = self.network.prune_expired_known_peers(now_unix);
+        self.save_network()?;
+        Ok(DaemonResponse::Ok(format!(
+            "pruned={} now_unix={}",
+            removed, now_unix
+        )))
+    }
+
     fn publish_local_provider_records_for_object(
         &mut self,
         oid: GitSha1Oid,
@@ -1813,6 +1835,7 @@ fn requires_admin_auth(command: &str) -> bool {
                 | "NETWORK_LISTEN"
                 | "NETWORK_BOOTSTRAP"
                 | "NETWORK_PEER_ADD"
+                | "NETWORK_PEER_PRUNE_EXPIRED"
                 | "NETWORK_PROVIDER_PUBLISH_SIGNED"
         )
     )
@@ -2912,6 +2935,7 @@ mod tests {
     use gitmesh_crypto::RepoContentKey;
     use gitmesh_git::{GitObjectKind, write_packfile};
     use gitmesh_identity::{AccountRootKey, DeviceKey};
+    use gitmesh_network::{NodeAnnouncement, NodeRole, ProtocolId, SignedNodeAnnouncement};
 
     fn put_object(state: &mut DaemonState, kind: &str, payload_hex: &str) -> String {
         state
@@ -3120,6 +3144,53 @@ mod tests {
         assert!(status.contains("storage_peers=1"));
         assert!(peers.contains("bootstrap-a;operator-bootstrap"));
         assert!(peers.contains("storage-a;operator-a"));
+    }
+
+    #[test]
+    fn network_peer_prune_expired_persists_compacted_store() {
+        let network_path =
+            std::env::temp_dir().join(format!("gitmeshd-test-network-{}.txt", std::process::id()));
+        let mut state = DaemonState::with_every_store_path(DaemonStorePaths {
+            network_store_path: Some(network_path.clone()),
+            ..DaemonStorePaths::default()
+        })
+        .unwrap();
+        let account = AccountRootKey::generate();
+        let device = DeviceKey::generate();
+        let certificate = account.certify_device(&device, "storage-node");
+        let descriptor = NodeDescriptor::new(
+            PeerId::new("storage-expiring").unwrap(),
+            OperatorId::new("operator-expiring").unwrap(),
+            [NodeRole::Storage],
+            "sfo",
+            [ProtocolId::PingV0, ProtocolId::AvailabilityV0],
+        )
+        .unwrap();
+        let announcement = NodeAnnouncement::new(
+            descriptor,
+            vec!["/ip4/10.0.0.4/tcp/4001".to_string()],
+            100,
+            200,
+            device.device_id(),
+        )
+        .unwrap();
+        let signed = SignedNodeAnnouncement::sign(announcement, certificate, &device).unwrap();
+        state.network.register_signed_peer(&signed, 150).unwrap();
+        state.save_network().unwrap();
+
+        let response = state
+            .handle_command("NETWORK_PEER_PRUNE_EXPIRED 200")
+            .unwrap()
+            .into_line();
+        let restored = DaemonState::with_every_store_path(DaemonStorePaths {
+            network_store_path: Some(network_path.clone()),
+            ..DaemonStorePaths::default()
+        })
+        .unwrap();
+
+        assert_eq!(response, "OK pruned=1 now_unix=200");
+        assert_eq!(restored.network.known_peer_count(), 0);
+        let _ = fs::remove_file(network_path);
     }
 
     #[test]

@@ -193,6 +193,14 @@ pub struct KnownPeerRecord {
     pub addresses: Vec<String>,
     pub first_seen_unix: u64,
     pub last_seen_unix: u64,
+    pub expires_at_unix: Option<u64>,
+}
+
+impl KnownPeerRecord {
+    pub fn is_active_at(&self, now_unix: u64) -> bool {
+        self.expires_at_unix
+            .is_none_or(|expires_at_unix| now_unix < expires_at_unix)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -362,6 +370,12 @@ impl NetworkNodeStore {
         self.known_peers.len()
     }
 
+    pub fn active_known_peers(&self, now_unix: u64) -> impl Iterator<Item = &KnownPeerRecord> {
+        self.known_peers
+            .values()
+            .filter(move |record| record.is_active_at(now_unix))
+    }
+
     pub fn storage_peer_count(&self) -> usize {
         self.known_peers
             .values()
@@ -391,8 +405,21 @@ impl NetworkNodeStore {
         addresses: Vec<String>,
         now_unix: u64,
     ) -> Result<&KnownPeerRecord, NetworkError> {
+        self.register_peer_with_expiry(descriptor, addresses, now_unix, None)
+    }
+
+    fn register_peer_with_expiry(
+        &mut self,
+        descriptor: NodeDescriptor,
+        addresses: Vec<String>,
+        now_unix: u64,
+        expires_at_unix: Option<u64>,
+    ) -> Result<&KnownPeerRecord, NetworkError> {
         if descriptor.peer_id == self.local_node.peer_id {
             return Err(NetworkError::InvalidNodeDescriptor);
+        }
+        if expires_at_unix.is_some_and(|expires| expires <= now_unix) {
+            return Err(NetworkError::InvalidNodeAnnouncement);
         }
         let mut addresses = addresses
             .into_iter()
@@ -408,12 +435,16 @@ impl NetworkNodeStore {
                 record.descriptor = descriptor.clone();
                 record.addresses = addresses.clone();
                 record.last_seen_unix = now_unix;
+                if expires_at_unix.is_some() {
+                    record.expires_at_unix = expires_at_unix;
+                }
             })
             .or_insert(KnownPeerRecord {
                 descriptor,
                 addresses,
                 first_seen_unix: now_unix,
                 last_seen_unix: now_unix,
+                expires_at_unix,
             });
         self.known_peers
             .get(&peer_id)
@@ -426,11 +457,19 @@ impl NetworkNodeStore {
         now_unix: u64,
     ) -> Result<&KnownPeerRecord, NetworkError> {
         signed.verify(now_unix)?;
-        self.register_peer(
+        self.register_peer_with_expiry(
             signed.announcement.descriptor.clone(),
             signed.announcement.addresses.clone(),
             now_unix,
+            Some(signed.announcement.expires_at_unix),
         )
+    }
+
+    pub fn prune_expired_known_peers(&mut self, now_unix: u64) -> usize {
+        let before = self.known_peers.len();
+        self.known_peers
+            .retain(|_, record| record.is_active_at(now_unix));
+        before - self.known_peers.len()
     }
 
     pub fn bootstrap(
@@ -487,8 +526,13 @@ impl NetworkNodeStore {
             output.push_str(&format!("listen\t{address}\n"));
         }
         for record in self.known_peers.values() {
+            let expiry = record
+                .expires_at_unix
+                .map_or_else(String::new, |expires_at_unix| {
+                    format!("\t{expires_at_unix}")
+                });
             output.push_str(&format!(
-                "peer\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "peer\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}{}\n",
                 record.descriptor.peer_id,
                 record.descriptor.operator_id,
                 format_roles(&record.descriptor.roles),
@@ -496,7 +540,8 @@ impl NetworkNodeStore {
                 format_protocols(&record.descriptor.protocols),
                 format_addresses(&record.addresses),
                 record.first_seen_unix,
-                record.last_seen_unix
+                record.last_seen_unix,
+                expiry
             ));
         }
         output
@@ -538,6 +583,18 @@ impl NetworkNodeStore {
                     addresses,
                     first_seen_unix,
                     last_seen_unix,
+                ]
+                | [
+                    "peer",
+                    peer_id,
+                    operator_id,
+                    roles,
+                    region,
+                    protocols,
+                    addresses,
+                    first_seen_unix,
+                    last_seen_unix,
+                    _,
                 ] => {
                     let descriptor = NodeDescriptor::new(
                         PeerId::new(*peer_id)?,
@@ -555,6 +612,17 @@ impl NetworkNodeStore {
                     if last_seen_unix < first_seen_unix {
                         return Err(NetworkError::InvalidNodeStore);
                     }
+                    let expires_at_unix = if parts.len() == 10 {
+                        let expires_at_unix = parts[9]
+                            .parse::<u64>()
+                            .map_err(|_| NetworkError::InvalidNodeStore)?;
+                        if expires_at_unix <= last_seen_unix {
+                            return Err(NetworkError::InvalidNodeStore);
+                        }
+                        Some(expires_at_unix)
+                    } else {
+                        None
+                    };
                     store.known_peers.insert(
                         descriptor.peer_id.clone(),
                         KnownPeerRecord {
@@ -562,6 +630,7 @@ impl NetworkNodeStore {
                             addresses: parse_addresses(addresses)?,
                             first_seen_unix,
                             last_seen_unix,
+                            expires_at_unix,
                         },
                     );
                 }
@@ -2775,6 +2844,81 @@ mod tests {
 
         assert_eq!(store.known_peer_count(), 1);
         assert_eq!(store.storage_peer_count(), 1);
+        let record = store.known_peers().next().unwrap();
+        assert_eq!(record.expires_at_unix, Some(200));
+        assert_eq!(store.active_known_peers(199).count(), 1);
+        assert_eq!(store.active_known_peers(200).count(), 0);
+    }
+
+    #[test]
+    fn node_store_prunes_expired_signed_peers() {
+        let account = gitmesh_identity::AccountRootKey::generate();
+        let device = gitmesh_identity::DeviceKey::generate();
+        let certificate = account.certify_device(&device, "storage-node");
+        let announcement = NodeAnnouncement::new(
+            storage_descriptor("storage-a", "operator-a", "sfo").unwrap(),
+            vec!["/ip4/10.0.0.2/tcp/4001".to_string()],
+            100,
+            200,
+            device.device_id(),
+        )
+        .unwrap();
+        let signed = SignedNodeAnnouncement::sign(announcement, certificate, &device).unwrap();
+        let mut store = NetworkNodeStore::default();
+        store
+            .register_peer(
+                storage_descriptor("storage-b", "operator-b", "iad").unwrap(),
+                vec!["/ip4/10.0.0.3/tcp/4001".to_string()],
+                120,
+            )
+            .unwrap();
+        store.register_signed_peer(&signed, 150).unwrap();
+
+        assert_eq!(store.prune_expired_known_peers(200), 1);
+        assert_eq!(store.known_peer_count(), 1);
+        assert_eq!(
+            store
+                .known_peers()
+                .next()
+                .unwrap()
+                .descriptor
+                .peer_id
+                .as_str(),
+            "storage-b"
+        );
+    }
+
+    #[test]
+    fn node_store_snapshot_preserves_signed_peer_expiry() {
+        let account = gitmesh_identity::AccountRootKey::generate();
+        let device = gitmesh_identity::DeviceKey::generate();
+        let certificate = account.certify_device(&device, "storage-node");
+        let announcement = NodeAnnouncement::new(
+            storage_descriptor("storage-a", "operator-a", "sfo").unwrap(),
+            vec!["/ip4/10.0.0.2/tcp/4001".to_string()],
+            100,
+            200,
+            device.device_id(),
+        )
+        .unwrap();
+        let signed = SignedNodeAnnouncement::sign(announcement, certificate, &device).unwrap();
+        let mut store = NetworkNodeStore::default();
+        store.register_signed_peer(&signed, 150).unwrap();
+
+        let restored = NetworkNodeStore::from_snapshot(&store.to_snapshot()).unwrap();
+
+        assert_eq!(restored, store);
+        assert!(restored.to_snapshot().contains("\t200\n"));
+    }
+
+    #[test]
+    fn node_store_loads_legacy_peers_without_expiry() {
+        let snapshot = "gitmesh-network-node-store-v0\nlocal\tlocal-a\toperator-local\tclient\tlocal\tping-v0\npeer\tstorage-a\toperator-a\tstorage\tsfo\tping-v0\t/ip4/10.0.0.2/tcp/4001\t100\t120\n";
+        let store = NetworkNodeStore::from_snapshot(snapshot).unwrap();
+        let record = store.known_peers().next().unwrap();
+
+        assert_eq!(record.expires_at_unix, None);
+        assert_eq!(store.active_known_peers(u64::MAX).count(), 1);
     }
 
     #[test]

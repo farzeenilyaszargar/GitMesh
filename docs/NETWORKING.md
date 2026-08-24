@@ -25,6 +25,11 @@ accepted after expiry. A peer registry may cache announcements locally, but the
 cached copy is not authority without signature, certificate, and freshness
 verification.
 
+Known-peer stores preserve expiry for peers learned from signed announcements.
+Manual bootstrap peers may remain non-expiring local configuration, but signed
+announcements are excluded from active peer views after expiry and can be
+pruned from persisted node-store snapshots.
+
 ## Provider Records
 
 Storage providers advertise shard availability with signed provider records.
