@@ -79,7 +79,9 @@ return push success
 ```
 
 A branch must never point to data that has not already met repository durability
-policy.
+policy. A coordinator verifies this against current availability-provider evidence
+for the target object before applying the CAS transaction; local object presence
+alone is not sufficient.
 
 ## Ref History And Checkpoints
 

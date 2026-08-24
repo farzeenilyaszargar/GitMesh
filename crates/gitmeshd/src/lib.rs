@@ -676,9 +676,36 @@ impl DaemonState {
             update.new_oid,
             update.force,
         )?;
+        self.require_available_ref_target(update.new_oid)?;
         let receipt = self.refs.apply(update);
         self.save_refs()?;
         Ok(DaemonResponse::Ok(format_receipt(receipt)))
+    }
+
+    fn require_available_ref_target(&self, oid: Option<GitSha1Oid>) -> Result<()> {
+        let Some(oid) = oid else {
+            return Ok(());
+        };
+        let requirement = AvailabilityRequirement::new(self.objects.policy().data_shards, 3, 2)
+            .map_err(DaemonError::Network)?;
+        let now = network_now_unix()?;
+        let record = self
+            .objects
+            .get_record(oid)
+            .ok_or(DaemonError::Repository(RepositoryError::MissingObject(oid)))?;
+        let providers = self
+            .availability
+            .active_records_for_segment(record.segment_cid, now);
+        if providers.is_empty() {
+            return Err(DaemonError::MissingDurableObject(oid));
+        }
+        let report = self
+            .objects
+            .object_availability_report(oid, &providers, requirement, now)?;
+        if !report.satisfies_requirement() {
+            return Err(DaemonError::MissingDurableObject(oid));
+        }
+        Ok(())
     }
 
     fn ref_checkpoint_signed_verify(&self, rest: &str) -> Result<DaemonResponse> {
@@ -3735,6 +3762,26 @@ mod tests {
             err,
             DaemonError::Repository(RepositoryError::MissingObject(_))
         ));
+        assert_eq!(
+            state
+                .handle_command("REF_GET refs/heads/main")
+                .unwrap()
+                .into_line(),
+            "OK ref=refs/heads/main oid=none"
+        );
+    }
+
+    #[test]
+    fn ref_update_requires_current_availability_evidence() {
+        let mut state = DaemonState::default();
+        let oid = put_root_commit(&mut state, "availability gated ref");
+        state.availability = InMemoryAvailabilityDirectory::default();
+
+        let err = state
+            .handle_command(&format!("REF_UPDATE tx1 refs/heads/main none {oid} acct"))
+            .unwrap_err();
+
+        assert!(matches!(err, DaemonError::MissingDurableObject(_)));
         assert_eq!(
             state
                 .handle_command("REF_GET refs/heads/main")
