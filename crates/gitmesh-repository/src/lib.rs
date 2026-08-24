@@ -17,7 +17,9 @@ use gitmesh_git::{
     parse_commit_links, parse_tree_entries, write_packfile,
 };
 use gitmesh_network::{
-    InMemoryPeer, InMemorySwarm, PeerId, PlacementPolicy, client_descriptor, storage_descriptor,
+    AvailabilityReport, AvailabilityRequirement, InMemoryAvailabilityDirectory, InMemoryPeer,
+    InMemorySwarm, PeerId, PlacementPolicy, ShardProviderRecord, client_descriptor,
+    storage_descriptor,
 };
 use gitmesh_storage::{
     EncryptedSegment, RepairOutcome, Shard, ShardAuditReport, SimulatedNetwork, StoragePolicy,
@@ -141,6 +143,50 @@ impl RepositoryObjectStore {
     pub fn has_durable_object(&self, oid: GitSha1Oid) -> bool {
         self.get_record(oid)
             .is_some_and(|record| record.durability_satisfied)
+    }
+
+    pub fn object_availability_report(
+        &self,
+        oid: GitSha1Oid,
+        providers: &[ShardProviderRecord],
+        requirement: AvailabilityRequirement,
+        now_unix: u64,
+    ) -> Result<AvailabilityReport> {
+        let stored = self
+            .objects
+            .get(&oid)
+            .ok_or(RepositoryError::MissingObject(oid))?;
+        let known_shards = stored
+            .record
+            .shard_cids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut directory = InMemoryAvailabilityDirectory::default();
+        for provider in providers {
+            if provider.segment_cid != stored.record.segment_cid
+                || !known_shards.contains(&provider.shard_cid)
+                || provider.shard_index >= self.policy.total_shards()
+            {
+                return Err(RepositoryError::InvalidAvailabilityEvidence);
+            }
+            directory
+                .publish(provider.clone())
+                .map_err(|err| RepositoryError::Network(err.to_string()))?;
+        }
+        Ok(directory.availability_report(stored.record.segment_cid, now_unix, requirement))
+    }
+
+    pub fn has_qualified_durable_object(
+        &self,
+        oid: GitSha1Oid,
+        providers: &[ShardProviderRecord],
+        requirement: AvailabilityRequirement,
+        now_unix: u64,
+    ) -> Result<bool> {
+        Ok(self
+            .object_availability_report(oid, providers, requirement, now_unix)?
+            .satisfies_requirement())
     }
 
     pub fn validate_ref_update(
@@ -756,6 +802,8 @@ pub enum RepositoryError {
     UnknownKind(String),
     #[error("repository store is invalid: {0}")]
     InvalidStore(&'static str),
+    #[error("availability evidence does not match stored object shards")]
+    InvalidAvailabilityEvidence,
     #[error("network failed: {0}")]
     Network(String),
     #[error("I/O failed: {0}")]
@@ -843,6 +891,7 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gitmesh_network::{NodeRole, OperatorId, ShardRef};
 
     fn put_root_commit(store: &mut RepositoryObjectStore, message: &str) -> GitSha1Oid {
         let tree = GitObject::new(GitObjectKind::Tree, Vec::new());
@@ -895,6 +944,31 @@ mod tests {
         commit_oid
     }
 
+    fn providers_for_record(record: &GitObjectRecord, count: usize) -> Vec<ShardProviderRecord> {
+        record
+            .shard_cids
+            .iter()
+            .take(count)
+            .enumerate()
+            .map(|(index, shard_cid)| {
+                let region = if index % 2 == 0 { "iad" } else { "sfo" };
+                ShardProviderRecord::new(
+                    ShardRef {
+                        segment_cid: record.segment_cid,
+                        shard_cid: *shard_cid,
+                        shard_index: index,
+                    },
+                    PeerId::new(format!("peer-{index}")).unwrap(),
+                    OperatorId::new(format!("operator-{index}")).unwrap(),
+                    region,
+                    [NodeRole::Storage],
+                    gitmesh_network::ProviderLease::new(1, 500).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
     #[test]
     fn stores_and_reads_git_object() {
         let mut store = RepositoryObjectStore::default();
@@ -935,6 +1009,44 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(store.object_count(), 1);
         assert!(store.has_durable_object(first.oid));
+    }
+
+    #[test]
+    fn object_availability_report_uses_qualified_provider_evidence() {
+        let mut store = RepositoryObjectStore::default();
+        let object = GitObject::new(GitObjectKind::Blob, b"qualified availability");
+        let record = store.put_git_object(object).unwrap();
+        let providers = providers_for_record(&record, store.policy().data_shards);
+        let requirement = AvailabilityRequirement::new(store.policy().data_shards, 3, 2).unwrap();
+
+        let report = store
+            .object_availability_report(record.oid, &providers, requirement, 100)
+            .unwrap();
+        let satisfied = store
+            .has_qualified_durable_object(record.oid, &providers, requirement, 100)
+            .unwrap();
+
+        assert_eq!(report.distinct_shard_count, store.policy().data_shards);
+        assert_eq!(report.distinct_operator_count, store.policy().data_shards);
+        assert_eq!(report.distinct_region_count, 2);
+        assert!(report.satisfies_requirement());
+        assert!(satisfied);
+    }
+
+    #[test]
+    fn object_availability_report_rejects_foreign_shard_evidence() {
+        let mut store = RepositoryObjectStore::default();
+        let object = GitObject::new(GitObjectKind::Blob, b"availability evidence");
+        let record = store.put_git_object(object).unwrap();
+        let mut providers = providers_for_record(&record, store.policy().data_shards);
+        providers[0].shard_cid = shard_cid(record.segment_cid, 0, b"forged");
+        let requirement = AvailabilityRequirement::new(store.policy().data_shards, 3, 2).unwrap();
+
+        let err = store
+            .object_availability_report(record.oid, &providers, requirement, 100)
+            .unwrap_err();
+
+        assert!(matches!(err, RepositoryError::InvalidAvailabilityEvidence));
     }
 
     #[test]

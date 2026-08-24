@@ -12,3 +12,8 @@ object through the current P2P storage boundary: distribute encrypted shards to
 storage peers, publish provider leases, remove one provider, repair the missing
 shard onto a replacement peer, rediscover providers, reconstruct, decrypt, and
 verify the original Git object.
+
+Repository objects can also be checked against external provider evidence with
+`object_availability_report`. The report rejects provider records that do not
+match the stored object's segment and shard CIDs, then evaluates the remaining
+active records against shard, operator, and region requirements.
