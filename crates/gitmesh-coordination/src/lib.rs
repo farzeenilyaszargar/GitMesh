@@ -158,6 +158,7 @@ pub struct VerifiedRefUpdate {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RepoPolicy {
+    policy_epoch: u64,
     require_signed_refs: bool,
     writer_accounts: BTreeSet<String>,
     writer_devices: BTreeSet<String>,
@@ -167,42 +168,67 @@ pub struct RepoPolicy {
 }
 
 impl RepoPolicy {
+    pub fn policy_epoch(&self) -> u64 {
+        self.policy_epoch
+    }
+
     pub fn require_signed_refs(&self) -> bool {
         self.require_signed_refs
     }
 
     pub fn set_require_signed_refs(&mut self, value: bool) {
+        if self.require_signed_refs != value {
+            self.bump_policy_epoch();
+        }
         self.require_signed_refs = value;
     }
 
     pub fn grant_writer_account(&mut self, account_id: &AccountId) {
-        self.writer_accounts.insert(account_id.as_cid().to_string());
+        if self.writer_accounts.insert(account_id.as_cid().to_string()) {
+            self.bump_policy_epoch();
+        }
     }
 
     pub fn grant_writer_account_id_string(&mut self, account_id: &str) {
-        self.writer_accounts.insert(account_id.to_string());
+        if self.writer_accounts.insert(account_id.to_string()) {
+            self.bump_policy_epoch();
+        }
     }
 
     pub fn grant_writer_device(&mut self, device_id: &DeviceId) {
-        self.writer_devices.insert(device_id.as_cid().to_string());
+        if self.writer_devices.insert(device_id.as_cid().to_string()) {
+            self.bump_policy_epoch();
+        }
     }
 
     pub fn grant_force_push_account(&mut self, account_id: &AccountId) {
-        self.force_push_accounts
-            .insert(account_id.as_cid().to_string());
+        if self
+            .force_push_accounts
+            .insert(account_id.as_cid().to_string())
+        {
+            self.bump_policy_epoch();
+        }
     }
 
     pub fn grant_force_push_account_id_string(&mut self, account_id: &str) {
-        self.force_push_accounts.insert(account_id.to_string());
+        if self.force_push_accounts.insert(account_id.to_string()) {
+            self.bump_policy_epoch();
+        }
     }
 
     pub fn grant_force_push_device(&mut self, device_id: &DeviceId) {
-        self.force_push_devices
-            .insert(device_id.as_cid().to_string());
+        if self
+            .force_push_devices
+            .insert(device_id.as_cid().to_string())
+        {
+            self.bump_policy_epoch();
+        }
     }
 
     pub fn protect_ref(&mut self, ref_name: RefName) {
-        self.protected_refs.insert(ref_name);
+        if self.protected_refs.insert(ref_name) {
+            self.bump_policy_epoch();
+        }
     }
 
     pub fn protected_ref_count(&self) -> usize {
@@ -222,6 +248,13 @@ impl RepoPolicy {
         update: &RefUpdate,
         actor: RefUpdateActor<'_>,
     ) -> Result<(), CoordinationError> {
+        if update.policy_epoch != self.policy_epoch {
+            return Err(CoordinationError::StalePolicyEpoch {
+                expected: self.policy_epoch,
+                actual: update.policy_epoch,
+            });
+        }
+
         let actor = match actor {
             RefUpdateActor::Unsigned if self.require_signed_refs => {
                 return Err(CoordinationError::UnsignedRefUpdateDenied);
@@ -258,6 +291,7 @@ impl RepoPolicy {
 
     pub fn to_snapshot(&self) -> Result<String, CoordinationError> {
         let mut snapshot = String::from("gitmesh-repo-policy-v0\n");
+        snapshot.push_str(&format!("policy_epoch\t{}\n", self.policy_epoch));
         snapshot.push_str(&format!(
             "require_signed_refs\t{}\n",
             format_bool(self.require_signed_refs)
@@ -296,6 +330,7 @@ impl RepoPolicy {
             }
             let parts = line.split('\t').collect::<Vec<_>>();
             match parts.as_slice() {
+                ["policy_epoch", value] => policy.policy_epoch = parse_u64(value)?,
                 ["require_signed_refs", value] => policy.require_signed_refs = parse_bool(value)?,
                 ["writer_account", value] => {
                     policy.writer_accounts.insert(snapshot_field(value)?);
@@ -316,6 +351,10 @@ impl RepoPolicy {
             }
         }
         Ok(policy)
+    }
+
+    fn bump_policy_epoch(&mut self) {
+        self.policy_epoch = self.policy_epoch.saturating_add(1);
     }
 
     pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<(), CoordinationError> {
@@ -815,6 +854,8 @@ pub enum CoordinationError {
     RefUpdateNotAuthorized,
     #[error("protected ref update denied by repository policy")]
     ProtectedRefDenied,
+    #[error("ref update policy epoch is stale: expected {expected}, got {actual}")]
+    StalePolicyEpoch { expected: u64, actual: u64 },
     #[error("identity verification failed: {0}")]
     Identity(#[from] IdentityError),
     #[error("I/O failed: {0}")]
@@ -1161,13 +1202,22 @@ mod tests {
         expected_old_oid: Option<GitSha1Oid>,
         new_oid: Option<GitSha1Oid>,
     ) -> RefUpdate {
+        update_at_epoch(tx, expected_old_oid, new_oid, 0)
+    }
+
+    fn update_at_epoch(
+        tx: &str,
+        expected_old_oid: Option<GitSha1Oid>,
+        new_oid: Option<GitSha1Oid>,
+        policy_epoch: u64,
+    ) -> RefUpdate {
         RefUpdate {
             repo_id: RepoId::new(b"repo"),
             ref_name: RefName::new("refs/heads/main").unwrap(),
             expected_old_oid,
             new_oid,
             force: false,
-            policy_epoch: 0,
+            policy_epoch,
             transaction_id: TransactionId::new(tx).unwrap(),
             signer: "acct_farzeen".to_string(),
         }
@@ -1416,7 +1466,10 @@ mod tests {
         policy.set_require_signed_refs(true);
 
         let err = policy
-            .authorize_ref_update(&update("tx1", None, Some(oid(1))), RefUpdateActor::Unsigned)
+            .authorize_ref_update(
+                &update_at_epoch("tx1", None, Some(oid(1)), policy.policy_epoch()),
+                RefUpdateActor::Unsigned,
+            )
             .unwrap_err();
 
         assert!(matches!(err, CoordinationError::UnsignedRefUpdateDenied));
@@ -1432,7 +1485,7 @@ mod tests {
 
         policy
             .authorize_ref_update(
-                &update("tx1", None, Some(oid(1))),
+                &update_at_epoch("tx1", None, Some(oid(1)), policy.policy_epoch()),
                 RefUpdateActor::Signed(SignedRefUpdateActor {
                     account_id: &certificate.account_id.as_cid().to_string(),
                     device_id: &certificate.device_id.as_cid().to_string(),
@@ -1454,7 +1507,7 @@ mod tests {
 
         let err = policy
             .authorize_ref_update(
-                &update("tx1", None, Some(oid(1))),
+                &update_at_epoch("tx1", None, Some(oid(1)), policy.policy_epoch()),
                 RefUpdateActor::Signed(SignedRefUpdateActor {
                     account_id: &other_certificate.account_id.as_cid().to_string(),
                     device_id: &other_certificate.device_id.as_cid().to_string(),
@@ -1470,11 +1523,12 @@ mod tests {
         let account = AccountRootKey::generate();
         let device = DeviceKey::generate();
         let certificate = account.certify_device(&device, "laptop");
-        let mut ref_update = update("tx1", Some(oid(1)), Some(oid(2)));
-        ref_update.force = true;
         let mut policy = RepoPolicy::default();
         policy.grant_writer_account(&certificate.account_id);
         policy.protect_ref(RefName::new("refs/heads/main").unwrap());
+        let mut ref_update =
+            update_at_epoch("tx1", Some(oid(1)), Some(oid(2)), policy.policy_epoch());
+        ref_update.force = true;
 
         let err = policy
             .authorize_ref_update(
@@ -1494,12 +1548,13 @@ mod tests {
         let account = AccountRootKey::generate();
         let device = DeviceKey::generate();
         let certificate = account.certify_device(&device, "laptop");
-        let mut ref_update = update("tx1", Some(oid(1)), Some(oid(2)));
-        ref_update.force = true;
         let mut policy = RepoPolicy::default();
         policy.grant_writer_account(&certificate.account_id);
         policy.grant_force_push_account(&certificate.account_id);
         policy.protect_ref(RefName::new("refs/heads/main").unwrap());
+        let mut ref_update =
+            update_at_epoch("tx1", Some(oid(1)), Some(oid(2)), policy.policy_epoch());
+        ref_update.force = true;
 
         policy
             .authorize_ref_update(
@@ -1528,10 +1583,66 @@ mod tests {
         let restored = RepoPolicy::from_snapshot(&policy.to_snapshot().unwrap()).unwrap();
 
         assert_eq!(restored, policy);
+        assert_eq!(restored.policy_epoch(), 6);
         assert!(restored.require_signed_refs());
         assert_eq!(restored.writer_count(), 2);
         assert_eq!(restored.force_pusher_count(), 2);
         assert_eq!(restored.protected_ref_count(), 1);
+    }
+
+    #[test]
+    fn policy_epoch_bumps_only_on_changes() {
+        let account = AccountRootKey::generate();
+        let mut policy = RepoPolicy::default();
+        let account_id = account.account_id();
+
+        assert_eq!(policy.policy_epoch(), 0);
+        policy.set_require_signed_refs(true);
+        assert_eq!(policy.policy_epoch(), 1);
+        policy.set_require_signed_refs(true);
+        assert_eq!(policy.policy_epoch(), 1);
+        policy.grant_writer_account(&account_id);
+        assert_eq!(policy.policy_epoch(), 2);
+        policy.grant_writer_account(&account_id);
+        assert_eq!(policy.policy_epoch(), 2);
+    }
+
+    #[test]
+    fn policy_rejects_stale_policy_epoch() {
+        let account = AccountRootKey::generate();
+        let device = DeviceKey::generate();
+        let certificate = account.certify_device(&device, "laptop");
+        let mut policy = RepoPolicy::default();
+        policy.grant_writer_account(&certificate.account_id);
+
+        let err = policy
+            .authorize_ref_update(
+                &update("tx1", None, Some(oid(1))),
+                RefUpdateActor::Signed(SignedRefUpdateActor {
+                    account_id: &certificate.account_id.as_cid().to_string(),
+                    device_id: &certificate.device_id.as_cid().to_string(),
+                }),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            CoordinationError::StalePolicyEpoch {
+                expected,
+                actual: 0
+            } if expected == policy.policy_epoch()
+        ));
+    }
+
+    #[test]
+    fn policy_snapshot_loads_legacy_epoch_zero_snapshot() {
+        let restored = RepoPolicy::from_snapshot(
+            "gitmesh-repo-policy-v0\nrequire_signed_refs\ttrue\nprotected_ref\trefs/heads/main\n",
+        )
+        .unwrap();
+
+        assert_eq!(restored.policy_epoch(), 0);
+        assert!(restored.require_signed_refs());
     }
 
     #[test]

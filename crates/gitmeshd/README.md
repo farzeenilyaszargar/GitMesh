@@ -45,7 +45,7 @@ The socket protocol is a V0 line protocol over Unix domain sockets:
 - `REF_LIST`
 - `REF_UPDATE <tx> <ref> <expected|none> <new|delete> <signer>`
 - `REF_UPDATE_FORCE <tx> <ref> <expected|none> <new|delete> <signer>`
-- `REF_UPDATE_SIGNED <tx> <ref> <expected|none> <new|delete> <label-hex> <account-key-hex> <device-key-hex> <cert-signature-hex> <update-signature-hex>`
+- `REF_UPDATE_SIGNED <tx> <policy-epoch> <ref> <expected|none> <new|delete> <label-hex> <account-key-hex> <device-key-hex> <cert-signature-hex> <update-signature-hex>`
 - `REF_CHECKPOINT`
 - `REF_CHECKPOINT_SIGNED_VERIFY <sequence> <parent|none> <refs-root-cid> <history-root-cid> <checkpoint-cid> <label-hex> <account-key-hex> <device-key-hex> <cert-signature-hex> <checkpoint-signature-hex>`
 - `OBJECT_PUT <blob|tree|commit|tag> <hex-payload|-for-empty>`

@@ -645,7 +645,7 @@ impl DaemonState {
             expected_old_oid,
             new_oid,
             force,
-            policy_epoch: 0,
+            policy_epoch: self.policy.policy_epoch(),
             transaction_id,
             signer: parts[4].to_string(),
         };
@@ -654,34 +654,45 @@ impl DaemonState {
 
     fn ref_update_signed(&mut self, rest: &str, force: bool) -> Result<DaemonResponse> {
         let parts = rest.split_whitespace().collect::<Vec<_>>();
-        if parts.len() != 9 {
+        if parts.len() != 9 && parts.len() != 10 {
             return Err(DaemonError::InvalidCommand(
-                "REF_UPDATE_SIGNED requires <tx> <ref> <expected|none> <new|delete> <label-hex> <account-key-hex> <device-key-hex> <cert-signature-hex> <update-signature-hex>".to_string(),
+                "REF_UPDATE_SIGNED requires <tx> [policy-epoch] <ref> <expected|none> <new|delete> <label-hex> <account-key-hex> <device-key-hex> <cert-signature-hex> <update-signature-hex>".to_string(),
             ));
         }
+        let (policy_epoch, ref_idx, cert_idx, sig_idx) = if parts.len() == 10 {
+            (
+                parse_u64_arg(parts[1], "policy epoch")?,
+                2usize,
+                5usize,
+                9usize,
+            )
+        } else {
+            (0, 1usize, 4usize, 8usize)
+        };
         let certificate = DeviceCertificate::from_key_bytes(
-            decode_label(parts[4])?,
-            decode_fixed_hex::<32>(parts[5])?,
-            decode_fixed_hex::<32>(parts[6])?,
-            decode_fixed_hex::<64>(parts[7])?,
+            decode_label(parts[cert_idx])?,
+            decode_fixed_hex::<32>(parts[cert_idx + 1])?,
+            decode_fixed_hex::<32>(parts[cert_idx + 2])?,
+            decode_fixed_hex::<64>(parts[cert_idx + 3])?,
         )?;
         let signer = certificate.device_id.as_cid().to_string();
         let update = RefUpdate {
             repo_id: self.repo_id.clone(),
-            ref_name: RefName::new(parts[1])?,
-            expected_old_oid: parse_optional_oid(parts[2])?,
-            new_oid: if parts[3] == "delete" {
+            ref_name: RefName::new(parts[ref_idx])?,
+            expected_old_oid: parse_optional_oid(parts[ref_idx + 1])?,
+            new_oid: if parts[ref_idx + 2] == "delete" {
                 None
             } else {
-                Some(GitSha1Oid::from_str(parts[3])?)
+                Some(GitSha1Oid::from_str(parts[ref_idx + 2])?)
             },
             force,
-            policy_epoch: 0,
+            policy_epoch,
             transaction_id: TransactionId::new(parts[0])?,
             signer,
         };
-        let verified = SignedRefUpdate::new(update, certificate, decode_fixed_hex::<64>(parts[8])?)
-            .verify_with_identity()?;
+        let verified =
+            SignedRefUpdate::new(update, certificate, decode_fixed_hex::<64>(parts[sig_idx])?)
+                .verify_with_identity()?;
         let account_id = verified.account_id.as_cid().to_string();
         let device_id = verified.device_id.as_cid().to_string();
         self.apply_verified_ref_update(
@@ -2435,7 +2446,8 @@ fn format_receipt(receipt: TransactionReceipt) -> String {
 
 fn format_policy(policy: &RepoPolicy) -> String {
     format!(
-        "require_signed_refs={} writers={} force_pushers={} protected_refs={}",
+        "policy_epoch={} require_signed_refs={} writers={} force_pushers={} protected_refs={}",
+        policy.policy_epoch(),
         policy.require_signed_refs(),
         policy.writer_count(),
         policy.force_pusher_count(),
@@ -4091,13 +4103,14 @@ mod tests {
             expected_old_oid: None,
             new_oid: Some(GitSha1Oid::from_str(&oid).unwrap()),
             force: false,
-            policy_epoch: 0,
+            policy_epoch: state.policy.policy_epoch(),
             transaction_id: TransactionId::new("tx-policy-signed").unwrap(),
             signer: certificate.device_id.as_cid().to_string(),
         };
         let update_signature = device.sign(&update.signing_transcript());
         let command = format!(
-            "REF_UPDATE_SIGNED tx-policy-signed refs/heads/main none {} {} {} {} {} {}",
+            "REF_UPDATE_SIGNED tx-policy-signed {} refs/heads/main none {} {} {} {} {} {}",
+            state.policy.policy_epoch(),
             oid,
             encode_hex(certificate.label.as_bytes()),
             encode_hex(&certificate.account_verifying_key),
@@ -4109,6 +4122,54 @@ mod tests {
         let response = state.handle_command(&command).unwrap().into_line();
 
         assert!(response.contains("status=committed"));
+    }
+
+    #[test]
+    fn policy_rejects_stale_signed_policy_epoch() {
+        let mut state = DaemonState::default();
+        let oid = put_root_commit(&mut state, "policy signed stale");
+        let account = AccountRootKey::generate();
+        let device = DeviceKey::generate();
+        let certificate = account.certify_device(&device, "gm-dev-device");
+        state
+            .handle_command("POLICY_SET_REQUIRE_SIGNED true")
+            .unwrap();
+        state
+            .handle_command(&format!(
+                "POLICY_GRANT_WRITER_ACCOUNT {}",
+                certificate.account_id.as_cid()
+            ))
+            .unwrap();
+        let update = RefUpdate {
+            repo_id: state.repo_id.clone(),
+            ref_name: RefName::new("refs/heads/main").unwrap(),
+            expected_old_oid: None,
+            new_oid: Some(GitSha1Oid::from_str(&oid).unwrap()),
+            force: false,
+            policy_epoch: 1,
+            transaction_id: TransactionId::new("tx-policy-stale").unwrap(),
+            signer: certificate.device_id.as_cid().to_string(),
+        };
+        let update_signature = device.sign(&update.signing_transcript());
+        let command = format!(
+            "REF_UPDATE_SIGNED tx-policy-stale 1 refs/heads/main none {} {} {} {} {} {}",
+            oid,
+            encode_hex(certificate.label.as_bytes()),
+            encode_hex(&certificate.account_verifying_key),
+            encode_hex(&certificate.device_verifying_key),
+            encode_hex(&certificate.signature),
+            encode_hex(&update_signature)
+        );
+
+        let err = state.handle_command(&command).unwrap_err();
+
+        assert!(matches!(
+            err,
+            DaemonError::Coordination(CoordinationError::StalePolicyEpoch {
+                expected: 2,
+                actual: 1
+            })
+        ));
     }
 
     #[test]
@@ -4129,6 +4190,7 @@ mod tests {
         let response = format_policy(&restored.policy);
 
         assert!(response.contains("require_signed_refs=true"));
+        assert!(response.contains("policy_epoch=2"));
         assert!(response.contains("protected_refs=1"));
         let _ = fs::remove_file(policy_path);
     }

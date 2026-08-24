@@ -45,6 +45,11 @@ A push succeeds only if `current_ref == expected_old_oid` and policy permits the
 update. Conflicting simultaneous pushes produce normal Git non-fast-forward
 behavior. Force pushes are signed, policy-checked, and auditable.
 
+`policy_epoch` binds a `RefUpdate` to the exact repository policy snapshot used
+when the actor signed or submitted it. Repository policy changes monotonically
+increment the epoch, policy snapshots persist it, and coordinators reject stale
+updates before evaluating writer or protected-ref permissions.
+
 ## Push Transaction
 
 ```text

@@ -173,7 +173,11 @@ impl LocalIdentity {
         Ok(())
     }
 
-    fn signed_ref_update_command(&self, args: &[String]) -> Result<String, GmError> {
+    fn signed_ref_update_command(
+        &self,
+        args: &[String],
+        policy_epoch: u64,
+    ) -> Result<String, GmError> {
         let update = RefUpdate {
             repo_id: RepoId::new(b"gitmeshd-v0-repo"),
             ref_name: RefName::new(&args[1])?,
@@ -184,14 +188,15 @@ impl LocalIdentity {
                 Some(GitSha1Oid::from_str(&args[3])?)
             },
             force: false,
-            policy_epoch: 0,
+            policy_epoch,
             transaction_id: TransactionId::new(&args[0])?,
             signer: self.certificate.device_id.as_cid().to_string(),
         };
         let update_signature = self.device.sign(&update.signing_transcript());
         Ok(format!(
-            "REF_UPDATE_SIGNED {} {} {} {} {} {} {} {} {}",
+            "REF_UPDATE_SIGNED {} {} {} {} {} {} {} {} {} {}",
             args[0],
+            policy_epoch,
             args[1],
             args[2],
             args[3],
@@ -1009,6 +1014,17 @@ fn response_field<'a>(response: &'a str, name: &str) -> Option<&'a str> {
         .find_map(|part| part.strip_prefix(&format!("{name}=")))
 }
 
+fn current_policy_epoch(socket_path: &Path) -> Result<u64, GmError> {
+    let response = request_unix_socket(socket_path, "POLICY_SHOW")?;
+    if !response.starts_with("OK ") {
+        return Err(GmError::DaemonResponse(response));
+    }
+    response_field(&response, "policy_epoch")
+        .ok_or_else(|| GmError::DaemonResponse(response.clone()))?
+        .parse()
+        .map_err(|_| GmError::DaemonResponse(response))
+}
+
 fn load_issue_summaries() -> Vec<gitmesh_collaboration::IssueSummary> {
     request_unix_socket(default_socket_path(), "ISSUE_LIST farzeen/gitmesh")
         .ok()
@@ -1693,9 +1709,13 @@ fn refs(args: &[String]) -> Result<(), GmError> {
                 ));
             }
             let identity = LocalIdentity::load_or_create_default()?;
+            let policy_epoch = current_policy_epoch(&socket_path)?;
             println!(
                 "{}",
-                request_unix_socket(socket_path, &identity.signed_ref_update_command(&rest)?)?
+                request_unix_socket(
+                    socket_path,
+                    &identity.signed_ref_update_command(&rest, policy_epoch)?
+                )?
             );
             Ok(())
         }
@@ -1709,9 +1729,13 @@ fn refs(args: &[String]) -> Result<(), GmError> {
                 ));
             }
             let identity = LocalIdentity::create("gm-dev-device".to_string());
+            let policy_epoch = current_policy_epoch(&socket_path)?;
             println!(
                 "{}",
-                request_unix_socket(socket_path, &identity.signed_ref_update_command(&rest)?)?
+                request_unix_socket(
+                    socket_path,
+                    &identity.signed_ref_update_command(&rest, policy_epoch)?
+                )?
             );
             Ok(())
         }
@@ -2537,9 +2561,9 @@ mod tests {
         assert_eq!(loaded.label, "test-device");
         assert!(
             loaded
-                .signed_ref_update_command(&args(&["tx1", "refs/heads/main", "none", "delete"]))
+                .signed_ref_update_command(&args(&["tx1", "refs/heads/main", "none", "delete"]), 7)
                 .unwrap()
-                .starts_with("REF_UPDATE_SIGNED tx1 refs/heads/main none delete")
+                .starts_with("REF_UPDATE_SIGNED tx1 7 refs/heads/main none delete")
         );
 
         let _ = fs::remove_file(path);

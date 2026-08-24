@@ -369,6 +369,11 @@ impl HelperState {
             new_oid
         };
         let expected_text = expected.unwrap_or_else(|| "none".to_string());
+        let policy_epoch = if self.config.identity_enabled {
+            Some(current_policy_epoch(daemon_socket)?)
+        } else {
+            None
+        };
         let transaction_id = format!(
             "push-{}-{}-{}",
             sanitize_tx_component(&push.dst),
@@ -384,6 +389,7 @@ impl HelperState {
                 &expected_text,
                 &new_target,
                 push.force,
+                policy_epoch.unwrap_or(0),
             )?;
             gitmeshd::request_unix_socket(daemon_socket, &command)?
         } else {
@@ -454,6 +460,7 @@ impl LocalIdentity {
         expected_old_oid: &str,
         new_oid: &str,
         force: bool,
+        policy_epoch: u64,
     ) -> Result<String> {
         let update = RefUpdate {
             repo_id: RepoId::new(b"gitmeshd-v0-repo"),
@@ -461,7 +468,7 @@ impl LocalIdentity {
             expected_old_oid: parse_optional_oid(expected_old_oid)?,
             new_oid: parse_optional_new_oid(new_oid)?,
             force,
-            policy_epoch: 0,
+            policy_epoch,
             transaction_id: TransactionId::new(transaction_id)?,
             signer: self.certificate.device_id.as_cid().to_string(),
         };
@@ -472,7 +479,7 @@ impl LocalIdentity {
             "REF_UPDATE_SIGNED"
         };
         Ok(format!(
-            "{command} {transaction_id} {ref_name} {expected_old_oid} {new_oid} {} {} {} {} {}",
+            "{command} {transaction_id} {policy_epoch} {ref_name} {expected_old_oid} {new_oid} {} {} {} {} {}",
             hex(self.label.as_bytes()),
             hex(&self.certificate.account_verifying_key),
             hex(&self.certificate.device_verifying_key),
@@ -633,6 +640,25 @@ fn current_remote_ref(daemon_socket: &Path, ref_name: &str) -> Result<Option<Str
     } else {
         Ok(Some(oid.to_string()))
     }
+}
+
+fn current_policy_epoch(daemon_socket: &Path) -> Result<u64> {
+    let response = gitmeshd::request_unix_socket(daemon_socket, "POLICY_SHOW")?;
+    if !response.starts_with("OK ") {
+        return Err(HelperError::DaemonResponse(response));
+    }
+    response_field(&response, "policy_epoch")
+        .ok_or_else(|| {
+            HelperError::DaemonResponse(format!(
+                "missing policy_epoch field in response: {response}"
+            ))
+        })?
+        .parse()
+        .map_err(|_| {
+            HelperError::DaemonResponse(format!(
+                "invalid policy_epoch field in response: {response}"
+            ))
+        })
 }
 
 fn parse_optional_oid(value: &str) -> Result<Option<GitSha1Oid>> {
@@ -1237,11 +1263,12 @@ mod tests {
                 "3b18e512dba79e4c8300dd08aeb37f8e728b8dad",
                 "6b18e512dba79e4c8300dd08aeb37f8e728b8dad",
                 true,
+                4,
             )
             .unwrap();
 
         assert!(command.starts_with(
-            "REF_UPDATE_SIGNED_FORCE tx1 refs/heads/main 3b18e512dba79e4c8300dd08aeb37f8e728b8dad 6b18e512dba79e4c8300dd08aeb37f8e728b8dad"
+            "REF_UPDATE_SIGNED_FORCE tx1 4 refs/heads/main 3b18e512dba79e4c8300dd08aeb37f8e728b8dad 6b18e512dba79e4c8300dd08aeb37f8e728b8dad"
         ));
 
         let _ = fs::remove_file(path);

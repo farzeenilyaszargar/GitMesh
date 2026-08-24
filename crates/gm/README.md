@@ -75,9 +75,10 @@ Git object is verified after rediscovery.
 the current bootstrap/control-plane spine for known peers before the libp2p
 runtime takes over live dialing.
 
-`signed-update-dev` uses an ephemeral certified Ed25519 device key to exercise
-the production signed `RefUpdate` path. Persistent account/device key storage is
-a later auth component.
+`signed-update` and `signed-update-dev` fetch the daemon's current repository
+policy epoch and bind it into the signed `RefUpdate`. `signed-update-dev` uses
+an ephemeral certified Ed25519 device key to exercise the production signed
+path. Persistent account/device key storage is a later auth component.
 
 Pack import accepts full objects plus OFS-delta and REF-delta entries. Pack
 export currently writes full-object packs for compatibility.
