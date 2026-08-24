@@ -135,6 +135,10 @@ expect_contains "$availability_response" "required_shards=10"
 ref_response="$(run_gitmeshd ref-update "$SOCKET_PATH" tx-smoke refs/tags/smoke none "$oid" smoke)"
 expect_contains "$ref_response" "status=committed"
 
+signed_checkpoint_response="$(run_gm ref signed-checkpoint "$SOCKET_PATH")"
+expect_contains "$signed_checkpoint_response" "signed=true"
+expect_contains "$signed_checkpoint_response" "sequence=1"
+
 status_response="$(run_gitmeshd repo-status "$SOCKET_PATH")"
 expect_contains "$status_response" "objects=1"
 expect_contains "$status_response" "refs=1"

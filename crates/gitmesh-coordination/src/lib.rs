@@ -513,6 +513,13 @@ impl RefStore {
         self.checkpoints.last()
     }
 
+    pub fn checkpoint_before_latest(&self) -> Option<&RefCheckpoint> {
+        self.checkpoints
+            .len()
+            .checked_sub(2)
+            .and_then(|index| self.checkpoints.get(index))
+    }
+
     pub fn preflight_receipt(&self, update: &RefUpdate) -> Option<TransactionReceipt> {
         let (existing_fingerprint, receipt) = self.receipts.get(&update.transaction_id)?;
         if existing_fingerprint == &update.operation_fingerprint() {
@@ -1272,6 +1279,7 @@ mod tests {
         assert_eq!(second.parent, Some(first.checkpoint_cid));
         assert_ne!(first.refs_root, second.refs_root);
         assert_ne!(first.history_root, second.history_root);
+        assert_eq!(store.checkpoint_before_latest(), Some(first));
     }
 
     #[test]

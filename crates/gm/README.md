@@ -31,6 +31,7 @@ Implemented command families:
 - `gm ref get [socket] <ref>`
 - `gm ref update [socket] <tx> <ref> <expected|none> <new|delete> <signer>`
 - `gm ref checkpoint [socket]`
+- `gm ref signed-checkpoint [socket]`
 - `gm ref signed-update-dev [socket] <tx> <ref> <expected|none> <new|delete>`
 - `gm object put [socket] <blob|tree|commit|tag> <hex-payload>`
 - `gm object get [socket] <oid>`

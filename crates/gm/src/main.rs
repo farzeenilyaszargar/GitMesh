@@ -10,7 +10,9 @@ use gitmesh_collaboration::{
     CollaborationEvent, CollaborationEventKind, CollaborationPayload, sample_issues,
     sample_pull_requests,
 };
-use gitmesh_coordination::{RefName, RefUpdate, RepoId, TransactionId};
+use gitmesh_coordination::{
+    RefCheckpoint, RefName, RefUpdate, RepoId, SignedRefCheckpoint, TransactionId,
+};
 use gitmesh_core::{Cid, CidKind, HashAlgorithm, hex};
 use gitmesh_crypto::RepoContentKey;
 use gitmesh_git::{GitObjectKind, GitSha1Oid, parse_loose_object, parse_packfile};
@@ -194,6 +196,26 @@ impl LocalIdentity {
             hex(&self.certificate.device_verifying_key),
             hex(&self.certificate.signature),
             hex(&update_signature)
+        ))
+    }
+
+    fn signed_ref_checkpoint_command(&self, checkpoint: RefCheckpoint) -> Result<String, GmError> {
+        let signed =
+            SignedRefCheckpoint::sign(checkpoint.clone(), self.certificate.clone(), &self.device)?;
+        Ok(format!(
+            "REF_CHECKPOINT_SIGNED_VERIFY {} {} {} {} {} {} {} {} {} {}",
+            checkpoint.sequence,
+            checkpoint
+                .parent
+                .map_or_else(|| "none".to_string(), |cid| cid.to_string()),
+            checkpoint.refs_root,
+            checkpoint.history_root,
+            checkpoint.checkpoint_cid,
+            hex(self.certificate.label.as_bytes()),
+            hex(&self.certificate.account_verifying_key),
+            hex(&self.certificate.device_verifying_key),
+            hex(&self.certificate.signature),
+            hex(&signed.signature)
         ))
     }
 
@@ -897,6 +919,40 @@ fn parse_ref_list_response(response: &str) -> Result<Vec<ListedRef>, GmError> {
         .collect()
 }
 
+fn parse_ref_checkpoint_response(response: &str) -> Result<RefCheckpoint, GmError> {
+    if !response.starts_with("OK ") {
+        return Err(GmError::DaemonResponse(response.to_string()));
+    }
+    if response_field(response, "checkpoint") == Some("none") {
+        return Err(GmError::InvalidArguments(
+            "no ref checkpoint exists to sign".to_string(),
+        ));
+    }
+    let sequence = response_field(response, "sequence")
+        .ok_or_else(|| GmError::DaemonResponse(response.to_string()))?
+        .parse::<u64>()
+        .map_err(|_| GmError::DaemonResponse(response.to_string()))?;
+    let parent = response_field(response, "parent")
+        .ok_or_else(|| GmError::DaemonResponse(response.to_string()))
+        .and_then(parse_optional_protocol_cid)?;
+    let refs_root = response_field(response, "refs_root")
+        .ok_or_else(|| GmError::DaemonResponse(response.to_string()))
+        .and_then(parse_protocol_cid_digest)?;
+    let history_root = response_field(response, "history_root")
+        .ok_or_else(|| GmError::DaemonResponse(response.to_string()))
+        .and_then(parse_protocol_cid_digest)?;
+    let checkpoint_cid = response_field(response, "checkpoint")
+        .ok_or_else(|| GmError::DaemonResponse(response.to_string()))
+        .and_then(parse_protocol_cid_digest)?;
+    Ok(RefCheckpoint {
+        sequence,
+        parent,
+        refs_root,
+        history_root,
+        checkpoint_cid,
+    })
+}
+
 fn response_field<'a>(response: &'a str, name: &str) -> Option<&'a str> {
     response
         .split_whitespace()
@@ -996,6 +1052,14 @@ fn parse_protocol_cid_digest(value: &str) -> Result<Cid, GmError> {
             HashAlgorithm::Blake3_256,
             decode_fixed_hex::<32>(value)?,
         ))
+    }
+}
+
+fn parse_optional_protocol_cid(value: &str) -> Result<Option<Cid>, GmError> {
+    if value == "none" {
+        Ok(None)
+    } else {
+        Ok(Some(parse_protocol_cid_digest(value)?))
     }
 }
 
@@ -1433,6 +1497,20 @@ fn refs(args: &[String]) -> Result<(), GmError> {
         Some("checkpoint") => {
             let socket_path = args.get(1).map_or_else(default_socket_path, Into::into);
             println!("{}", request_unix_socket(socket_path, "REF_CHECKPOINT")?);
+            Ok(())
+        }
+        Some("signed-checkpoint") => {
+            let socket_path = args.get(1).map_or_else(default_socket_path, Into::into);
+            let response = request_unix_socket(&socket_path, "REF_CHECKPOINT")?;
+            let checkpoint = parse_ref_checkpoint_response(&response)?;
+            let identity = LocalIdentity::load_or_create_default()?;
+            println!(
+                "{}",
+                request_unix_socket(
+                    socket_path,
+                    &identity.signed_ref_checkpoint_command(checkpoint)?
+                )?
+            );
             Ok(())
         }
         Some("signed-update") => {
@@ -2057,6 +2135,7 @@ fn print_help() {
     println!("  ref list [socket]");
     println!("  ref update [socket] <tx> <ref> <expected|none> <new|delete> <signer>");
     println!("  ref checkpoint [socket]");
+    println!("  ref signed-checkpoint [socket]");
     println!("  ref signed-update [socket] <tx> <ref> <expected|none> <new|delete>");
     println!("  ref signed-update-dev [socket] <tx> <ref> <expected|none> <new|delete>");
     println!("  object put [socket] <blob|tree|commit|tag> <hex-payload>");
@@ -2298,6 +2377,35 @@ mod tests {
             GitSha1Oid::from_str("3b18e512dba79e4c8300dd08aeb37f8e728b8dad").unwrap()
         );
         assert_eq!(parse_ref_list_response("OK refs=none").unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn parses_ref_checkpoint_response() {
+        let parent = Cid::from_digest(CidKind::ProtocolObject, HashAlgorithm::Blake3_256, [1; 32]);
+        let refs_root =
+            Cid::from_digest(CidKind::ProtocolObject, HashAlgorithm::Blake3_256, [2; 32]);
+        let history_root =
+            Cid::from_digest(CidKind::ProtocolObject, HashAlgorithm::Blake3_256, [3; 32]);
+        let checkpoint_cid =
+            Cid::from_digest(CidKind::ProtocolObject, HashAlgorithm::Blake3_256, [4; 32]);
+        let response = format!(
+            "OK checkpoint={checkpoint_cid} sequence=2 parent={parent} refs_root={refs_root} history_root={history_root}"
+        );
+
+        let checkpoint = parse_ref_checkpoint_response(&response).unwrap();
+
+        assert_eq!(checkpoint.sequence, 2);
+        assert_eq!(checkpoint.parent, Some(parent));
+        assert_eq!(checkpoint.refs_root, refs_root);
+        assert_eq!(checkpoint.history_root, history_root);
+        assert_eq!(checkpoint.checkpoint_cid, checkpoint_cid);
+    }
+
+    #[test]
+    fn rejects_empty_ref_checkpoint_response() {
+        let err = parse_ref_checkpoint_response("OK checkpoint=none").unwrap_err();
+
+        assert!(matches!(err, GmError::InvalidArguments(_)));
     }
 
     #[test]

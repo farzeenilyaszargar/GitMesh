@@ -410,6 +410,7 @@ dependencies = [
  "gitmesh-accounts",
  "gitmesh-collaboration",
  "gitmesh-coordination",
+ "gitmesh-core",
  "gitmesh-crypto",
  "gitmesh-git",
  "gitmesh-identity",

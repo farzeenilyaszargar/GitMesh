@@ -9,6 +9,7 @@ repository.workspace = true
 gitmesh-accounts.workspace = true
 gitmesh-collaboration.workspace = true
 gitmesh-coordination.workspace = true
+gitmesh-core.workspace = true
 gitmesh-crypto.workspace = true
 gitmesh-git.workspace = true
 gitmesh-identity.workspace = true

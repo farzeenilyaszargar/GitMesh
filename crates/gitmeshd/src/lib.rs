@@ -23,9 +23,11 @@ use gitmesh_collaboration::{
     sample_issue_events, sample_pull_request_events,
 };
 use gitmesh_coordination::{
-    CoordinationError, RefName, RefStore, RefUpdate, RefUpdateActor, RejectionReason, RepoId,
-    RepoPolicy, SignedRefUpdate, SignedRefUpdateActor, TransactionId, TransactionReceipt,
+    CoordinationError, RefCheckpoint, RefName, RefStore, RefUpdate, RefUpdateActor,
+    RejectionReason, RepoId, RepoPolicy, SignedRefCheckpoint, SignedRefUpdate,
+    SignedRefUpdateActor, TransactionId, TransactionReceipt,
 };
+use gitmesh_core::{Cid, CidKind, HashAlgorithm};
 use gitmesh_git::{GitError, GitObject, GitSha1Oid, parse_packfile};
 use gitmesh_identity::{
     AccountId, DeviceCertificate, DeviceId, IdentityError, RepoKeyGrant, RepoKeyGrantStore,
@@ -376,6 +378,10 @@ impl DaemonState {
             return Ok(DaemonResponse::Ok(format_checkpoint(&self.refs)));
         }
 
+        if let Some(rest) = trimmed.strip_prefix("REF_CHECKPOINT_SIGNED_VERIFY ") {
+            return self.ref_checkpoint_signed_verify(rest);
+        }
+
         if trimmed == "POLICY_SHOW" {
             return Ok(DaemonResponse::Ok(format_policy(&self.policy)));
         }
@@ -658,6 +664,49 @@ impl DaemonState {
         let receipt = self.refs.apply(update);
         self.save_refs()?;
         Ok(DaemonResponse::Ok(format_receipt(receipt)))
+    }
+
+    fn ref_checkpoint_signed_verify(&self, rest: &str) -> Result<DaemonResponse> {
+        let parts = rest.split_whitespace().collect::<Vec<_>>();
+        if parts.len() != 10 {
+            return Err(DaemonError::InvalidCommand(
+                "REF_CHECKPOINT_SIGNED_VERIFY requires <sequence> <parent|none> <refs-root-cid> <history-root-cid> <checkpoint-cid> <label-hex> <account-key-hex> <device-key-hex> <cert-signature-hex> <checkpoint-signature-hex>".to_string(),
+            ));
+        }
+        let checkpoint = RefCheckpoint {
+            sequence: parts[0].parse::<u64>().map_err(|_| {
+                DaemonError::InvalidCommand("checkpoint sequence must be a u64".to_string())
+            })?,
+            parent: parse_optional_protocol_cid(parts[1])?,
+            refs_root: parse_protocol_object_cid(parts[2])?,
+            history_root: parse_protocol_object_cid(parts[3])?,
+            checkpoint_cid: parse_protocol_object_cid(parts[4])?,
+        };
+        let latest = self
+            .refs
+            .latest_checkpoint()
+            .ok_or_else(|| DaemonError::InvalidCommand("no ref checkpoint exists".to_string()))?;
+        if &checkpoint != latest {
+            return Err(DaemonError::Coordination(
+                CoordinationError::InvalidSnapshot,
+            ));
+        }
+        let certificate = DeviceCertificate::from_key_bytes(
+            decode_label(parts[5])?,
+            decode_fixed_hex::<32>(parts[6])?,
+            decode_fixed_hex::<32>(parts[7])?,
+            decode_fixed_hex::<64>(parts[8])?,
+        )?;
+        let verified =
+            SignedRefCheckpoint::new(checkpoint, certificate, decode_fixed_hex::<64>(parts[9])?)
+                .verify(self.refs.checkpoint_before_latest())?;
+        Ok(DaemonResponse::Ok(format!(
+            "checkpoint={} sequence={} signed=true account={} device={}",
+            verified.checkpoint.checkpoint_cid,
+            verified.checkpoint.sequence,
+            verified.account_id.as_cid(),
+            verified.device_id.as_cid()
+        )))
     }
 
     fn policy_set_require_signed(&mut self, rest: &str) -> Result<DaemonResponse> {
@@ -2087,6 +2136,25 @@ fn validate_collaboration_actor(value: &str) -> Result<()> {
 fn parse_policy_identity(value: &str) -> Result<&str> {
     AccountId::from_protocol_cid_text(value).map_err(DaemonError::Identity)?;
     Ok(value)
+}
+
+fn parse_protocol_object_cid(value: &str) -> Result<Cid> {
+    let cid = Cid::from_str(value)
+        .map_err(|_| DaemonError::InvalidCommand("invalid GitMesh protocol CID".to_string()))?;
+    if cid.kind() != CidKind::ProtocolObject || cid.hash_algorithm() != HashAlgorithm::Blake3_256 {
+        return Err(DaemonError::InvalidCommand(
+            "expected protocol-object CID".to_string(),
+        ));
+    }
+    Ok(cid)
+}
+
+fn parse_optional_protocol_cid(value: &str) -> Result<Option<Cid>> {
+    if value == "none" {
+        Ok(None)
+    } else {
+        Ok(Some(parse_protocol_object_cid(value)?))
+    }
 }
 
 fn format_receipt(receipt: TransactionReceipt) -> String {
@@ -3776,6 +3844,79 @@ mod tests {
         assert!(checkpoint.contains("refs_root=gitmesh:v0:ProtocolObject"));
         assert!(checkpoint.contains("history_root=gitmesh:v0:ProtocolObject"));
         assert!(status.contains("checkpoints=1"));
+    }
+
+    #[test]
+    fn ref_checkpoint_signed_verify_accepts_current_tip() {
+        let mut state = DaemonState::default();
+        let oid = put_root_commit(&mut state, "signed checkpoint");
+        state
+            .handle_command(&format!("REF_UPDATE tx1 refs/heads/main none {oid} acct"))
+            .unwrap();
+        let checkpoint = state.refs.latest_checkpoint().unwrap().clone();
+        let account = AccountRootKey::generate();
+        let device = DeviceKey::generate();
+        let certificate = account.certify_device(&device, "checkpoint-signer");
+        let signed = SignedRefCheckpoint::sign(checkpoint.clone(), certificate, &device).unwrap();
+        let command = format!(
+            "REF_CHECKPOINT_SIGNED_VERIFY {} {} {} {} {} {} {} {} {} {}",
+            checkpoint.sequence,
+            checkpoint
+                .parent
+                .map_or_else(|| "none".to_string(), |cid| cid.to_string()),
+            checkpoint.refs_root,
+            checkpoint.history_root,
+            checkpoint.checkpoint_cid,
+            encode_hex(signed.certificate.label.as_bytes()),
+            encode_hex(&signed.certificate.account_verifying_key),
+            encode_hex(&signed.certificate.device_verifying_key),
+            encode_hex(&signed.certificate.signature),
+            encode_hex(&signed.signature)
+        );
+
+        let response = state.handle_command(&command).unwrap().into_line();
+
+        assert!(response.contains("signed=true"));
+        assert!(response.contains("sequence=1"));
+        assert!(response.contains(&format!("checkpoint={}", checkpoint.checkpoint_cid)));
+        assert!(response.contains(&format!("account={}", account.account_id().as_cid())));
+        assert!(response.contains(&format!("device={}", device.device_id().as_cid())));
+    }
+
+    #[test]
+    fn ref_checkpoint_signed_verify_rejects_bad_signature() {
+        let mut state = DaemonState::default();
+        let oid = put_root_commit(&mut state, "bad checkpoint signature");
+        state
+            .handle_command(&format!("REF_UPDATE tx1 refs/heads/main none {oid} acct"))
+            .unwrap();
+        let checkpoint = state.refs.latest_checkpoint().unwrap().clone();
+        let account = AccountRootKey::generate();
+        let device = DeviceKey::generate();
+        let certificate = account.certify_device(&device, "checkpoint-signer");
+        let bad_signature = [9_u8; 64];
+        let command = format!(
+            "REF_CHECKPOINT_SIGNED_VERIFY {} {} {} {} {} {} {} {} {} {}",
+            checkpoint.sequence,
+            checkpoint
+                .parent
+                .map_or_else(|| "none".to_string(), |cid| cid.to_string()),
+            checkpoint.refs_root,
+            checkpoint.history_root,
+            checkpoint.checkpoint_cid,
+            encode_hex(certificate.label.as_bytes()),
+            encode_hex(&certificate.account_verifying_key),
+            encode_hex(&certificate.device_verifying_key),
+            encode_hex(&certificate.signature),
+            encode_hex(&bad_signature)
+        );
+
+        let err = state.handle_command(&command).unwrap_err();
+
+        assert!(matches!(
+            err,
+            DaemonError::Coordination(CoordinationError::Identity(IdentityError::InvalidSignature))
+        ));
     }
 
     #[test]
