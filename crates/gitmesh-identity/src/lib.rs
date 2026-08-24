@@ -699,14 +699,13 @@ fn parse_u64(value: &str) -> Result<u64, IdentityError> {
 }
 
 fn parse_protocol_cid(value: &str) -> Result<Cid, IdentityError> {
-    let digest_hex = value
-        .strip_prefix("gitmesh:v0:ProtocolObject:Blake3_256:")
-        .ok_or(IdentityError::InvalidGrantStore)?;
-    Ok(Cid::from_digest(
-        CidKind::ProtocolObject,
-        HashAlgorithm::Blake3_256,
-        decode_fixed_hex::<32>(digest_hex)?,
-    ))
+    let cid = value
+        .parse::<Cid>()
+        .map_err(|_| IdentityError::InvalidGrantStore)?;
+    if cid.kind() != CidKind::ProtocolObject || cid.hash_algorithm() != HashAlgorithm::Blake3_256 {
+        return Err(IdentityError::InvalidGrantStore);
+    }
+    Ok(cid)
 }
 
 fn decode_fixed_hex<const N: usize>(value: &str) -> Result<[u8; N], IdentityError> {

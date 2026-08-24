@@ -4,7 +4,7 @@
 //! should share: algorithm identifiers, typed CIDs, and deterministic envelope
 //! bytes for hashed protocol objects.
 
-use std::fmt;
+use std::{fmt, str::FromStr};
 
 use thiserror::Error;
 
@@ -22,6 +22,13 @@ impl HashAlgorithm {
             Self::Blake3_256 => blake3::hash(bytes).into(),
         }
     }
+
+    fn parse_label(value: &str) -> Result<Self, CoreError> {
+        match value {
+            "Blake3_256" => Ok(Self::Blake3_256),
+            _ => Err(CoreError::InvalidCid),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -31,6 +38,18 @@ pub enum CidKind {
     PlainSegment = 2,
     EncryptedSegment = 3,
     Shard = 4,
+}
+
+impl CidKind {
+    fn parse_label(value: &str) -> Result<Self, CoreError> {
+        match value {
+            "ProtocolObject" => Ok(Self::ProtocolObject),
+            "PlainSegment" => Ok(Self::PlainSegment),
+            "EncryptedSegment" => Ok(Self::EncryptedSegment),
+            "Shard" => Ok(Self::Shard),
+            _ => Err(CoreError::InvalidCid),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -104,6 +123,29 @@ impl fmt::Display for Cid {
     }
 }
 
+impl FromStr for Cid {
+    type Err = CoreError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let parts = value.split(':').collect::<Vec<_>>();
+        if parts.len() != 5 || parts[0] != "gitmesh" {
+            return Err(CoreError::InvalidCid);
+        }
+        let version = parts[1]
+            .strip_prefix('v')
+            .ok_or(CoreError::InvalidCid)?
+            .parse::<u32>()
+            .map_err(|_| CoreError::InvalidCid)?;
+        if version != GITMESH_PROTOCOL_VERSION {
+            return Err(CoreError::InvalidCid);
+        }
+        let kind = CidKind::parse_label(parts[2])?;
+        let hash_algorithm = HashAlgorithm::parse_label(parts[3])?;
+        let digest = decode_fixed_hex::<32>(parts[4])?;
+        Ok(Self::from_digest(kind, hash_algorithm, digest))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProtocolEnvelope {
     pub domain: String,
@@ -152,6 +194,8 @@ pub enum CoreError {
     InvalidDomain,
     #[error("field is too large to encode")]
     FieldTooLarge,
+    #[error("invalid GitMesh CID")]
+    InvalidCid,
 }
 
 pub fn encrypted_segment_cid(ciphertext: &[u8]) -> Cid {
@@ -200,6 +244,35 @@ fn put_bytes(out: &mut Vec<u8>, value: &[u8]) -> Result<(), CoreError> {
     Ok(())
 }
 
+fn decode_fixed_hex<const N: usize>(value: &str) -> Result<[u8; N], CoreError> {
+    let bytes = decode_hex(value)?;
+    bytes.try_into().map_err(|_| CoreError::InvalidCid)
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>, CoreError> {
+    if !value.len().is_multiple_of(2) {
+        return Err(CoreError::InvalidCid);
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|chunk| {
+            let high = hex_nibble(chunk[0]).ok_or(CoreError::InvalidCid)?;
+            let low = hex_nibble(chunk[1]).ok_or(CoreError::InvalidCid)?;
+            Ok((high << 4) | low)
+        })
+        .collect()
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,6 +290,33 @@ mod tests {
 
         assert_ne!(segment, shard);
         assert_eq!(segment.kind(), CidKind::EncryptedSegment);
+    }
+
+    #[test]
+    fn cid_display_round_trips_through_strict_parser() {
+        let cid = Cid::new(
+            CidKind::ProtocolObject,
+            HashAlgorithm::Blake3_256,
+            b"payload",
+        );
+        let text = cid.to_string();
+        let parsed = text.parse::<Cid>().unwrap();
+
+        assert_eq!(parsed, cid);
+        assert_eq!(parsed.kind(), CidKind::ProtocolObject);
+        assert_eq!(parsed.hash_algorithm(), HashAlgorithm::Blake3_256);
+    }
+
+    #[test]
+    fn cid_parser_rejects_wrong_version_kind_hash_and_digest() {
+        assert!("gitmesh:v1:ProtocolObject:Blake3_256:0000000000000000000000000000000000000000000000000000000000000000".parse::<Cid>().is_err());
+        assert!("gitmesh:v0:Unknown:Blake3_256:0000000000000000000000000000000000000000000000000000000000000000".parse::<Cid>().is_err());
+        assert!("gitmesh:v0:ProtocolObject:OtherHash:0000000000000000000000000000000000000000000000000000000000000000".parse::<Cid>().is_err());
+        assert!(
+            "gitmesh:v0:ProtocolObject:Blake3_256:not-hex"
+                .parse::<Cid>()
+                .is_err()
+        );
     }
 
     #[test]

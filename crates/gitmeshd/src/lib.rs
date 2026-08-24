@@ -28,7 +28,7 @@ use gitmesh_coordination::{
 };
 use gitmesh_git::{GitError, GitObject, GitSha1Oid, parse_packfile};
 use gitmesh_identity::{
-    DeviceCertificate, DeviceId, IdentityError, RepoKeyGrant, RepoKeyGrantStore,
+    AccountId, DeviceCertificate, DeviceId, IdentityError, RepoKeyGrant, RepoKeyGrantStore,
 };
 use gitmesh_network::{
     AvailabilityRequirement, NetworkError, NetworkNodeStore, NodeDescriptor, OperatorId, PeerId,
@@ -2085,15 +2085,8 @@ fn validate_collaboration_actor(value: &str) -> Result<()> {
 }
 
 fn parse_policy_identity(value: &str) -> Result<&str> {
-    if value.starts_with("gitmesh:v0:ProtocolObject:Blake3_256:")
-        && !value.contains(char::is_whitespace)
-    {
-        Ok(value)
-    } else {
-        Err(DaemonError::InvalidCommand(
-            "expected GitMesh account identity CID".to_string(),
-        ))
-    }
+    AccountId::from_protocol_cid_text(value).map_err(DaemonError::Identity)?;
+    Ok(value)
 }
 
 fn format_receipt(receipt: TransactionReceipt) -> String {

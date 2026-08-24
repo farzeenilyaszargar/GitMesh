@@ -7,6 +7,7 @@ Currently implemented:
 - `HashAlgorithm`
 - `CidKind`
 - typed `Cid`
+- strict full-text `Cid` parsing for `gitmesh:v0:<kind>:<hash>:<digest>`
 - `ProtocolEnvelope`
 - domain-separated encrypted segment and shard CID helpers
 
