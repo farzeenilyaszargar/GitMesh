@@ -977,6 +977,23 @@ impl InMemoryAvailabilityDirectory {
             .map(|entry| &entry.provider)
     }
 
+    pub fn prune_expired(&mut self, now_unix: u64) -> usize {
+        let mut removed = 0_usize;
+        let mut empty_segments = Vec::new();
+        for (segment_cid, records) in &mut self.records_by_segment {
+            let before = records.len();
+            records.retain(|entry| entry.provider.is_active_at(now_unix));
+            removed += before - records.len();
+            if records.is_empty() {
+                empty_segments.push(*segment_cid);
+            }
+        }
+        for segment_cid in empty_segments {
+            self.records_by_segment.remove(&segment_cid);
+        }
+        removed
+    }
+
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, NetworkError> {
         let path = path.as_ref();
         if !path.exists() {
@@ -2106,6 +2123,28 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].lease_epoch, 2);
         assert_eq!(records[0].expires_at_unix, 200);
+    }
+
+    #[test]
+    fn availability_directory_prunes_expired_provider_records() {
+        let segment = cid(CidKind::EncryptedSegment, 1);
+        let mut directory = InMemoryAvailabilityDirectory::default();
+        directory
+            .publish(provider(segment, 0, "peer-a", "op-a", 100))
+            .unwrap();
+        directory
+            .publish(provider(segment, 1, "peer-b", "op-b", 300))
+            .unwrap();
+
+        let removed = directory.prune_expired(150);
+
+        assert_eq!(removed, 1);
+        let records = directory.active_records_for_segment(segment, 150);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].peer_id, PeerId::new("peer-b").unwrap());
+        let snapshot = directory.to_snapshot();
+        assert!(!snapshot.contains("peer-a"));
+        assert!(snapshot.contains("peer-b"));
     }
 
     #[test]

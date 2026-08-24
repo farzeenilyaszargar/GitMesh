@@ -1479,6 +1479,23 @@ fn daemon(args: &[String]) -> Result<(), GmError> {
             );
             Ok(())
         }
+        Some("network-provider-prune-expired") => {
+            let socket_path = args.get(1).map_or_else(default_socket_path, Into::into);
+            let command = match args.get(2) {
+                Some(now_unix) => {
+                    now_unix.parse::<u64>().map_err(|_| {
+                        GmError::InvalidArguments(
+                            "daemon network-provider-prune-expired timestamp must be a u64"
+                                .to_string(),
+                        )
+                    })?;
+                    format!("NETWORK_PROVIDER_PRUNE_EXPIRED {now_unix}")
+                }
+                None => "NETWORK_PROVIDER_PRUNE_EXPIRED".to_string(),
+            };
+            println!("{}", request_unix_socket(socket_path, &command)?);
+            Ok(())
+        }
         Some(command) => Err(GmError::UnknownCommand(format!("daemon {command}"))),
     }
 }
@@ -2283,6 +2300,7 @@ fn print_help() {
         "  daemon network-provider-publish [socket] <segment-cid> <shard-cid> <shard-index> <peer-id> <operator-id> <region> <roles-csv> <lease-epoch> <expires-at>"
     );
     println!("  daemon network-provider-find [socket] <segment-cid>");
+    println!("  daemon network-provider-prune-expired [socket] [now-unix]");
     println!("  policy show [socket]");
     println!("  policy require-signed [socket] <true|false>");
     println!("  policy storage-show [socket]");

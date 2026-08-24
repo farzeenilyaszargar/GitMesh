@@ -215,6 +215,10 @@ provider_find_response="$(run_gm daemon network-provider-find "$SOCKET_PATH" "$p
 expect_contains "$provider_find_response" "count=1"
 expect_contains "$provider_find_response" "storage-a"
 expect_contains "$provider_find_response" "$provider_shard"
+provider_prune_response="$(run_gm daemon network-provider-prune-expired "$SOCKET_PATH" "$((provider_expires + 1))")"
+expect_contains "$provider_prune_response" "pruned=1"
+provider_find_after_prune="$(run_gm daemon network-provider-find "$SOCKET_PATH" "$provider_segment")"
+expect_contains "$provider_find_after_prune" "count=0"
 
 gm_issue_response="$(run_gm issue create "CLI issue" "verifies gm writes" "cli,collaboration")"
 expect_contains "$gm_issue_response" "OK event="

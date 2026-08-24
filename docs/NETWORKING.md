@@ -78,6 +78,11 @@ stored signature before the record re-enters the active directory view. Older
 unsigned local-development records remain parseable, but they are compatibility
 evidence rather than production-grade lease authority.
 
+Availability directories support explicit expired-record pruning. Pruning
+removes records whose lease expiry is not active at the prune timestamp and
+rewrites the directory snapshot without empty segment buckets; repair workers
+then operate from the remaining active evidence.
+
 ## Retrieval
 
 Clients rank providers by locality, historical success, latency, bandwidth,

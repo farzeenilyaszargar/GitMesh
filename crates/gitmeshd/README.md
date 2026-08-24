@@ -72,6 +72,7 @@ The socket protocol is a V0 line protocol over Unix domain sockets:
 - `NETWORK_PEER_LIST`
 - `NETWORK_PROVIDER_PUBLISH_SIGNED <segment-cid> <shard-cid> <shard-index> <peer-id> <operator-id> <region> <roles-csv> <lease-epoch> <expires-at> <label-hex> <account-key-hex> <device-key-hex> <cert-signature-hex> <provider-signature-hex>`
 - `NETWORK_PROVIDER_FIND <segment-cid>`
+- `NETWORK_PROVIDER_PRUNE_EXPIRED [now-unix]`
 - `STORAGE_POLICY_SHOW`
 - `STORAGE_POLICY_SET <data-shards> <parity-shards> <min-operators> <min-regions>`
 - `REPO_STATUS`
@@ -88,6 +89,10 @@ compatibility.
 local store. Existing objects are encoded with the current shard layout, so
 changing the policy after object ingest is rejected until a future migration
 flow can re-pack and re-place stored objects safely.
+
+`NETWORK_PROVIDER_PRUNE_EXPIRED` removes expired provider leases from the local
+availability directory and rewrites the availability snapshot, keeping the
+directory bounded while active records remain discoverable.
 
 `NETWORK_REPAIR_PROOF` is a Git-object-level backend proof for the current P2P
 storage spine. It stores a blob as encrypted erasure-coded shards, publishes

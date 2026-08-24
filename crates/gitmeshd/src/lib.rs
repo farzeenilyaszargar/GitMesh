@@ -566,6 +566,14 @@ impl DaemonState {
             return self.network_provider_find(rest);
         }
 
+        if trimmed == "NETWORK_PROVIDER_PRUNE_EXPIRED" {
+            return self.network_provider_prune_expired("");
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("NETWORK_PROVIDER_PRUNE_EXPIRED ") {
+            return self.network_provider_prune_expired(rest);
+        }
+
         if trimmed == "NETWORK_PEER_LIST" {
             return Ok(DaemonResponse::Ok(format_network_peer_list(&self.network)));
         }
@@ -1567,6 +1575,20 @@ impl DaemonState {
             .availability
             .active_records_for_segment(segment_cid, network_now_unix()?);
         Ok(DaemonResponse::Ok(format_provider_records(&providers)))
+    }
+
+    fn network_provider_prune_expired(&mut self, rest: &str) -> Result<DaemonResponse> {
+        let now_unix = if rest.trim().is_empty() {
+            network_now_unix()?
+        } else {
+            parse_u64_arg(rest.trim(), "prune timestamp")?
+        };
+        let removed = self.availability.prune_expired(now_unix);
+        self.save_availability()?;
+        Ok(DaemonResponse::Ok(format!(
+            "pruned={} now_unix={}",
+            removed, now_unix
+        )))
     }
 
     fn publish_local_provider_records_for_object(
@@ -3244,6 +3266,72 @@ mod tests {
         assert!(providers.contains("count=1"));
         assert!(providers.contains("storage-a"));
         assert!(providers.contains(&shard_cid.to_string()));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn network_provider_prune_expired_compacts_persisted_directory() {
+        let path = std::env::temp_dir().join(format!(
+            "gitmeshd-availability-{}-{}.tsv",
+            std::process::id(),
+            "prune"
+        ));
+        let mut state = DaemonState::with_every_store_path(DaemonStorePaths {
+            availability_store_path: Some(path.clone()),
+            ..DaemonStorePaths::default()
+        })
+        .unwrap();
+        let segment_cid = Cid::from_digest(
+            CidKind::EncryptedSegment,
+            HashAlgorithm::Blake3_256,
+            [8; 32],
+        );
+        let expired_shard = Cid::from_digest(CidKind::Shard, HashAlgorithm::Blake3_256, [9; 32]);
+        let active_shard = Cid::from_digest(CidKind::Shard, HashAlgorithm::Blake3_256, [10; 32]);
+        let now = network_now_unix().unwrap();
+        for (index, shard_cid, expires_at) in [
+            (0, expired_shard, now.saturating_sub(10)),
+            (1, active_shard, now + 600),
+        ] {
+            state
+                .availability
+                .publish(
+                    ShardProviderRecord::new(
+                        ShardRef {
+                            segment_cid,
+                            shard_cid,
+                            shard_index: index,
+                        },
+                        PeerId::new(format!("storage-{index}")).unwrap(),
+                        OperatorId::new(format!("operator-{index}")).unwrap(),
+                        "sfo",
+                        parse_node_roles("storage").unwrap(),
+                        ProviderLease::new(1, expires_at).unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        state.save_availability().unwrap();
+
+        let command = format!("NETWORK_PROVIDER_PRUNE_EXPIRED {now}");
+        let response = state.handle_command(&command).unwrap().into_line();
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        let mut restored = DaemonState::with_every_store_path(DaemonStorePaths {
+            availability_store_path: Some(path.clone()),
+            ..DaemonStorePaths::default()
+        })
+        .unwrap();
+        let providers = restored
+            .handle_command(&format!("NETWORK_PROVIDER_FIND {segment_cid}"))
+            .unwrap()
+            .into_line();
+
+        assert_eq!(response, format!("OK pruned=1 now_unix={now}"));
+        assert!(!persisted.contains("storage-0"));
+        assert!(persisted.contains("storage-1"));
+        assert!(providers.contains("count=1"));
+        assert!(providers.contains(&active_shard.to_string()));
         let _ = fs::remove_file(path);
     }
 
