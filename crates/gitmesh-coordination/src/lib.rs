@@ -634,9 +634,9 @@ impl RefStore {
                 "checkpoint\t{}\t{}\t{}\t{}\t{}\n",
                 checkpoint.sequence,
                 format_optional_cid(checkpoint.parent),
-                checkpoint.refs_root.as_hex(),
-                checkpoint.history_root.as_hex(),
-                checkpoint.checkpoint_cid.as_hex()
+                checkpoint.refs_root,
+                checkpoint.history_root,
+                checkpoint.checkpoint_cid
             ));
         }
         if let Some(parent) = path.parent() {
@@ -732,9 +732,9 @@ impl RefStore {
                     }
                     let sequence = parse_u64(parts[1])?;
                     let parent = parse_optional_cid(parts[2])?;
-                    let refs_root = protocol_cid_from_hex(parts[3])?;
-                    let history_root = protocol_cid_from_hex(parts[4])?;
-                    let checkpoint_cid = protocol_cid_from_hex(parts[5])?;
+                    let refs_root = protocol_cid_from_text(parts[3])?;
+                    let history_root = protocol_cid_from_text(parts[4])?;
+                    let checkpoint_cid = protocol_cid_from_text(parts[5])?;
                     let checkpoint = RefCheckpoint {
                         sequence,
                         parent,
@@ -844,20 +844,32 @@ fn parse_optional_cid(value: &str) -> Result<Option<Cid>, CoordinationError> {
     if value == "none" {
         Ok(None)
     } else {
-        protocol_cid_from_hex(value).map(Some)
+        protocol_cid_from_text(value).map(Some)
     }
 }
 
 fn format_optional_cid(cid: Option<Cid>) -> String {
-    cid.map_or_else(|| "none".to_string(), Cid::as_hex)
+    cid.map_or_else(|| "none".to_string(), |cid| cid.to_string())
 }
 
-fn protocol_cid_from_hex(value: &str) -> Result<Cid, CoordinationError> {
-    Ok(Cid::from_digest(
-        CidKind::ProtocolObject,
-        HashAlgorithm::Blake3_256,
-        parse_digest(value)?,
-    ))
+fn protocol_cid_from_text(value: &str) -> Result<Cid, CoordinationError> {
+    if value.starts_with("gitmesh:") {
+        let cid = value
+            .parse::<Cid>()
+            .map_err(|_| CoordinationError::InvalidSnapshot)?;
+        if cid.kind() != CidKind::ProtocolObject
+            || cid.hash_algorithm() != HashAlgorithm::Blake3_256
+        {
+            return Err(CoordinationError::InvalidSnapshot);
+        }
+        Ok(cid)
+    } else {
+        Ok(Cid::from_digest(
+            CidKind::ProtocolObject,
+            HashAlgorithm::Blake3_256,
+            parse_digest(value)?,
+        ))
+    }
 }
 
 fn parse_digest(value: &str) -> Result<[u8; 32], CoordinationError> {
@@ -1521,6 +1533,7 @@ mod tests {
         let mut snapshot_path = std::env::temp_dir();
         snapshot_path.push(format!("gitmesh-ref-store-test-{}.txt", std::process::id()));
         store.save_to_path(&snapshot_path).unwrap();
+        let snapshot = fs::read_to_string(&snapshot_path).unwrap();
 
         let mut restored = RefStore::load_from_path(&snapshot_path).unwrap();
         let retry = restored.apply(update("tx1", None, Some(oid(1))));
@@ -1533,6 +1546,7 @@ mod tests {
         assert_eq!(restored.mutation_count(), 1);
         assert_eq!(restored.checkpoint_count(), 1);
         assert_eq!(restored.latest_checkpoint(), store.latest_checkpoint());
+        assert!(snapshot.contains("gitmesh:v0:ProtocolObject:Blake3_256:"));
         let _ = fs::remove_file(snapshot_path);
     }
 

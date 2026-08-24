@@ -276,7 +276,7 @@ impl CollaborationEventStore {
         for event in &self.events {
             out.push_str(&format!(
                 "event\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-                event.event_id.as_hex(),
+                event.event_id,
                 encode_text(&event.repo),
                 event.kind.label(),
                 encode_text(&event.actor),
@@ -612,7 +612,7 @@ fn encode_parents(parents: &[Cid]) -> String {
     }
     parents
         .iter()
-        .map(|parent| parent.as_hex())
+        .map(|parent| parent.to_string())
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -625,11 +625,23 @@ fn decode_parents(value: &str) -> Result<Vec<Cid>, CollaborationError> {
 }
 
 fn parse_protocol_cid_digest(value: &str) -> Result<Cid, CollaborationError> {
-    Ok(Cid::from_digest(
-        CidKind::ProtocolObject,
-        HashAlgorithm::Blake3_256,
-        decode_fixed_hex::<32>(value)?,
-    ))
+    if value.starts_with("gitmesh:") {
+        let cid = value
+            .parse::<Cid>()
+            .map_err(|_| CollaborationError::InvalidSnapshot)?;
+        if cid.kind() != CidKind::ProtocolObject
+            || cid.hash_algorithm() != HashAlgorithm::Blake3_256
+        {
+            return Err(CollaborationError::InvalidSnapshot);
+        }
+        Ok(cid)
+    } else {
+        Ok(Cid::from_digest(
+            CidKind::ProtocolObject,
+            HashAlgorithm::Blake3_256,
+            decode_fixed_hex::<32>(value)?,
+        ))
+    }
 }
 
 fn parse_u64(value: &str) -> Result<u64, CollaborationError> {
@@ -762,6 +774,7 @@ mod tests {
         let tampered = snapshot.replacen("50657273697374", "54616d7065726564", 1);
 
         assert_eq!(restored, store);
+        assert!(snapshot.contains("gitmesh:v0:ProtocolObject:Blake3_256:"));
         assert!(CollaborationEventStore::from_snapshot(&tampered).is_err());
     }
 

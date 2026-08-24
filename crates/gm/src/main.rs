@@ -978,11 +978,25 @@ fn parse_pr_list_response(
 }
 
 fn parse_protocol_cid_digest(value: &str) -> Result<Cid, GmError> {
-    Ok(Cid::from_digest(
-        CidKind::ProtocolObject,
-        HashAlgorithm::Blake3_256,
-        decode_fixed_hex::<32>(value)?,
-    ))
+    if value.starts_with("gitmesh:") {
+        let cid = value
+            .parse::<Cid>()
+            .map_err(|_| GmError::InvalidArguments("invalid GitMesh CID".to_string()))?;
+        if cid.kind() != CidKind::ProtocolObject
+            || cid.hash_algorithm() != HashAlgorithm::Blake3_256
+        {
+            return Err(GmError::InvalidArguments(
+                "expected protocol-object CID".to_string(),
+            ));
+        }
+        Ok(cid)
+    } else {
+        Ok(Cid::from_digest(
+            CidKind::ProtocolObject,
+            HashAlgorithm::Blake3_256,
+            decode_fixed_hex::<32>(value)?,
+        ))
+    }
 }
 
 fn decode_hex_text(value: &str) -> Result<String, GmError> {
