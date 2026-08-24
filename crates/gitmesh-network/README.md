@@ -12,6 +12,7 @@ Currently implemented:
 - `ShardRef`
 - `ShardEnvelope`
 - `ShardProviderRecord`
+- `SignedShardProviderRecord`
 - `NodeAnnouncement`
 - `SignedNodeAnnouncement`
 - `KnownPeerRecord`
@@ -40,6 +41,7 @@ The in-memory swarm supports:
 - storage-role enforcement for shard writes
 - shard integrity verification before store/fetch success
 - provider publication and lease expiry
+- signed provider records with device-certificate verification and expiry
 - provider discovery through the availability protocol
 - placement across qualified storage peers with operator and region constraints
 - transport-level provider publish/discover flows from `gitmesh-storage`

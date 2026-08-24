@@ -706,6 +706,66 @@ impl ShardProviderRecord {
     pub fn counts_for_durability(&self) -> bool {
         self.roles.contains(&NodeRole::Storage)
     }
+
+    pub fn signing_transcript(&self) -> Vec<u8> {
+        let mut transcript = Vec::new();
+        put_transcript_field(&mut transcript, b"gitmesh.network.shard-provider-record.v0");
+        put_transcript_field(&mut transcript, self.segment_cid.to_string().as_bytes());
+        put_transcript_field(&mut transcript, self.shard_cid.to_string().as_bytes());
+        transcript.extend_from_slice(&(self.shard_index as u64).to_be_bytes());
+        put_transcript_field(&mut transcript, self.peer_id.as_str().as_bytes());
+        put_transcript_field(&mut transcript, self.operator_id.as_str().as_bytes());
+        put_transcript_field(&mut transcript, format_roles(&self.roles).as_bytes());
+        transcript.extend_from_slice(&self.lease_epoch.to_be_bytes());
+        transcript.extend_from_slice(&self.expires_at_unix.to_be_bytes());
+        transcript
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignedShardProviderRecord {
+    pub record: ShardProviderRecord,
+    pub certificate: DeviceCertificate,
+    pub signature: [u8; 64],
+}
+
+impl SignedShardProviderRecord {
+    pub fn sign(
+        record: ShardProviderRecord,
+        certificate: DeviceCertificate,
+        device: &DeviceKey,
+    ) -> Result<Self, NetworkError> {
+        if certificate.device_id != device.device_id() {
+            return Err(NetworkError::ProviderRecordSignerMismatch);
+        }
+        let signature = device.sign(&record.signing_transcript());
+        Ok(Self {
+            record,
+            certificate,
+            signature,
+        })
+    }
+
+    pub fn new(
+        record: ShardProviderRecord,
+        certificate: DeviceCertificate,
+        signature: [u8; 64],
+    ) -> Self {
+        Self {
+            record,
+            certificate,
+            signature,
+        }
+    }
+
+    pub fn verify(&self, now_unix: u64) -> Result<(), NetworkError> {
+        if !self.record.is_active_at(now_unix) {
+            return Err(NetworkError::ExpiredProviderRecord);
+        }
+        self.certificate
+            .verify_device_signature(&self.record.signing_transcript(), &self.signature)?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -734,6 +794,15 @@ impl InMemoryAvailabilityDirectory {
             records.push(record);
         }
         Ok(())
+    }
+
+    pub fn publish_signed(
+        &mut self,
+        signed: &SignedShardProviderRecord,
+        now_unix: u64,
+    ) -> Result<(), NetworkError> {
+        signed.verify(now_unix)?;
+        self.publish(signed.record.clone())
     }
 
     pub fn active_records_for_segment(
@@ -1272,6 +1341,10 @@ pub enum NetworkError {
     AnnouncementSignerMismatch,
     #[error("node announcement is expired or not yet valid")]
     ExpiredNodeAnnouncement,
+    #[error("provider record signer does not match certificate")]
+    ProviderRecordSignerMismatch,
+    #[error("provider record is expired")]
+    ExpiredProviderRecord,
     #[error("identity verification failed: {0}")]
     Identity(#[from] IdentityError),
     #[error("invalid provider record")]
@@ -1763,5 +1836,64 @@ mod tests {
         let err = signed.verify(200).unwrap_err();
 
         assert_eq!(err, NetworkError::ExpiredNodeAnnouncement);
+    }
+
+    #[test]
+    fn signed_provider_record_publishes_after_verification() {
+        let account = gitmesh_identity::AccountRootKey::generate();
+        let device = gitmesh_identity::DeviceKey::generate();
+        let certificate = account.certify_device(&device, "storage-provider");
+        let segment = cid(CidKind::EncryptedSegment, 1);
+        let record = provider(segment, 0, "storage-a", "operator-a", 500);
+        let signed = SignedShardProviderRecord::sign(record.clone(), certificate, &device).unwrap();
+        let mut directory = InMemoryAvailabilityDirectory::default();
+
+        directory.publish_signed(&signed, 100).unwrap();
+
+        assert_eq!(
+            directory.active_records_for_segment(segment, 100),
+            vec![record]
+        );
+        assert_eq!(directory.durable_shard_count(segment, 100), 1);
+    }
+
+    #[test]
+    fn signed_provider_record_rejects_tampering() {
+        let account = gitmesh_identity::AccountRootKey::generate();
+        let device = gitmesh_identity::DeviceKey::generate();
+        let certificate = account.certify_device(&device, "storage-provider");
+        let segment = cid(CidKind::EncryptedSegment, 1);
+        let mut signed = SignedShardProviderRecord::sign(
+            provider(segment, 0, "storage-a", "operator-a", 500),
+            certificate,
+            &device,
+        )
+        .unwrap();
+        signed.record.lease_epoch = 2;
+
+        let err = signed.verify(100).unwrap_err();
+
+        assert!(matches!(
+            err,
+            NetworkError::Identity(gitmesh_identity::IdentityError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn signed_provider_record_rejects_expired_records() {
+        let account = gitmesh_identity::AccountRootKey::generate();
+        let device = gitmesh_identity::DeviceKey::generate();
+        let certificate = account.certify_device(&device, "storage-provider");
+        let segment = cid(CidKind::EncryptedSegment, 1);
+        let signed = SignedShardProviderRecord::sign(
+            provider(segment, 0, "storage-a", "operator-a", 500),
+            certificate,
+            &device,
+        )
+        .unwrap();
+
+        let err = signed.verify(500).unwrap_err();
+
+        assert_eq!(err, NetworkError::ExpiredProviderRecord);
     }
 }

@@ -7,7 +7,7 @@ durability, availability, verification, detection, and recovery properties.
 
 | Threat | Asset | Attacker capability | Attack | Mitigation | Remaining risk | Detection | Recovery |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Malicious storage peer | Shards | Stores or serves bytes | Delete, corrupt, withhold | CIDs, shard hashes, erasure coding, leases, audits | Availability loss if many independent peers fail | Audit failures, retrieval failures | Repair from `k` healthy shards |
+| Malicious storage peer | Shards | Stores or serves bytes | Delete, corrupt, withhold | CIDs, shard hashes, erasure coding, signed leases, audits | Availability loss if many independent peers fail | Audit failures, retrieval failures | Repair from `k` healthy shards |
 | Malicious cache peer | Git objects/packs | Serves cached data | Serve stale or corrupt pack | Verify checkpoints, indexes, Git OIDs, segment hashes | DoS through bad responses | Cache error metrics | Retry other providers |
 | Malicious relay | Connectivity | Observes or drops traffic | Traffic analysis, selective DoS | End-to-end transport security, multiple relays | Metadata leakage | Relay failure/latency metrics | Direct/alternate relay paths |
 | Malicious gateway | Web access | Controls gateway responses | Rollback, omit refs, serve bad blobs | Browser/client verification of checkpoints and CIDs | UX degradation, DoS | Checkpoint gossip divergence | Switch gateways/direct access |

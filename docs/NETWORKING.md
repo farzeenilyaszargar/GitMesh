@@ -25,6 +25,14 @@ accepted after expiry. A peer registry may cache announcements locally, but the
 cached copy is not authority without signature, certificate, and freshness
 verification.
 
+## Provider Records
+
+Storage providers advertise shard availability with signed provider records.
+Each record binds the segment CID, shard CID, shard index, peer ID, operator ID,
+storage role set, lease epoch, and expiry time. Directories may cache these
+records, but clients verify signatures, expiry, shard CIDs, and placement policy
+before counting a shard toward durability.
+
 ## DHT Usage
 
 The DHT is not an application database. It is used for:
@@ -55,7 +63,8 @@ shard providers
 ```
 
 Availability records are signed and expire. Clients verify leases, shard CIDs,
-placement policy, and audit status before treating data as durable.
+provider signatures, placement policy, and audit status before treating data as
+durable.
 
 ## Retrieval
 
