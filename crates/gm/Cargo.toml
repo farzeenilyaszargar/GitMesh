@@ -12,5 +12,6 @@ gitmesh-core.workspace = true
 gitmesh-crypto.workspace = true
 gitmesh-git.workspace = true
 gitmesh-identity.workspace = true
+gitmesh-network.workspace = true
 gitmeshd.workspace = true
 thiserror.workspace = true

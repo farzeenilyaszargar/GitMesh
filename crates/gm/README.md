@@ -27,6 +27,8 @@ Implemented command families:
 - `gm daemon network-bootstrap [socket] <peer-id> <operator-id> <region> <multiaddr>`
 - `gm daemon network-peer-add [socket] <peer-id> <operator-id> <roles-csv> <region> <protocols-csv> <addresses-csv|->`
 - `gm daemon network-peer-list [socket]`
+- `gm daemon network-provider-publish [socket] <segment-cid> <shard-cid> <shard-index> <peer-id> <operator-id> <region> <roles-csv> <lease-epoch> <expires-at>`
+- `gm daemon network-provider-find [socket] <segment-cid>`
 - `gm ref list [socket]`
 - `gm ref get [socket] <ref>`
 - `gm ref update [socket] <tx> <ref> <expected|none> <new|delete> <signer>`

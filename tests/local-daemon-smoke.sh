@@ -180,6 +180,28 @@ gm_network_peers="$(run_gm daemon network-peer-list "$SOCKET_PATH")"
 expect_contains "$gm_network_peers" "bootstrap-a;operator-bootstrap"
 expect_contains "$gm_network_peers" "storage-a;operator-a"
 
+provider_segment="gitmesh:v0:EncryptedSegment:Blake3_256:1111111111111111111111111111111111111111111111111111111111111111"
+provider_shard="gitmesh:v0:Shard:Blake3_256:2222222222222222222222222222222222222222222222222222222222222222"
+provider_expires="$(( $(date +%s) + 600 ))"
+provider_publish_response="$(
+  run_gm daemon network-provider-publish \
+    "$SOCKET_PATH" \
+    "$provider_segment" \
+    "$provider_shard" \
+    0 \
+    storage-a \
+    operator-a \
+    sfo \
+    storage \
+    1 \
+    "$provider_expires"
+)"
+expect_contains "$provider_publish_response" "published=true"
+provider_find_response="$(run_gm daemon network-provider-find "$SOCKET_PATH" "$provider_segment")"
+expect_contains "$provider_find_response" "count=1"
+expect_contains "$provider_find_response" "storage-a"
+expect_contains "$provider_find_response" "$provider_shard"
+
 gm_issue_response="$(run_gm issue create "CLI issue" "verifies gm writes" "cli,collaboration")"
 expect_contains "$gm_issue_response" "OK event="
 expect_contains "$gm_issue_response" "number=2"

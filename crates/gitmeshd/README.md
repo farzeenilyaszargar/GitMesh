@@ -70,6 +70,8 @@ The socket protocol is a V0 line protocol over Unix domain sockets:
 - `NETWORK_BOOTSTRAP <peer-id> <operator-id> <region> <multiaddr>`
 - `NETWORK_PEER_ADD <peer-id> <operator-id> <roles-csv> <region> <protocols-csv> <addresses-csv|->`
 - `NETWORK_PEER_LIST`
+- `NETWORK_PROVIDER_PUBLISH_SIGNED <segment-cid> <shard-cid> <shard-index> <peer-id> <operator-id> <region> <roles-csv> <lease-epoch> <expires-at> <label-hex> <account-key-hex> <device-key-hex> <cert-signature-hex> <provider-signature-hex>`
+- `NETWORK_PROVIDER_FIND <segment-cid>`
 - `REPO_STATUS`
 
 The optional store paths persist canonical Git object storage state and

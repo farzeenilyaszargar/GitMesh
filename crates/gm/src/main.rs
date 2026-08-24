@@ -17,6 +17,10 @@ use gitmesh_core::{Cid, CidKind, HashAlgorithm, hex};
 use gitmesh_crypto::RepoContentKey;
 use gitmesh_git::{GitObjectKind, GitSha1Oid, parse_loose_object, parse_packfile};
 use gitmesh_identity::{AccountRootKey, DevIdentity, DeviceKey, short_id};
+use gitmesh_network::{
+    OperatorId, PeerId, ProviderLease, ShardProviderRecord, ShardRef, SignedShardProviderRecord,
+    parse_node_roles,
+};
 use gitmeshd::{default_socket_path, request_unix_socket};
 use thiserror::Error;
 
@@ -211,6 +215,52 @@ impl LocalIdentity {
             checkpoint.refs_root,
             checkpoint.history_root,
             checkpoint.checkpoint_cid,
+            hex(self.certificate.label.as_bytes()),
+            hex(&self.certificate.account_verifying_key),
+            hex(&self.certificate.device_verifying_key),
+            hex(&self.certificate.signature),
+            hex(&signed.signature)
+        ))
+    }
+
+    fn signed_provider_publish_command(&self, args: &[String]) -> Result<String, GmError> {
+        let record = ShardProviderRecord::new(
+            ShardRef {
+                segment_cid: parse_cid_with_kind(&args[0], CidKind::EncryptedSegment)?,
+                shard_cid: parse_cid_with_kind(&args[1], CidKind::Shard)?,
+                shard_index: args[2].parse::<usize>().map_err(|_| {
+                    GmError::InvalidArguments("shard index must be a positive integer".to_string())
+                })?,
+            },
+            PeerId::new(&args[3])?,
+            OperatorId::new(&args[4])?,
+            &args[5],
+            parse_node_roles(&args[6])?,
+            ProviderLease::new(
+                args[7].parse::<u64>().map_err(|_| {
+                    GmError::InvalidArguments("lease epoch must be a u64".to_string())
+                })?,
+                args[8].parse::<u64>().map_err(|_| {
+                    GmError::InvalidArguments("provider expiry must be a u64".to_string())
+                })?,
+            )?,
+        )?;
+        let signed = SignedShardProviderRecord::sign(
+            record.clone(),
+            self.certificate.clone(),
+            &self.device,
+        )?;
+        Ok(format!(
+            "NETWORK_PROVIDER_PUBLISH_SIGNED {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+            record.segment_cid,
+            record.shard_cid,
+            record.shard_index,
+            record.peer_id,
+            record.operator_id,
+            record.region,
+            args[6],
+            record.lease_epoch,
+            record.expires_at_unix,
             hex(self.certificate.label.as_bytes()),
             hex(&self.certificate.account_verifying_key),
             hex(&self.certificate.device_verifying_key),
@@ -1034,19 +1084,26 @@ fn parse_pr_list_response(
 }
 
 fn parse_protocol_cid_digest(value: &str) -> Result<Cid, GmError> {
+    parse_cid_with_kind(value, CidKind::ProtocolObject)
+}
+
+fn parse_cid_with_kind(value: &str, expected_kind: CidKind) -> Result<Cid, GmError> {
     if value.starts_with("gitmesh:") {
         let cid = value
             .parse::<Cid>()
             .map_err(|_| GmError::InvalidArguments("invalid GitMesh CID".to_string()))?;
-        if cid.kind() != CidKind::ProtocolObject
-            || cid.hash_algorithm() != HashAlgorithm::Blake3_256
-        {
-            return Err(GmError::InvalidArguments(
-                "expected protocol-object CID".to_string(),
-            ));
+        if cid.kind() != expected_kind || cid.hash_algorithm() != HashAlgorithm::Blake3_256 {
+            return Err(GmError::InvalidArguments(format!(
+                "expected {expected_kind:?} CID"
+            )));
         }
         Ok(cid)
     } else {
+        if expected_kind != CidKind::ProtocolObject {
+            return Err(GmError::InvalidArguments(
+                "full GitMesh CID is required for non-protocol CIDs".to_string(),
+            ));
+        }
         Ok(Cid::from_digest(
             CidKind::ProtocolObject,
             HashAlgorithm::Blake3_256,
@@ -1387,6 +1444,39 @@ fn daemon(args: &[String]) -> Result<(), GmError> {
         Some("network-peer-list") => {
             let socket_path = args.get(1).map_or_else(default_socket_path, Into::into);
             println!("{}", request_unix_socket(socket_path, "NETWORK_PEER_LIST")?);
+            Ok(())
+        }
+        Some("network-provider-publish") => {
+            let socket_path = args.get(1).map_or_else(default_socket_path, Into::into);
+            let rest = args.iter().skip(2).cloned().collect::<Vec<_>>();
+            if rest.len() != 9 {
+                return Err(GmError::InvalidArguments(
+                    "daemon network-provider-publish requires <segment-cid> <shard-cid> <shard-index> <peer-id> <operator-id> <region> <roles-csv> <lease-epoch> <expires-at>"
+                        .to_string(),
+                ));
+            }
+            let identity = LocalIdentity::load_or_create_default()?;
+            println!(
+                "{}",
+                request_unix_socket(
+                    socket_path,
+                    &identity.signed_provider_publish_command(&rest)?
+                )?
+            );
+            Ok(())
+        }
+        Some("network-provider-find") => {
+            let socket_path = args.get(1).map_or_else(default_socket_path, Into::into);
+            let segment_cid = args.get(2).ok_or_else(|| {
+                GmError::InvalidArguments(
+                    "daemon network-provider-find requires a segment CID".to_string(),
+                )
+            })?;
+            parse_cid_with_kind(segment_cid, CidKind::EncryptedSegment)?;
+            println!(
+                "{}",
+                request_unix_socket(socket_path, &format!("NETWORK_PROVIDER_FIND {segment_cid}"))?
+            );
             Ok(())
         }
         Some(command) => Err(GmError::UnknownCommand(format!("daemon {command}"))),
@@ -2126,6 +2216,10 @@ fn print_help() {
         "  daemon network-peer-add [socket] <peer-id> <operator-id> <roles-csv> <region> <protocols-csv> <addresses-csv|->"
     );
     println!("  daemon network-peer-list [socket]");
+    println!(
+        "  daemon network-provider-publish [socket] <segment-cid> <shard-cid> <shard-index> <peer-id> <operator-id> <region> <roles-csv> <lease-epoch> <expires-at>"
+    );
+    println!("  daemon network-provider-find [socket] <segment-cid>");
     println!("  policy show [socket]");
     println!("  policy require-signed [socket] <true|false>");
     println!("  policy grant-writer [socket] <account-cid>");
@@ -2190,6 +2284,8 @@ enum GmError {
     Collaboration(#[from] gitmesh_collaboration::CollaborationError),
     #[error(transparent)]
     Git(#[from] gitmesh_git::GitError),
+    #[error(transparent)]
+    Network(#[from] gitmesh_network::NetworkError),
     #[error("daemon returned an error response: {0}")]
     DaemonResponse(String),
     #[error("git command failed: {0}")]
@@ -2343,6 +2439,35 @@ mod tests {
 
         let _ = fs::remove_file(path);
         let _ = fs::remove_dir(temp_dir);
+    }
+
+    #[test]
+    fn local_identity_signs_provider_records() {
+        let identity = LocalIdentity::create("provider-device".to_string());
+        let segment_cid = Cid::from_digest(
+            CidKind::EncryptedSegment,
+            HashAlgorithm::Blake3_256,
+            [1; 32],
+        );
+        let shard_cid = Cid::from_digest(CidKind::Shard, HashAlgorithm::Blake3_256, [2; 32]);
+        let command = identity
+            .signed_provider_publish_command(&args(&[
+                &segment_cid.to_string(),
+                &shard_cid.to_string(),
+                "0",
+                "storage-a",
+                "operator-a",
+                "sfo",
+                "storage",
+                "1",
+                "9999999999",
+            ]))
+            .unwrap();
+
+        assert!(command.starts_with("NETWORK_PROVIDER_PUBLISH_SIGNED "));
+        assert!(command.contains(&segment_cid.to_string()));
+        assert!(command.contains(&shard_cid.to_string()));
+        assert!(command.contains(" storage-a operator-a sfo storage 1 9999999999 "));
     }
 
     #[test]

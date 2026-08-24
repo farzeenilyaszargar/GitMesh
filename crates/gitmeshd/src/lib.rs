@@ -33,8 +33,9 @@ use gitmesh_identity::{
     AccountId, DeviceCertificate, DeviceId, IdentityError, RepoKeyGrant, RepoKeyGrantStore,
 };
 use gitmesh_network::{
-    AvailabilityRequirement, NetworkError, NetworkNodeStore, NodeDescriptor, OperatorId, PeerId,
-    now_unix as network_now_unix, parse_node_roles, parse_protocol_ids,
+    AvailabilityRequirement, InMemoryAvailabilityDirectory, NetworkError, NetworkNodeStore,
+    NodeDescriptor, OperatorId, PeerId, ProviderLease, ShardProviderRecord, ShardRef,
+    SignedShardProviderRecord, now_unix as network_now_unix, parse_node_roles, parse_protocol_ids,
 };
 use gitmesh_repository::{
     RepositoryError, RepositoryObjectAudit, RepositoryObjectStore, RepositoryRepairReport,
@@ -157,6 +158,7 @@ pub struct DaemonState {
     accounts: AccountStore,
     collaboration: CollaborationEventStore,
     network: NetworkNodeStore,
+    availability: InMemoryAvailabilityDirectory,
     object_store_path: Option<PathBuf>,
     ref_store_path: Option<PathBuf>,
     policy_store_path: Option<PathBuf>,
@@ -177,6 +179,7 @@ impl Default for DaemonState {
             accounts: AccountStore::default(),
             collaboration: CollaborationEventStore::default(),
             network: NetworkNodeStore::default(),
+            availability: InMemoryAvailabilityDirectory::default(),
             object_store_path: None,
             ref_store_path: None,
             policy_store_path: None,
@@ -303,6 +306,7 @@ impl DaemonState {
             } else {
                 NetworkNodeStore::default()
             },
+            availability: InMemoryAvailabilityDirectory::default(),
             object_store_path,
             ref_store_path,
             policy_store_path,
@@ -532,6 +536,14 @@ impl DaemonState {
 
         if let Some(rest) = trimmed.strip_prefix("NETWORK_PEER_ADD ") {
             return self.network_peer_add(rest);
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("NETWORK_PROVIDER_PUBLISH_SIGNED ") {
+            return self.network_provider_publish_signed(rest);
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("NETWORK_PROVIDER_FIND ") {
+            return self.network_provider_find(rest);
         }
 
         if trimmed == "NETWORK_PEER_LIST" {
@@ -1382,6 +1394,61 @@ impl DaemonState {
         )))
     }
 
+    fn network_provider_publish_signed(&mut self, rest: &str) -> Result<DaemonResponse> {
+        let parts = rest.split_whitespace().collect::<Vec<_>>();
+        if parts.len() != 14 {
+            return Err(DaemonError::InvalidCommand(
+                "NETWORK_PROVIDER_PUBLISH_SIGNED requires <segment-cid> <shard-cid> <shard-index> <peer-id> <operator-id> <region> <roles-csv> <lease-epoch> <expires-at> <label-hex> <account-key-hex> <device-key-hex> <cert-signature-hex> <provider-signature-hex>".to_string(),
+            ));
+        }
+        let record = ShardProviderRecord::new(
+            ShardRef {
+                segment_cid: parse_cid_with_kind(parts[0], CidKind::EncryptedSegment)?,
+                shard_cid: parse_cid_with_kind(parts[1], CidKind::Shard)?,
+                shard_index: parse_usize_arg(parts[2], "shard index")?,
+            },
+            PeerId::new(parts[3])?,
+            OperatorId::new(parts[4])?,
+            parts[5],
+            parse_node_roles(parts[6])?,
+            ProviderLease::new(
+                parse_u64_arg(parts[7], "lease epoch")?,
+                parse_u64_arg(parts[8], "provider expiry")?,
+            )?,
+        )?;
+        let certificate = DeviceCertificate::from_key_bytes(
+            decode_label(parts[9])?,
+            decode_fixed_hex::<32>(parts[10])?,
+            decode_fixed_hex::<32>(parts[11])?,
+            decode_fixed_hex::<64>(parts[12])?,
+        )?;
+        let signed = SignedShardProviderRecord::new(
+            record.clone(),
+            certificate,
+            decode_fixed_hex::<64>(parts[13])?,
+        );
+        self.availability
+            .publish_signed(&signed, network_now_unix()?)?;
+        Ok(DaemonResponse::Ok(format!(
+            "segment={} shard={} index={} peer={} operator={} lease_epoch={} expires_at={} published=true",
+            record.segment_cid,
+            record.shard_cid,
+            record.shard_index,
+            record.peer_id,
+            record.operator_id,
+            record.lease_epoch,
+            record.expires_at_unix
+        )))
+    }
+
+    fn network_provider_find(&self, rest: &str) -> Result<DaemonResponse> {
+        let segment_cid = parse_cid_with_kind(rest.trim(), CidKind::EncryptedSegment)?;
+        let providers = self
+            .availability
+            .active_records_for_segment(segment_cid, network_now_unix()?);
+        Ok(DaemonResponse::Ok(format_provider_records(&providers)))
+    }
+
     fn save_objects(&self) -> Result<()> {
         if let Some(path) = &self.object_store_path {
             self.objects.save_to_path(path)?;
@@ -1555,6 +1622,7 @@ fn requires_admin_auth(command: &str) -> bool {
                 | "NETWORK_LISTEN"
                 | "NETWORK_BOOTSTRAP"
                 | "NETWORK_PEER_ADD"
+                | "NETWORK_PROVIDER_PUBLISH_SIGNED"
         )
     )
 }
@@ -2079,6 +2147,12 @@ fn parse_unix_timestamp(value: &str) -> Result<u64> {
         .map_err(|_| DaemonError::InvalidCommand("timestamp must be a u64".to_string()))
 }
 
+fn parse_u64_arg(value: &str, name: &str) -> Result<u64> {
+    value
+        .parse()
+        .map_err(|_| DaemonError::InvalidCommand(format!("{name} must be a u64")))
+}
+
 fn parse_usize_arg(value: &str, name: &str) -> Result<usize> {
     value
         .parse()
@@ -2139,12 +2213,16 @@ fn parse_policy_identity(value: &str) -> Result<&str> {
 }
 
 fn parse_protocol_object_cid(value: &str) -> Result<Cid> {
+    parse_cid_with_kind(value, CidKind::ProtocolObject)
+}
+
+fn parse_cid_with_kind(value: &str, expected_kind: CidKind) -> Result<Cid> {
     let cid = Cid::from_str(value)
-        .map_err(|_| DaemonError::InvalidCommand("invalid GitMesh protocol CID".to_string()))?;
-    if cid.kind() != CidKind::ProtocolObject || cid.hash_algorithm() != HashAlgorithm::Blake3_256 {
-        return Err(DaemonError::InvalidCommand(
-            "expected protocol-object CID".to_string(),
-        ));
+        .map_err(|_| DaemonError::InvalidCommand("invalid GitMesh CID".to_string()))?;
+    if cid.kind() != expected_kind || cid.hash_algorithm() != HashAlgorithm::Blake3_256 {
+        return Err(DaemonError::InvalidCommand(format!(
+            "expected {expected_kind:?} CID"
+        )));
     }
     Ok(cid)
 }
@@ -2439,6 +2517,33 @@ fn format_network_peer_list(network: &NetworkNodeStore) -> String {
         })
         .collect::<Vec<_>>();
     format!("peers={} count={}", entries.join("|"), peers.len())
+}
+
+fn format_provider_records(providers: &[ShardProviderRecord]) -> String {
+    if providers.is_empty() {
+        return "providers=none count=0".to_string();
+    }
+    let entries = providers
+        .iter()
+        .map(|record| {
+            format!(
+                "{};{};{};{};{};{};{}",
+                record.shard_index,
+                record.shard_cid,
+                record.peer_id,
+                record.operator_id,
+                record.region,
+                record
+                    .roles
+                    .iter()
+                    .map(|role| role.as_str())
+                    .collect::<Vec<_>>()
+                    .join("+"),
+                record.expires_at_unix
+            )
+        })
+        .collect::<Vec<_>>();
+    format!("providers={} count={}", entries.join("|"), providers.len())
 }
 
 fn parse_network_addresses(value: &str) -> Result<Vec<String>> {
@@ -2776,6 +2881,14 @@ mod tests {
             .unwrap_err(),
             DaemonError::Unauthorized
         ));
+        assert!(matches!(
+            authorize_command(
+                &auth,
+                "NETWORK_PROVIDER_PUBLISH_SIGNED gitmesh:v0:EncryptedSegment:Blake3_256:1111111111111111111111111111111111111111111111111111111111111111 gitmesh:v0:Shard:Blake3_256:2222222222222222222222222222222222222222222222222222222222222222 0 storage-a operator-a sfo storage 1 999 00 1111111111111111111111111111111111111111111111111111111111111111 2222222222222222222222222222222222222222222222222222222222222222 33333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333 44444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444"
+            )
+            .unwrap_err(),
+            DaemonError::Unauthorized
+        ));
     }
 
     #[test]
@@ -2812,6 +2925,92 @@ mod tests {
         assert!(status.contains("storage_peers=1"));
         assert!(peers.contains("bootstrap-a;operator-bootstrap"));
         assert!(peers.contains("storage-a;operator-a"));
+    }
+
+    #[test]
+    fn network_provider_directory_accepts_signed_records() {
+        let mut state = DaemonState::default();
+        let segment_cid = Cid::from_digest(
+            CidKind::EncryptedSegment,
+            HashAlgorithm::Blake3_256,
+            [1; 32],
+        );
+        let shard_cid = Cid::from_digest(CidKind::Shard, HashAlgorithm::Blake3_256, [2; 32]);
+        let account = AccountRootKey::generate();
+        let device = DeviceKey::generate();
+        let certificate = account.certify_device(&device, "provider-device");
+        let record = ShardProviderRecord::new(
+            ShardRef {
+                segment_cid,
+                shard_cid,
+                shard_index: 0,
+            },
+            PeerId::new("storage-a").unwrap(),
+            OperatorId::new("operator-a").unwrap(),
+            "sfo",
+            parse_node_roles("storage").unwrap(),
+            ProviderLease::new(1, network_now_unix().unwrap() + 600).unwrap(),
+        )
+        .unwrap();
+        let signed = SignedShardProviderRecord::sign(record.clone(), certificate, &device).unwrap();
+        let publish = format!(
+            "NETWORK_PROVIDER_PUBLISH_SIGNED {} {} {} {} {} {} storage {} {} {} {} {} {} {}",
+            record.segment_cid,
+            record.shard_cid,
+            record.shard_index,
+            record.peer_id,
+            record.operator_id,
+            record.region,
+            record.lease_epoch,
+            record.expires_at_unix,
+            encode_hex(signed.certificate.label.as_bytes()),
+            encode_hex(&signed.certificate.account_verifying_key),
+            encode_hex(&signed.certificate.device_verifying_key),
+            encode_hex(&signed.certificate.signature),
+            encode_hex(&signed.signature)
+        );
+
+        let publish_response = state.handle_command(&publish).unwrap().into_line();
+        let find_response = state
+            .handle_command(&format!("NETWORK_PROVIDER_FIND {segment_cid}"))
+            .unwrap()
+            .into_line();
+
+        assert!(publish_response.contains("published=true"));
+        assert!(find_response.contains("count=1"));
+        assert!(find_response.contains("storage-a"));
+        assert!(find_response.contains(&shard_cid.to_string()));
+    }
+
+    #[test]
+    fn network_provider_directory_rejects_bad_signatures() {
+        let mut state = DaemonState::default();
+        let segment_cid = Cid::from_digest(
+            CidKind::EncryptedSegment,
+            HashAlgorithm::Blake3_256,
+            [3; 32],
+        );
+        let shard_cid = Cid::from_digest(CidKind::Shard, HashAlgorithm::Blake3_256, [4; 32]);
+        let account = AccountRootKey::generate();
+        let device = DeviceKey::generate();
+        let certificate = account.certify_device(&device, "provider-device");
+        let bad_signature = [5_u8; 64];
+        let command = format!(
+            "NETWORK_PROVIDER_PUBLISH_SIGNED {segment_cid} {shard_cid} 0 storage-a operator-a sfo storage 1 {} {} {} {} {} {}",
+            network_now_unix().unwrap() + 600,
+            encode_hex(certificate.label.as_bytes()),
+            encode_hex(&certificate.account_verifying_key),
+            encode_hex(&certificate.device_verifying_key),
+            encode_hex(&certificate.signature),
+            encode_hex(&bad_signature)
+        );
+
+        let err = state.handle_command(&command).unwrap_err();
+
+        assert!(matches!(
+            err,
+            DaemonError::Network(NetworkError::Identity(IdentityError::InvalidSignature))
+        ));
     }
 
     #[test]
