@@ -9,6 +9,7 @@ use std::fs;
 use std::path::Path;
 
 use gitmesh_core::{Cid, CidKind, CoreError, HashAlgorithm, ProtocolEnvelope, hex};
+use gitmesh_identity::{AccountId, DeviceCertificate, DeviceId, IdentityError};
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -133,6 +134,63 @@ impl CollaborationEvent {
             payload,
         })
     }
+
+    pub fn signing_transcript(&self) -> Vec<u8> {
+        let mut transcript = Vec::new();
+        transcript.extend_from_slice(b"gitmesh.v0.collaboration-event");
+        put_transcript_field(&mut transcript, self.event_id.to_string().as_bytes());
+        put_transcript_field(&mut transcript, self.repo.as_bytes());
+        put_transcript_field(&mut transcript, self.kind.label().as_bytes());
+        put_transcript_field(&mut transcript, self.actor.as_bytes());
+        transcript.extend_from_slice(&self.timestamp_unix.to_be_bytes());
+        transcript
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignedCollaborationEvent {
+    pub event: CollaborationEvent,
+    pub certificate: DeviceCertificate,
+    pub signature: [u8; 64],
+}
+
+impl SignedCollaborationEvent {
+    pub fn new(
+        event: CollaborationEvent,
+        certificate: DeviceCertificate,
+        signature: [u8; 64],
+    ) -> Self {
+        Self {
+            event,
+            certificate,
+            signature,
+        }
+    }
+
+    pub fn verify(self) -> Result<CollaborationEvent, CollaborationError> {
+        Ok(self.verify_with_identity()?.event)
+    }
+
+    pub fn verify_with_identity(self) -> Result<VerifiedCollaborationEvent, CollaborationError> {
+        let signer = self.certificate.device_id.as_cid().as_hex();
+        if self.event.actor != signer {
+            return Err(CollaborationError::SignerMismatch);
+        }
+        self.certificate
+            .verify_device_signature(&self.event.signing_transcript(), &self.signature)?;
+        Ok(VerifiedCollaborationEvent {
+            event: self.event,
+            account_id: self.certificate.account_id,
+            device_id: self.certificate.device_id,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedCollaborationEvent {
+    pub event: CollaborationEvent,
+    pub account_id: AccountId,
+    pub device_id: DeviceId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -402,10 +460,14 @@ pub enum CollaborationError {
     MissingPullRequestRefs,
     #[error("invalid collaboration snapshot")]
     InvalidSnapshot,
+    #[error("collaboration event actor does not match signer device")]
+    SignerMismatch,
     #[error("I/O failed: {0}")]
     Io(String),
     #[error(transparent)]
     Core(#[from] CoreError),
+    #[error(transparent)]
+    Identity(#[from] IdentityError),
 }
 
 impl From<std::io::Error> for CollaborationError {
@@ -498,6 +560,12 @@ fn put_bytes(out: &mut Vec<u8>, value: &[u8]) {
     let len = u32::try_from(value.len()).expect("collaboration field length fits u32");
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(value);
+}
+
+fn put_transcript_field(transcript: &mut Vec<u8>, value: &[u8]) {
+    let len = u32::try_from(value.len()).expect("collaboration transcript field fits u32");
+    transcript.extend_from_slice(&len.to_be_bytes());
+    transcript.extend_from_slice(value);
 }
 
 fn encode_text(value: &str) -> String {
@@ -604,6 +672,7 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gitmesh_identity::{AccountRootKey, DeviceKey};
 
     fn issue_event_with_parents(parents: Vec<Cid>) -> CollaborationEvent {
         CollaborationEvent::new(
@@ -711,6 +780,94 @@ mod tests {
 
         assert_eq!(restored.event_count(), 1);
         assert_eq!(restored.issue_summaries("farzeen/gitmesh")[0].number, 1);
+    }
+
+    #[test]
+    fn signed_event_verifies_certified_device_signature() {
+        let account = AccountRootKey::from_seed([11_u8; 32]);
+        let device = DeviceKey::from_seed([12_u8; 32]);
+        let certificate = account.certify_device(&device, "laptop");
+        let actor = certificate.device_id.as_cid().as_hex();
+        let event = CollaborationEvent::new(
+            "farzeen/gitmesh",
+            CollaborationEventKind::IssueOpened,
+            actor,
+            Vec::new(),
+            1_787_166_000,
+            CollaborationPayload::issue(
+                "Sign collaboration events",
+                "Bind issue events to a certified device key.",
+                vec!["protocol".to_string()],
+            ),
+        )
+        .unwrap();
+        let signature = device.sign(&event.signing_transcript());
+
+        let verified = SignedCollaborationEvent::new(event.clone(), certificate, signature)
+            .verify_with_identity()
+            .unwrap();
+
+        assert_eq!(verified.event, event);
+        assert_eq!(verified.device_id.as_cid().as_hex(), event.actor);
+    }
+
+    #[test]
+    fn signed_event_rejects_tampered_event_body() {
+        let account = AccountRootKey::from_seed([13_u8; 32]);
+        let device = DeviceKey::from_seed([14_u8; 32]);
+        let certificate = account.certify_device(&device, "laptop");
+        let actor = certificate.device_id.as_cid().as_hex();
+        let event = CollaborationEvent::new(
+            "farzeen/gitmesh",
+            CollaborationEventKind::IssueOpened,
+            actor.clone(),
+            Vec::new(),
+            1_787_166_000,
+            CollaborationPayload::issue("Original issue", "body", Vec::new()),
+        )
+        .unwrap();
+        let signature = device.sign(&event.signing_transcript());
+        let tampered = CollaborationEvent::new(
+            "farzeen/gitmesh",
+            CollaborationEventKind::IssueOpened,
+            actor,
+            Vec::new(),
+            1_787_166_000,
+            CollaborationPayload::issue("Tampered issue", "body", Vec::new()),
+        )
+        .unwrap();
+
+        let err = SignedCollaborationEvent::new(tampered, certificate, signature)
+            .verify()
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            CollaborationError::Identity(IdentityError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn signed_event_rejects_actor_signer_mismatch() {
+        let account = AccountRootKey::from_seed([15_u8; 32]);
+        let device = DeviceKey::from_seed([16_u8; 32]);
+        let certificate = account.certify_device(&device, "laptop");
+        let event = CollaborationEvent::new(
+            "farzeen/gitmesh",
+            CollaborationEventKind::IssueOpened,
+            "farzeen",
+            Vec::new(),
+            1_787_166_000,
+            CollaborationPayload::issue("Actor mismatch", "body", Vec::new()),
+        )
+        .unwrap();
+        let signature = device.sign(&event.signing_transcript());
+
+        let err = SignedCollaborationEvent::new(event, certificate, signature)
+            .verify()
+            .unwrap_err();
+
+        assert!(matches!(err, CollaborationError::SignerMismatch));
     }
 
     #[test]

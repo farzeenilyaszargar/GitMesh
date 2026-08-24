@@ -7,4 +7,5 @@ repository.workspace = true
 
 [dependencies]
 gitmesh-core.workspace = true
+gitmesh-identity.workspace = true
 thiserror.workspace = true
