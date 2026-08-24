@@ -78,6 +78,12 @@ stored signature before the record re-enters the active directory view. Older
 unsigned local-development records remain parseable, but they are compatibility
 evidence rather than production-grade lease authority.
 
+An unsigned provider update at the same or an older lease epoch cannot replace
+an existing signed provider record for the same shard/provider tuple. This keeps
+directory caches from silently downgrading verified lease evidence. A higher
+lease epoch may still replace older evidence during local-development
+compatibility flows until all directory writes are signed.
+
 Availability directories support explicit expired-record pruning. Pruning
 removes records whose lease expiry is not active at the prune timestamp and
 rewrites the directory snapshot without empty segment buckets; repair workers

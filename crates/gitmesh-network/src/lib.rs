@@ -910,7 +910,10 @@ impl InMemoryAvailabilityDirectory {
                 && existing.provider.peer_id == record.peer_id
                 && existing.provider.shard_index == record.shard_index
         }) {
-            if record.lease_epoch >= existing.provider.lease_epoch {
+            if record.lease_epoch > existing.provider.lease_epoch
+                || (record.lease_epoch == existing.provider.lease_epoch
+                    && existing.signed.is_none())
+            {
                 *existing = AvailabilityDirectoryRecord::unsigned(record);
             }
         } else {
@@ -2897,6 +2900,53 @@ mod tests {
             vec![record]
         );
         assert_eq!(restored.to_snapshot(), snapshot);
+    }
+
+    #[test]
+    fn unsigned_same_epoch_record_does_not_downgrade_signed_evidence() {
+        let account = gitmesh_identity::AccountRootKey::generate();
+        let device = gitmesh_identity::DeviceKey::generate();
+        let certificate = account.certify_device(&device, "storage-provider");
+        let segment = cid(CidKind::EncryptedSegment, 1);
+        let mut record = provider(segment, 0, "storage-a", "operator-a", 500);
+        record.lease_epoch = 2;
+        let signed = SignedShardProviderRecord::sign(record.clone(), certificate, &device).unwrap();
+        let mut unsigned = record.clone();
+        unsigned.expires_at_unix = 700;
+        let mut directory = InMemoryAvailabilityDirectory::default();
+
+        directory.publish_signed(&signed, 100).unwrap();
+        directory.publish(unsigned).unwrap();
+
+        let records = directory.active_records_for_segment(segment, 100);
+        assert_eq!(records, vec![record]);
+        let snapshot = directory.to_snapshot();
+        assert!(snapshot.contains("signed-provider"));
+        assert!(snapshot.contains(&hex(&signed.signature)));
+    }
+
+    #[test]
+    fn higher_epoch_unsigned_record_can_renew_compatibility_lease() {
+        let account = gitmesh_identity::AccountRootKey::generate();
+        let device = gitmesh_identity::DeviceKey::generate();
+        let certificate = account.certify_device(&device, "storage-provider");
+        let segment = cid(CidKind::EncryptedSegment, 1);
+        let mut record = provider(segment, 0, "storage-a", "operator-a", 500);
+        record.lease_epoch = 2;
+        let signed = SignedShardProviderRecord::sign(record.clone(), certificate, &device).unwrap();
+        let mut renewed = record.clone();
+        renewed.lease_epoch = 3;
+        renewed.expires_at_unix = 700;
+        let mut directory = InMemoryAvailabilityDirectory::default();
+
+        directory.publish_signed(&signed, 100).unwrap();
+        directory.publish(renewed.clone()).unwrap();
+
+        let records = directory.active_records_for_segment(segment, 100);
+        assert_eq!(records, vec![renewed]);
+        let snapshot = directory.to_snapshot();
+        assert!(snapshot.contains("provider"));
+        assert!(!snapshot.contains("signed-provider"));
     }
 
     #[test]
