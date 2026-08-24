@@ -1283,6 +1283,7 @@ mod tests {
                         account_store_path: Some(account_store),
                         collaboration_store_path: None,
                         network_store_path: None,
+                        ..gitmeshd::DaemonStorePaths::default()
                     },
                     gitmeshd::DaemonAuth::disabled(),
                 );

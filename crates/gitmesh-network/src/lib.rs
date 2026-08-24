@@ -14,6 +14,7 @@ use gitmesh_identity::{DeviceCertificate, DeviceId, DeviceKey, IdentityError};
 use thiserror::Error;
 
 const NODE_STORE_HEADER: &str = "gitmesh-network-node-store-v0";
+const AVAILABILITY_DIRECTORY_HEADER: &str = "gitmesh-availability-directory-v0";
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct PeerId(String);
@@ -915,6 +916,91 @@ impl InMemoryAvailabilityDirectory {
             .collect()
     }
 
+    pub fn records(&self) -> impl Iterator<Item = &ShardProviderRecord> {
+        self.records_by_segment.values().flatten()
+    }
+
+    pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, NetworkError> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let text = fs::read_to_string(path).map_err(|err| NetworkError::Io(err.to_string()))?;
+        Self::from_snapshot(&text)
+    }
+
+    pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<(), NetworkError> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|err| NetworkError::Io(err.to_string()))?;
+        }
+        let tmp_path = path.with_extension("tmp");
+        fs::write(&tmp_path, self.to_snapshot())
+            .map_err(|err| NetworkError::Io(err.to_string()))?;
+        fs::rename(&tmp_path, path).map_err(|err| NetworkError::Io(err.to_string()))?;
+        Ok(())
+    }
+
+    pub fn to_snapshot(&self) -> String {
+        let mut output = String::from(AVAILABILITY_DIRECTORY_HEADER);
+        output.push('\n');
+        for record in self.records() {
+            output.push_str(&format!(
+                "provider\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                record.segment_cid,
+                record.shard_cid,
+                record.shard_index,
+                record.peer_id,
+                record.operator_id,
+                record.region,
+                format_roles(&record.roles),
+                record.lease_epoch,
+                record.expires_at_unix
+            ));
+        }
+        output
+    }
+
+    pub fn from_snapshot(text: &str) -> Result<Self, NetworkError> {
+        let mut lines = text.lines();
+        if lines.next() != Some(AVAILABILITY_DIRECTORY_HEADER) {
+            return Err(NetworkError::InvalidAvailabilityDirectory);
+        }
+        let mut directory = Self::default();
+        for line in lines {
+            let parts = line.split('\t').collect::<Vec<_>>();
+            match parts.as_slice() {
+                [
+                    "provider",
+                    segment_cid,
+                    shard_cid,
+                    shard_index,
+                    peer_id,
+                    operator_id,
+                    region,
+                    roles,
+                    lease_epoch,
+                    expires_at_unix,
+                ] => {
+                    directory.publish(ShardProviderRecord::new(
+                        ShardRef {
+                            segment_cid: parse_cid(segment_cid)?,
+                            shard_cid: parse_cid(shard_cid)?,
+                            shard_index: parse_usize(shard_index)?,
+                        },
+                        PeerId::new(*peer_id)?,
+                        OperatorId::new(*operator_id)?,
+                        *region,
+                        parse_roles(roles)?,
+                        ProviderLease::new(parse_u64(lease_epoch)?, parse_u64(expires_at_unix)?)?,
+                    )?)?;
+                }
+                _ => return Err(NetworkError::InvalidAvailabilityDirectory),
+            }
+        }
+        Ok(directory)
+    }
+
     pub fn durable_shard_count(&self, segment_cid: Cid, now_unix: u64) -> usize {
         self.active_records_for_segment(segment_cid, now_unix)
             .into_iter()
@@ -1501,6 +1587,24 @@ fn parse_roles(value: &str) -> Result<BTreeSet<NodeRole>, NetworkError> {
     value.split(',').map(NodeRole::parse).collect()
 }
 
+fn parse_cid(value: &str) -> Result<Cid, NetworkError> {
+    value
+        .parse()
+        .map_err(|_| NetworkError::InvalidAvailabilityDirectory)
+}
+
+fn parse_usize(value: &str) -> Result<usize, NetworkError> {
+    value
+        .parse()
+        .map_err(|_| NetworkError::InvalidAvailabilityDirectory)
+}
+
+fn parse_u64(value: &str) -> Result<u64, NetworkError> {
+    value
+        .parse()
+        .map_err(|_| NetworkError::InvalidAvailabilityDirectory)
+}
+
 fn format_protocols(protocols: &BTreeSet<ProtocolId>) -> String {
     protocols
         .iter()
@@ -1584,6 +1688,8 @@ pub enum NetworkError {
     InvalidNodeDescriptor,
     #[error("invalid network node store snapshot")]
     InvalidNodeStore,
+    #[error("invalid availability directory snapshot")]
+    InvalidAvailabilityDirectory,
     #[error("invalid signed node announcement")]
     InvalidNodeAnnouncement,
     #[error("node announcement signer does not match certificate")]
@@ -1667,6 +1773,34 @@ mod tests {
 
         assert_eq!(directory.active_records_for_segment(segment, 100).len(), 1);
         assert_eq!(directory.durable_shard_count(segment, 100), 1);
+    }
+
+    #[test]
+    fn availability_directory_snapshot_round_trips() {
+        let segment = cid(CidKind::EncryptedSegment, 1);
+        let mut directory = InMemoryAvailabilityDirectory::default();
+        directory
+            .publish(provider(segment, 0, "peer-a", "op-a", 150))
+            .unwrap();
+        let mut second = provider(segment, 1, "peer-b", "op-b", 175);
+        second.region = "fra".to_string();
+        second.roles.insert(NodeRole::Cache);
+        directory.publish(second).unwrap();
+
+        let restored =
+            InMemoryAvailabilityDirectory::from_snapshot(&directory.to_snapshot()).unwrap();
+
+        assert_eq!(
+            restored.active_records_for_segment(segment, 100),
+            directory.active_records_for_segment(segment, 100)
+        );
+    }
+
+    #[test]
+    fn availability_directory_rejects_invalid_snapshot() {
+        let err = InMemoryAvailabilityDirectory::from_snapshot("bad\n").unwrap_err();
+
+        assert_eq!(err, NetworkError::InvalidAvailabilityDirectory);
     }
 
     #[test]

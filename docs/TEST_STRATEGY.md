@@ -48,7 +48,8 @@ Run multi-node tests with real protocol networking:
 
 - local daemon smoke: socket server, persisted stores, collaboration writes, Git
   object storage, ref publication, persisted network peer/listen/bootstrap
-  state, `gm` CLI reads/writes, web-gateway API reads/writes, and status reads
+  state, persisted availability-provider records, `gm` CLI reads/writes,
+  web-gateway API reads/writes, and status reads
 - local 5-node and 20-node networks
 - public push/fetch/clone
 - lease renewal and expiry

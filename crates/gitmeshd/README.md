@@ -6,7 +6,7 @@ Currently implemented:
 
 - `gitmeshd v0-proof [payload...]`
 - `gitmeshd network-repair-proof [payload...]`
-- `gitmeshd serve [socket] [object-store] [ref-store] [policy-store] [key-grant-store] [account-store] [collaboration-store] [network-store]`
+- `gitmeshd serve [socket] [object-store] [ref-store] [policy-store] [key-grant-store] [account-store] [collaboration-store] [network-store] [availability-store]`
 - `gitmeshd ping [socket]`
 - `gitmeshd socket-v0-proof [socket] [payload...]`
 - `gitmeshd socket-network-repair-proof [socket] [payload...]`

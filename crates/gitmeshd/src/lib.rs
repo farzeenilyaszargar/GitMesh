@@ -146,6 +146,7 @@ pub struct DaemonStorePaths {
     pub account_store_path: Option<PathBuf>,
     pub collaboration_store_path: Option<PathBuf>,
     pub network_store_path: Option<PathBuf>,
+    pub availability_store_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -166,6 +167,7 @@ pub struct DaemonState {
     account_store_path: Option<PathBuf>,
     collaboration_store_path: Option<PathBuf>,
     network_store_path: Option<PathBuf>,
+    availability_store_path: Option<PathBuf>,
 }
 
 impl Default for DaemonState {
@@ -187,6 +189,7 @@ impl Default for DaemonState {
             account_store_path: None,
             collaboration_store_path: None,
             network_store_path: None,
+            availability_store_path: None,
         }
     }
 }
@@ -249,73 +252,71 @@ impl DaemonState {
         account_store_path: Option<PathBuf>,
         collaboration_store_path: Option<PathBuf>,
     ) -> Result<Self> {
-        Self::with_every_store_path(
+        Self::with_every_store_path(DaemonStorePaths {
             object_store_path,
             ref_store_path,
             policy_store_path,
             key_grant_store_path,
             account_store_path,
             collaboration_store_path,
-            None,
-        )
+            ..DaemonStorePaths::default()
+        })
     }
 
-    pub fn with_every_store_path(
-        object_store_path: Option<PathBuf>,
-        ref_store_path: Option<PathBuf>,
-        policy_store_path: Option<PathBuf>,
-        key_grant_store_path: Option<PathBuf>,
-        account_store_path: Option<PathBuf>,
-        collaboration_store_path: Option<PathBuf>,
-        network_store_path: Option<PathBuf>,
-    ) -> Result<Self> {
+    pub fn with_every_store_path(stores: DaemonStorePaths) -> Result<Self> {
         let mut state = Self {
             repo_id: RepoId::new(b"gitmeshd-v0-repo"),
-            refs: if let Some(path) = &ref_store_path {
+            refs: if let Some(path) = &stores.ref_store_path {
                 RefStore::load_from_path(path)?
             } else {
                 RefStore::default()
             },
-            policy: if let Some(path) = &policy_store_path {
+            policy: if let Some(path) = &stores.policy_store_path {
                 RepoPolicy::load_from_path(path)?
             } else {
                 RepoPolicy::default()
             },
-            objects: if let Some(path) = &object_store_path {
+            objects: if let Some(path) = &stores.object_store_path {
                 RepositoryObjectStore::load_from_path(path)?
             } else {
                 RepositoryObjectStore::default()
             },
-            key_grants: if let Some(path) = &key_grant_store_path {
+            key_grants: if let Some(path) = &stores.key_grant_store_path {
                 RepoKeyGrantStore::load_from_path(path)?
             } else {
                 RepoKeyGrantStore::default()
             },
-            accounts: if let Some(path) = &account_store_path {
+            accounts: if let Some(path) = &stores.account_store_path {
                 AccountStore::load_from_path(path)?
             } else {
                 AccountStore::default()
             },
-            collaboration: if let Some(path) = &collaboration_store_path {
+            collaboration: if let Some(path) = &stores.collaboration_store_path {
                 CollaborationEventStore::load_from_path(path)?
             } else {
                 CollaborationEventStore::default()
             },
-            network: if let Some(path) = &network_store_path {
+            network: if let Some(path) = &stores.network_store_path {
                 NetworkNodeStore::load_from_path(path)?
             } else {
                 NetworkNodeStore::default()
             },
-            availability: InMemoryAvailabilityDirectory::default(),
-            object_store_path,
-            ref_store_path,
-            policy_store_path,
-            key_grant_store_path,
-            account_store_path,
-            collaboration_store_path,
-            network_store_path,
+            availability: if let Some(path) = &stores.availability_store_path {
+                InMemoryAvailabilityDirectory::load_from_path(path)?
+            } else {
+                InMemoryAvailabilityDirectory::default()
+            },
+            object_store_path: stores.object_store_path,
+            ref_store_path: stores.ref_store_path,
+            policy_store_path: stores.policy_store_path,
+            key_grant_store_path: stores.key_grant_store_path,
+            account_store_path: stores.account_store_path,
+            collaboration_store_path: stores.collaboration_store_path,
+            network_store_path: stores.network_store_path,
+            availability_store_path: stores.availability_store_path,
         };
         state.rehydrate_availability_from_objects()?;
+        state.save_availability()?;
         Ok(state)
     }
 
@@ -766,6 +767,7 @@ impl DaemonState {
         let record = self.objects.put_git_object(GitObject::new(kind, payload))?;
         let provider_records = self.publish_local_provider_records_for_object(record.oid, 1)?;
         self.save_objects()?;
+        self.save_availability()?;
         Ok(DaemonResponse::Ok(format!(
             "oid={} kind={:?} canonical_bytes={} segment_cid={} shards={} available_shards={} provider_records={} durability_satisfied={}",
             record.oid,
@@ -792,6 +794,7 @@ impl DaemonState {
             oids.push(record.oid.to_string());
         }
         self.save_objects()?;
+        self.save_availability()?;
         Ok(DaemonResponse::Ok(format!(
             "pack_version={} imported={} provider_records={} objects={}",
             pack.version,
@@ -898,6 +901,7 @@ impl DaemonState {
             self.publish_local_provider_records_for_object(report.oid, 1)?;
         }
         self.save_objects()?;
+        self.save_availability()?;
         Ok(DaemonResponse::Ok(format_repair_reports(&reports)))
     }
 
@@ -1449,6 +1453,7 @@ impl DaemonState {
         );
         self.availability
             .publish_signed(&signed, network_now_unix()?)?;
+        self.save_availability()?;
         Ok(DaemonResponse::Ok(format!(
             "segment={} shard={} index={} peer={} operator={} lease_epoch={} expires_at={} published=true",
             record.segment_cid,
@@ -1545,6 +1550,13 @@ impl DaemonState {
     fn save_network(&self) -> Result<()> {
         if let Some(path) = &self.network_store_path {
             self.network.save_to_path(path)?;
+        }
+        Ok(())
+    }
+
+    fn save_availability(&self) -> Result<()> {
+        if let Some(path) = &self.availability_store_path {
+            self.availability.save_to_path(path)?;
         }
         Ok(())
     }
@@ -1863,15 +1875,7 @@ pub fn serve_unix_socket_with_stores_and_auth(
     let socket_path = socket_path.as_ref();
     remove_stale_socket(socket_path)?;
     let listener = UnixListener::bind(socket_path)?;
-    let state = Arc::new(Mutex::new(DaemonState::with_every_store_path(
-        stores.object_store_path,
-        stores.ref_store_path,
-        stores.policy_store_path,
-        stores.key_grant_store_path,
-        stores.account_store_path,
-        stores.collaboration_store_path,
-        stores.network_store_path,
-    )?));
+    let state = Arc::new(Mutex::new(DaemonState::with_every_store_path(stores)?));
     let auth = Arc::new(auth);
     for stream in listener.incoming() {
         let stream = stream?;
@@ -3062,6 +3066,75 @@ mod tests {
             err,
             DaemonError::Network(NetworkError::Identity(IdentityError::InvalidSignature))
         ));
+    }
+
+    #[test]
+    fn network_provider_directory_persists_signed_records() {
+        let path = std::env::temp_dir().join(format!(
+            "gitmeshd-availability-{}-{}.tsv",
+            std::process::id(),
+            "persist"
+        ));
+        let mut state = DaemonState::with_every_store_path(DaemonStorePaths {
+            availability_store_path: Some(path.clone()),
+            ..DaemonStorePaths::default()
+        })
+        .unwrap();
+        let segment_cid = Cid::from_digest(
+            CidKind::EncryptedSegment,
+            HashAlgorithm::Blake3_256,
+            [6; 32],
+        );
+        let shard_cid = Cid::from_digest(CidKind::Shard, HashAlgorithm::Blake3_256, [7; 32]);
+        let account = AccountRootKey::generate();
+        let device = DeviceKey::generate();
+        let certificate = account.certify_device(&device, "provider-device");
+        let record = ShardProviderRecord::new(
+            ShardRef {
+                segment_cid,
+                shard_cid,
+                shard_index: 0,
+            },
+            PeerId::new("storage-a").unwrap(),
+            OperatorId::new("operator-a").unwrap(),
+            "sfo",
+            parse_node_roles("storage").unwrap(),
+            ProviderLease::new(1, network_now_unix().unwrap() + 600).unwrap(),
+        )
+        .unwrap();
+        let signed = SignedShardProviderRecord::sign(record.clone(), certificate, &device).unwrap();
+        let publish = format!(
+            "NETWORK_PROVIDER_PUBLISH_SIGNED {} {} {} {} {} {} storage {} {} {} {} {} {} {}",
+            record.segment_cid,
+            record.shard_cid,
+            record.shard_index,
+            record.peer_id,
+            record.operator_id,
+            record.region,
+            record.lease_epoch,
+            record.expires_at_unix,
+            encode_hex(signed.certificate.label.as_bytes()),
+            encode_hex(&signed.certificate.account_verifying_key),
+            encode_hex(&signed.certificate.device_verifying_key),
+            encode_hex(&signed.certificate.signature),
+            encode_hex(&signed.signature)
+        );
+
+        state.handle_command(&publish).unwrap();
+        let mut restored = DaemonState::with_every_store_path(DaemonStorePaths {
+            availability_store_path: Some(path.clone()),
+            ..DaemonStorePaths::default()
+        })
+        .unwrap();
+        let providers = restored
+            .handle_command(&format!("NETWORK_PROVIDER_FIND {segment_cid}"))
+            .unwrap()
+            .into_line();
+
+        assert!(providers.contains("count=1"));
+        assert!(providers.contains("storage-a"));
+        assert!(providers.contains(&shard_cid.to_string()));
+        let _ = fs::remove_file(path);
     }
 
     #[test]

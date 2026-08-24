@@ -31,6 +31,7 @@ fn run() -> Result<(), GitMeshdError> {
             let account_store_path: Option<PathBuf> = args.next().map(Into::into);
             let collaboration_store_path: Option<PathBuf> = args.next().map(Into::into);
             let network_store_path: Option<PathBuf> = args.next().map(Into::into);
+            let availability_store_path: Option<PathBuf> = args.next().map(Into::into);
             println!("gitmeshd listening on {}", socket_path.display());
             if let Some(path) = &object_store_path {
                 println!("gitmeshd object store {}", path.display());
@@ -53,6 +54,9 @@ fn run() -> Result<(), GitMeshdError> {
             if let Some(path) = &network_store_path {
                 println!("gitmeshd network store {}", path.display());
             }
+            if let Some(path) = &availability_store_path {
+                println!("gitmeshd availability store {}", path.display());
+            }
             let auth = DaemonAuth::from_env()?;
             if auth.is_enabled() {
                 println!("gitmeshd admin auth enabled");
@@ -67,6 +71,7 @@ fn run() -> Result<(), GitMeshdError> {
                     account_store_path,
                     collaboration_store_path,
                     network_store_path,
+                    availability_store_path,
                 },
                 auth,
             )?;
@@ -510,7 +515,7 @@ fn print_help() {
     println!("  v0-proof [payload...]   run the local encrypt/erasure-code/recover proof");
     println!("  network-repair-proof [payload...]   run Git-object transport repair proof");
     println!(
-        "  serve [socket] [object-store] [ref-store] [policy-store] [key-grant-store] [account-store] [collaboration-store] [network-store]   run the local daemon socket server"
+        "  serve [socket] [object-store] [ref-store] [policy-store] [key-grant-store] [account-store] [collaboration-store] [network-store] [availability-store]   run the local daemon socket server"
     );
     println!("  ping [socket]           ping a running local daemon");
     println!("  frame-ping [socket] [request-id]   ping using the binary frame protocol");

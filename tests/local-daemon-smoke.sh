@@ -11,6 +11,7 @@ KEY_STORE="$TMP_DIR/key-grants.tsv"
 ACCOUNT_STORE="$TMP_DIR/accounts.tsv"
 COLLAB_STORE="$TMP_DIR/collaboration.tsv"
 NETWORK_STORE="$TMP_DIR/network.tsv"
+AVAILABILITY_STORE="$TMP_DIR/availability.tsv"
 IDENTITY_STORE="$TMP_DIR/identity.tsv"
 DAEMON_PID=""
 WEB_PID=""
@@ -72,6 +73,7 @@ cargo run --quiet --bin gitmeshd -- serve \
   "$ACCOUNT_STORE" \
   "$COLLAB_STORE" \
   "$NETWORK_STORE" \
+  "$AVAILABILITY_STORE" \
   >"$TMP_DIR/gitmeshd.log" 2>&1 &
 DAEMON_PID="$!"
 
@@ -282,7 +284,7 @@ expect_contains "$web_status" '"ok":true'
 expect_contains "$web_status" '"collaboration_events":"8"'
 expect_contains "$web_status" '"network_peers":"2"'
 
-for store in "$OBJECT_STORE" "$REF_STORE" "$COLLAB_STORE" "$NETWORK_STORE"; do
+for store in "$OBJECT_STORE" "$REF_STORE" "$COLLAB_STORE" "$NETWORK_STORE" "$AVAILABILITY_STORE"; do
   if [[ ! -s "$store" ]]; then
     echo "expected persisted store file: $store" >&2
     exit 1
