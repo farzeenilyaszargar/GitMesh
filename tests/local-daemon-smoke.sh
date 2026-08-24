@@ -127,6 +127,11 @@ if [[ -z "$oid" ]]; then
   exit 1
 fi
 
+availability_response="$(run_gm object availability "$SOCKET_PATH" "$oid" 10 3 2)"
+expect_contains "$availability_response" "OK segment="
+expect_contains "$availability_response" "satisfied=true"
+expect_contains "$availability_response" "required_shards=10"
+
 ref_response="$(run_gitmeshd ref-update "$SOCKET_PATH" tx-smoke refs/tags/smoke none "$oid" smoke)"
 expect_contains "$ref_response" "status=committed"
 

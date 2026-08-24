@@ -217,6 +217,25 @@ fn run() -> Result<(), GitMeshdError> {
             );
             Ok(())
         }
+        Some("object-availability") => {
+            let socket_path = args.next().map_or_else(default_socket_path, Into::into);
+            let oid = args
+                .next()
+                .ok_or_else(|| GitMeshdError::InvalidArguments("missing object oid".to_string()))?;
+            let min_shards = args.next().unwrap_or_else(|| "10".to_string());
+            let min_operators = args.next().unwrap_or_else(|| "3".to_string());
+            let min_regions = args.next().unwrap_or_else(|| "2".to_string());
+            println!(
+                "{}",
+                request_unix_socket(
+                    socket_path,
+                    &format!(
+                        "OBJECT_AVAILABILITY {oid} {min_shards} {min_operators} {min_regions}"
+                    )
+                )?
+            );
+            Ok(())
+        }
         Some("pack-put") => {
             let socket_path = args.next().map_or_else(default_socket_path, Into::into);
             let pack_hex = args

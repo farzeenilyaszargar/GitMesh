@@ -1498,6 +1498,25 @@ fn object(args: &[String]) -> Result<(), GmError> {
             );
             Ok(())
         }
+        Some("availability") => {
+            let socket_path = args.get(1).map_or_else(default_socket_path, Into::into);
+            let oid = args.get(2).ok_or_else(|| {
+                GmError::InvalidArguments("object availability requires an oid".to_string())
+            })?;
+            let min_shards = args.get(3).map_or("10", String::as_str);
+            let min_operators = args.get(4).map_or("3", String::as_str);
+            let min_regions = args.get(5).map_or("2", String::as_str);
+            println!(
+                "{}",
+                request_unix_socket(
+                    socket_path,
+                    &format!(
+                        "OBJECT_AVAILABILITY {oid} {min_shards} {min_operators} {min_regions}"
+                    )
+                )?
+            );
+            Ok(())
+        }
         Some("repair") => {
             let socket_path = args.get(1).map_or_else(default_socket_path, Into::into);
             let target = args.get(2).map_or("all", String::as_str);
@@ -2030,6 +2049,7 @@ fn print_help() {
     println!("  object get [socket] <oid>");
     println!("  object list [socket]");
     println!("  object audit [socket] [all|oid]");
+    println!("  object availability [socket] <oid> [min-shards] [min-operators] [min-regions]");
     println!("  object repair [socket] [all|oid]");
     println!("  object import-loose [socket] <git-dir>");
     println!("  object import-pack [socket] <pack-file>");

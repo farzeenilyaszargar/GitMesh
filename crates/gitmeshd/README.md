@@ -52,14 +52,17 @@ The socket protocol is a V0 line protocol over Unix domain sockets:
 - `PACK_GET all`
 - `OBJECT_GET <oid>`
 - `OBJECT_LIST`
+- `OBJECT_AVAILABILITY <oid> <min-shards> <min-operators> <min-regions>`
 - `KEY_GRANT_PUT <repo-id> <epoch> <account-cid> <device-cid> <device-key-hex> <algorithm> <nonce-hex> <wrapped-key-hex> <signer-key-hex> <signature-hex>`
 - `KEY_GRANT_LIST <repo-id> [latest|all|epoch]`
 - `KEY_GRANT_REVOKE_DEVICE <device-cid> <effective-epoch>`
 - `KEY_GRANT_STATUS <repo-id>`
 - `COLLAB_SEED_SAMPLES`
 - `ISSUE_OPEN <owner/repo> <actor> <title-hex> <body-hex|-> <labels-hex-list|->`
+- `ISSUE_OPEN_SIGNED <owner/repo> <timestamp-unix> <title-hex> <body-hex|-> <labels-hex-list|-> <label-hex> <account-key-hex> <device-key-hex> <cert-signature-hex> <event-signature-hex>`
 - `ISSUE_LIST <owner/repo>`
 - `PR_OPEN <owner/repo> <actor> <source-ref> <target-ref> <title-hex> <body-hex|-> <labels-hex-list|->`
+- `PR_OPEN_SIGNED <owner/repo> <timestamp-unix> <source-ref> <target-ref> <title-hex> <body-hex|-> <labels-hex-list|-> <label-hex> <account-key-hex> <device-key-hex> <cert-signature-hex> <event-signature-hex>`
 - `PR_LIST <owner/repo>`
 - `NETWORK_STATUS`
 - `NETWORK_LISTEN <multiaddr>`

@@ -18,8 +18,8 @@ use gitmesh_git::{
 };
 use gitmesh_network::{
     AvailabilityReport, AvailabilityRequirement, InMemoryAvailabilityDirectory, InMemoryPeer,
-    InMemorySwarm, PeerId, PlacementPolicy, ShardProviderRecord, client_descriptor,
-    storage_descriptor,
+    InMemorySwarm, NodeRole, OperatorId, PeerId, PlacementPolicy, ProviderLease,
+    ShardProviderRecord, ShardRef, client_descriptor, storage_descriptor,
 };
 use gitmesh_storage::{
     EncryptedSegment, RepairOutcome, Shard, ShardAuditReport, SimulatedNetwork, StoragePolicy,
@@ -175,6 +175,45 @@ impl RepositoryObjectStore {
                 .map_err(|err| RepositoryError::Network(err.to_string()))?;
         }
         Ok(directory.availability_report(stored.record.segment_cid, now_unix, requirement))
+    }
+
+    pub fn local_provider_records_for_object(
+        &self,
+        oid: GitSha1Oid,
+        lease_epoch: u64,
+        expires_at_unix: u64,
+    ) -> Result<Vec<ShardProviderRecord>> {
+        let stored = self
+            .objects
+            .get(&oid)
+            .ok_or(RepositoryError::MissingObject(oid))?;
+        stored
+            .shards
+            .iter()
+            .map(|shard| {
+                let region = if shard.shard_index % 2 == 0 {
+                    "local-a"
+                } else {
+                    "local-b"
+                };
+                ShardProviderRecord::new(
+                    ShardRef {
+                        segment_cid: shard.segment_cid,
+                        shard_cid: shard.cid,
+                        shard_index: shard.shard_index,
+                    },
+                    PeerId::new(format!("v0-node-{}", shard.shard_index))
+                        .map_err(|err| RepositoryError::Network(err.to_string()))?,
+                    OperatorId::new(format!("v0-operator-{}", shard.shard_index))
+                        .map_err(|err| RepositoryError::Network(err.to_string()))?,
+                    region,
+                    [NodeRole::Storage],
+                    ProviderLease::new(lease_epoch, expires_at_unix)
+                        .map_err(|err| RepositoryError::Network(err.to_string()))?,
+                )
+                .map_err(|err| RepositoryError::Network(err.to_string()))
+            })
+            .collect()
     }
 
     pub fn has_qualified_durable_object(
@@ -891,7 +930,6 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gitmesh_network::{NodeRole, OperatorId, ShardRef};
 
     fn put_root_commit(store: &mut RepositoryObjectStore, message: &str) -> GitSha1Oid {
         let tree = GitObject::new(GitObjectKind::Tree, Vec::new());
@@ -1016,7 +1054,9 @@ mod tests {
         let mut store = RepositoryObjectStore::default();
         let object = GitObject::new(GitObjectKind::Blob, b"qualified availability");
         let record = store.put_git_object(object).unwrap();
-        let providers = providers_for_record(&record, store.policy().data_shards);
+        let providers = store
+            .local_provider_records_for_object(record.oid, 1, 500)
+            .unwrap();
         let requirement = AvailabilityRequirement::new(store.policy().data_shards, 3, 2).unwrap();
 
         let report = store
@@ -1026,8 +1066,11 @@ mod tests {
             .has_qualified_durable_object(record.oid, &providers, requirement, 100)
             .unwrap();
 
-        assert_eq!(report.distinct_shard_count, store.policy().data_shards);
-        assert_eq!(report.distinct_operator_count, store.policy().data_shards);
+        assert_eq!(report.distinct_shard_count, store.policy().total_shards());
+        assert_eq!(
+            report.distinct_operator_count,
+            store.policy().total_shards()
+        );
         assert_eq!(report.distinct_region_count, 2);
         assert!(report.satisfies_requirement());
         assert!(satisfied);

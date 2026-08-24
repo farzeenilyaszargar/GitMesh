@@ -54,6 +54,11 @@ materialize` exports daemon objects/refs into a native bare Git repository using
 `git index-pack` and `git update-ref`; `repo clone` uses that same Gen 1 cached
 bare-repo bridge and native `git clone`.
 
+`gm object availability [socket] <oid> [min-shards] [min-operators]
+[min-regions]` asks the daemon to build local provider evidence for an object
+and evaluate it against shard, operator, and region requirements. This is the
+current CLI hook for durability-before-ref-publication checks.
+
 `gm daemon network-proof` calls the daemon's Git-object transport repair proof:
 encrypted erasure-coded shards are published to providers, one provider is
 removed, the missing shard is rebuilt on a replacement peer, and the original

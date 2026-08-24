@@ -31,7 +31,7 @@ use gitmesh_identity::{
     DeviceCertificate, DeviceId, IdentityError, RepoKeyGrant, RepoKeyGrantStore,
 };
 use gitmesh_network::{
-    NetworkError, NetworkNodeStore, NodeDescriptor, OperatorId, PeerId,
+    AvailabilityRequirement, NetworkError, NetworkNodeStore, NodeDescriptor, OperatorId, PeerId,
     now_unix as network_now_unix, parse_node_roles, parse_protocol_ids,
 };
 use gitmesh_repository::{
@@ -424,6 +424,10 @@ impl DaemonState {
             return self.object_repair(rest);
         }
 
+        if let Some(rest) = trimmed.strip_prefix("OBJECT_AVAILABILITY ") {
+            return self.object_availability(rest);
+        }
+
         if trimmed == "OBJECT_LIST" {
             return Ok(DaemonResponse::Ok(format_object_list(&self.objects)));
         }
@@ -778,6 +782,31 @@ impl DaemonState {
             vec![self.objects.audit_object(parse_oid(rest)?)?]
         };
         Ok(DaemonResponse::Ok(format_audit_reports(&audits)))
+    }
+
+    fn object_availability(&self, rest: &str) -> Result<DaemonResponse> {
+        let parts = rest.split_whitespace().collect::<Vec<_>>();
+        if parts.len() != 4 {
+            return Err(DaemonError::InvalidCommand(
+                "OBJECT_AVAILABILITY requires <oid> <min-shards> <min-operators> <min-regions>"
+                    .to_string(),
+            ));
+        }
+        let oid = parse_oid(parts[0])?;
+        let requirement = AvailabilityRequirement::new(
+            parse_usize_arg(parts[1], "min-shards")?,
+            parse_usize_arg(parts[2], "min-operators")?,
+            parse_usize_arg(parts[3], "min-regions")?,
+        )
+        .map_err(DaemonError::Network)?;
+        let now = now_unix()?;
+        let providers =
+            self.objects
+                .local_provider_records_for_object(oid, 1, now.saturating_add(86_400))?;
+        let report = self
+            .objects
+            .object_availability_report(oid, &providers, requirement, now)?;
+        Ok(DaemonResponse::Ok(format_availability_report(&report)))
     }
 
     fn object_repair(&mut self, rest: &str) -> Result<DaemonResponse> {
@@ -2001,6 +2030,12 @@ fn parse_unix_timestamp(value: &str) -> Result<u64> {
         .map_err(|_| DaemonError::InvalidCommand("timestamp must be a u64".to_string()))
 }
 
+fn parse_usize_arg(value: &str, name: &str) -> Result<usize> {
+    value
+        .parse()
+        .map_err(|_| DaemonError::InvalidCommand(format!("{name} must be a positive integer")))
+}
+
 fn parse_bool_arg(value: &str) -> Result<bool> {
     match value {
         "true" => Ok(true),
@@ -2452,6 +2487,23 @@ fn format_repair_reports(reports: &[RepositoryRepairReport]) -> String {
         entries.join(","),
         repaired,
         durable
+    )
+}
+
+fn format_availability_report(report: &gitmesh_network::AvailabilityReport) -> String {
+    format!(
+        "segment={} active_records={} durable_records={} distinct_shards={} qualified_shards={} distinct_operators={} distinct_regions={} required_shards={} required_operators={} required_regions={} satisfied={}",
+        report.segment_cid,
+        report.active_record_count,
+        report.durable_record_count,
+        report.distinct_shard_count,
+        report.qualified_durable_shard_count,
+        report.distinct_operator_count,
+        report.distinct_region_count,
+        report.requirement.min_shards,
+        report.requirement.min_distinct_operators,
+        report.requirement.min_distinct_regions,
+        report.satisfies_requirement()
     )
 }
 
@@ -3595,6 +3647,23 @@ mod tests {
         assert!(repair.contains("repaired=1"));
         assert!(repair.contains("verified=16"));
         assert!(audit.contains("repair_needed=0"));
+    }
+
+    #[test]
+    fn object_availability_reports_local_provider_evidence() {
+        let mut state = DaemonState::default();
+        let oid = put_object(&mut state, "blob", &encode_hex(b"availability daemon"));
+
+        let report = state
+            .handle_command(&format!("OBJECT_AVAILABILITY {oid} 10 3 2"))
+            .unwrap()
+            .into_line();
+
+        assert!(report.contains("satisfied=true"));
+        assert!(report.contains("distinct_shards=16"));
+        assert!(report.contains("required_shards=10"));
+        assert!(report.contains("required_operators=3"));
+        assert!(report.contains("required_regions=2"));
     }
 
     #[test]
