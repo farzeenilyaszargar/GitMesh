@@ -269,7 +269,7 @@ impl DaemonState {
         collaboration_store_path: Option<PathBuf>,
         network_store_path: Option<PathBuf>,
     ) -> Result<Self> {
-        Ok(Self {
+        let mut state = Self {
             repo_id: RepoId::new(b"gitmeshd-v0-repo"),
             refs: if let Some(path) = &ref_store_path {
                 RefStore::load_from_path(path)?
@@ -314,7 +314,9 @@ impl DaemonState {
             account_store_path,
             collaboration_store_path,
             network_store_path,
-        })
+        };
+        state.rehydrate_availability_from_objects()?;
+        Ok(state)
     }
 
     pub fn handle_command(&mut self, line: &str) -> Result<DaemonResponse> {
@@ -892,6 +894,9 @@ impl DaemonState {
         } else {
             vec![self.objects.repair_object(parse_oid(rest)?)?]
         };
+        for report in &reports {
+            self.publish_local_provider_records_for_object(report.oid, 1)?;
+        }
         self.save_objects()?;
         Ok(DaemonResponse::Ok(format_repair_reports(&reports)))
     }
@@ -1480,6 +1485,19 @@ impl DaemonState {
             self.availability.publish(record)?;
         }
         Ok(count)
+    }
+
+    fn rehydrate_availability_from_objects(&mut self) -> Result<usize> {
+        let oids = self
+            .objects
+            .records()
+            .map(|record| record.oid)
+            .collect::<Vec<_>>();
+        let mut published = 0_usize;
+        for oid in oids {
+            published += self.publish_local_provider_records_for_object(oid, 1)?;
+        }
+        Ok(published)
     }
 
     fn save_objects(&self) -> Result<()> {
@@ -4192,11 +4210,21 @@ mod tests {
             .find_map(|part| part.strip_prefix("oid="))
             .unwrap()
             .to_string();
+        let segment_cid = put
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix("segment_cid="))
+            .unwrap()
+            .to_string();
 
-        let restored = DaemonState::with_object_store_path(path.clone()).unwrap();
+        let mut restored = DaemonState::with_object_store_path(path.clone()).unwrap();
         let get = restored.object_get(&oid).unwrap().into_line();
+        let providers = restored
+            .handle_command(&format!("NETWORK_PROVIDER_FIND {segment_cid}"))
+            .unwrap()
+            .into_line();
 
         assert!(get.contains("payload_hex=70657273697374"));
+        assert!(providers.contains("count=16"));
         let _ = fs::remove_file(path);
     }
 
