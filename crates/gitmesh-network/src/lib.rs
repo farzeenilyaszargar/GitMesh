@@ -9,7 +9,7 @@ use std::fmt;
 use std::fs;
 use std::path::Path;
 
-use gitmesh_core::{Cid, shard_cid};
+use gitmesh_core::{Cid, hex, shard_cid};
 use gitmesh_identity::{DeviceCertificate, DeviceId, DeviceKey, IdentityError};
 use thiserror::Error;
 
@@ -859,15 +859,41 @@ impl SignedShardProviderRecord {
         if !self.record.is_active_at(now_unix) {
             return Err(NetworkError::ExpiredProviderRecord);
         }
+        self.verify_signature()
+    }
+
+    pub fn verify_signature(&self) -> Result<(), NetworkError> {
         self.certificate
             .verify_device_signature(&self.record.signing_transcript(), &self.signature)?;
         Ok(())
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AvailabilityDirectoryRecord {
+    provider: ShardProviderRecord,
+    signed: Option<SignedShardProviderRecord>,
+}
+
+impl AvailabilityDirectoryRecord {
+    fn unsigned(provider: ShardProviderRecord) -> Self {
+        Self {
+            provider,
+            signed: None,
+        }
+    }
+
+    fn signed(signed: SignedShardProviderRecord) -> Self {
+        Self {
+            provider: signed.record.clone(),
+            signed: Some(signed),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryAvailabilityDirectory {
-    records_by_segment: BTreeMap<Cid, Vec<ShardProviderRecord>>,
+    records_by_segment: BTreeMap<Cid, Vec<AvailabilityDirectoryRecord>>,
 }
 
 impl InMemoryAvailabilityDirectory {
@@ -880,15 +906,15 @@ impl InMemoryAvailabilityDirectory {
             .entry(record.segment_cid)
             .or_default();
         if let Some(existing) = records.iter_mut().find(|existing| {
-            existing.shard_cid == record.shard_cid
-                && existing.peer_id == record.peer_id
-                && existing.shard_index == record.shard_index
+            existing.provider.shard_cid == record.shard_cid
+                && existing.provider.peer_id == record.peer_id
+                && existing.provider.shard_index == record.shard_index
         }) {
-            if record.lease_epoch >= existing.lease_epoch {
-                *existing = record;
+            if record.lease_epoch >= existing.provider.lease_epoch {
+                *existing = AvailabilityDirectoryRecord::unsigned(record);
             }
         } else {
-            records.push(record);
+            records.push(AvailabilityDirectoryRecord::unsigned(record));
         }
         Ok(())
     }
@@ -899,7 +925,34 @@ impl InMemoryAvailabilityDirectory {
         now_unix: u64,
     ) -> Result<(), NetworkError> {
         signed.verify(now_unix)?;
-        self.publish(signed.record.clone())
+        self.publish_verified_signed(signed.clone())
+    }
+
+    fn publish_verified_signed(
+        &mut self,
+        signed: SignedShardProviderRecord,
+    ) -> Result<(), NetworkError> {
+        if signed.record.expires_at_unix == 0 || signed.record.roles.is_empty() {
+            return Err(NetworkError::InvalidProviderRecord);
+        }
+        signed.verify_signature()?;
+        let record = signed.record.clone();
+        let records = self
+            .records_by_segment
+            .entry(record.segment_cid)
+            .or_default();
+        if let Some(existing) = records.iter_mut().find(|existing| {
+            existing.provider.shard_cid == record.shard_cid
+                && existing.provider.peer_id == record.peer_id
+                && existing.provider.shard_index == record.shard_index
+        }) {
+            if record.lease_epoch >= existing.provider.lease_epoch {
+                *existing = AvailabilityDirectoryRecord::signed(signed);
+            }
+        } else {
+            records.push(AvailabilityDirectoryRecord::signed(signed));
+        }
+        Ok(())
     }
 
     pub fn active_records_for_segment(
@@ -911,13 +964,17 @@ impl InMemoryAvailabilityDirectory {
             .get(&segment_cid)
             .into_iter()
             .flatten()
+            .map(|entry| &entry.provider)
             .filter(|record| record.is_active_at(now_unix))
             .cloned()
             .collect()
     }
 
     pub fn records(&self) -> impl Iterator<Item = &ShardProviderRecord> {
-        self.records_by_segment.values().flatten()
+        self.records_by_segment
+            .values()
+            .flatten()
+            .map(|entry| &entry.provider)
     }
 
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, NetworkError> {
@@ -944,19 +1001,40 @@ impl InMemoryAvailabilityDirectory {
     pub fn to_snapshot(&self) -> String {
         let mut output = String::from(AVAILABILITY_DIRECTORY_HEADER);
         output.push('\n');
-        for record in self.records() {
-            output.push_str(&format!(
-                "provider\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-                record.segment_cid,
-                record.shard_cid,
-                record.shard_index,
-                record.peer_id,
-                record.operator_id,
-                record.region,
-                format_roles(&record.roles),
-                record.lease_epoch,
-                record.expires_at_unix
-            ));
+        for entry in self.records_by_segment.values().flatten() {
+            let record = &entry.provider;
+            if let Some(signed) = &entry.signed {
+                output.push_str(&format!(
+                    "signed-provider\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                    record.segment_cid,
+                    record.shard_cid,
+                    record.shard_index,
+                    record.peer_id,
+                    record.operator_id,
+                    record.region,
+                    format_roles(&record.roles),
+                    record.lease_epoch,
+                    record.expires_at_unix,
+                    hex(signed.certificate.label.as_bytes()),
+                    hex(&signed.certificate.account_verifying_key),
+                    hex(&signed.certificate.device_verifying_key),
+                    hex(&signed.certificate.signature),
+                    hex(&signed.signature)
+                ));
+            } else {
+                output.push_str(&format!(
+                    "provider\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                    record.segment_cid,
+                    record.shard_cid,
+                    record.shard_index,
+                    record.peer_id,
+                    record.operator_id,
+                    record.region,
+                    format_roles(&record.roles),
+                    record.lease_epoch,
+                    record.expires_at_unix
+                ));
+            }
         }
         output
     }
@@ -994,6 +1072,49 @@ impl InMemoryAvailabilityDirectory {
                         parse_roles(roles)?,
                         ProviderLease::new(parse_u64(lease_epoch)?, parse_u64(expires_at_unix)?)?,
                     )?)?;
+                }
+                [
+                    "signed-provider",
+                    segment_cid,
+                    shard_cid,
+                    shard_index,
+                    peer_id,
+                    operator_id,
+                    region,
+                    roles,
+                    lease_epoch,
+                    expires_at_unix,
+                    label_hex,
+                    account_key_hex,
+                    device_key_hex,
+                    certificate_signature_hex,
+                    provider_signature_hex,
+                ] => {
+                    let record = ShardProviderRecord::new(
+                        ShardRef {
+                            segment_cid: parse_cid(segment_cid)?,
+                            shard_cid: parse_cid(shard_cid)?,
+                            shard_index: parse_usize(shard_index)?,
+                        },
+                        PeerId::new(*peer_id)?,
+                        OperatorId::new(*operator_id)?,
+                        *region,
+                        parse_roles(roles)?,
+                        ProviderLease::new(parse_u64(lease_epoch)?, parse_u64(expires_at_unix)?)?,
+                    )?;
+                    let certificate = DeviceCertificate::from_key_bytes(
+                        decode_utf8_hex(label_hex)?,
+                        decode_fixed_hex::<32>(account_key_hex)?,
+                        decode_fixed_hex::<32>(device_key_hex)?,
+                        decode_fixed_hex::<64>(certificate_signature_hex)?,
+                    )?;
+                    let signed = SignedShardProviderRecord::new(
+                        record,
+                        certificate,
+                        decode_fixed_hex::<64>(provider_signature_hex)?,
+                    );
+                    signed.verify_signature()?;
+                    directory.publish_verified_signed(signed)?;
                 }
                 _ => return Err(NetworkError::InvalidAvailabilityDirectory),
             }
@@ -1603,6 +1724,41 @@ fn parse_u64(value: &str) -> Result<u64, NetworkError> {
     value
         .parse()
         .map_err(|_| NetworkError::InvalidAvailabilityDirectory)
+}
+
+fn decode_utf8_hex(value: &str) -> Result<String, NetworkError> {
+    String::from_utf8(decode_hex(value)?).map_err(|_| NetworkError::InvalidAvailabilityDirectory)
+}
+
+fn decode_fixed_hex<const N: usize>(value: &str) -> Result<[u8; N], NetworkError> {
+    let bytes = decode_hex(value)?;
+    bytes
+        .try_into()
+        .map_err(|_| NetworkError::InvalidAvailabilityDirectory)
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>, NetworkError> {
+    if !value.len().is_multiple_of(2) {
+        return Err(NetworkError::InvalidAvailabilityDirectory);
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|chunk| {
+            let high = hex_nibble(chunk[0]).ok_or(NetworkError::InvalidAvailabilityDirectory)?;
+            let low = hex_nibble(chunk[1]).ok_or(NetworkError::InvalidAvailabilityDirectory)?;
+            Ok((high << 4) | low)
+        })
+        .collect()
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn format_protocols(protocols: &BTreeSet<ProtocolId>) -> String {
@@ -2508,5 +2664,60 @@ mod tests {
         let err = signed.verify(500).unwrap_err();
 
         assert_eq!(err, NetworkError::ExpiredProviderRecord);
+    }
+
+    #[test]
+    fn availability_snapshot_preserves_signed_provider_evidence() {
+        let account = gitmesh_identity::AccountRootKey::generate();
+        let device = gitmesh_identity::DeviceKey::generate();
+        let certificate = account.certify_device(&device, "storage-provider");
+        let segment = cid(CidKind::EncryptedSegment, 1);
+        let record = provider(segment, 0, "storage-a", "operator-a", 500);
+        let signed = SignedShardProviderRecord::sign(record.clone(), certificate, &device).unwrap();
+        let mut directory = InMemoryAvailabilityDirectory::default();
+
+        directory.publish_signed(&signed, 100).unwrap();
+        let snapshot = directory.to_snapshot();
+        let restored = InMemoryAvailabilityDirectory::from_snapshot(&snapshot).unwrap();
+
+        assert!(snapshot.contains("signed-provider"));
+        assert_eq!(
+            restored.active_records_for_segment(segment, 100),
+            vec![record]
+        );
+        assert_eq!(restored.to_snapshot(), snapshot);
+    }
+
+    #[test]
+    fn availability_snapshot_rejects_tampered_signed_provider_evidence() {
+        let account = gitmesh_identity::AccountRootKey::generate();
+        let device = gitmesh_identity::DeviceKey::generate();
+        let certificate = account.certify_device(&device, "storage-provider");
+        let segment = cid(CidKind::EncryptedSegment, 1);
+        let signed = SignedShardProviderRecord::sign(
+            provider(segment, 0, "storage-a", "operator-a", 500),
+            certificate,
+            &device,
+        )
+        .unwrap();
+        let mut directory = InMemoryAvailabilityDirectory::default();
+        directory.publish_signed(&signed, 100).unwrap();
+        let mut fields = directory
+            .to_snapshot()
+            .lines()
+            .nth(1)
+            .unwrap()
+            .split('\t')
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        fields[8] = "700".to_string();
+        let tampered = format!("{AVAILABILITY_DIRECTORY_HEADER}\n{}\n", fields.join("\t"));
+
+        let err = InMemoryAvailabilityDirectory::from_snapshot(&tampered).unwrap_err();
+
+        assert!(matches!(
+            err,
+            NetworkError::Identity(gitmesh_identity::IdentityError::InvalidSignature)
+        ));
     }
 }

@@ -66,6 +66,12 @@ Availability records are signed and expire. Clients verify leases, shard CIDs,
 provider signatures, placement policy, and audit status before treating data as
 durable.
 
+Directory snapshots persist signed provider records with their device
+certificate and provider signature intact. Loading a snapshot verifies the
+stored signature before the record re-enters the active directory view. Older
+unsigned local-development records remain parseable, but they are compatibility
+evidence rather than production-grade lease authority.
+
 ## Retrieval
 
 Clients rank providers by locality, historical success, latency, bandwidth,

@@ -3181,6 +3181,10 @@ mod tests {
         );
 
         state.handle_command(&publish).unwrap();
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert!(persisted.contains("signed-provider"));
+        assert!(persisted.contains(&encode_hex(&signed.signature)));
+
         let mut restored = DaemonState::with_every_store_path(DaemonStorePaths {
             availability_store_path: Some(path.clone()),
             ..DaemonStorePaths::default()
