@@ -13,7 +13,8 @@ use gitmesh_crypto::{
 use gitmesh_network::{
     InMemoryAvailabilityDirectory, NetworkError, NetworkRequest, NetworkResponse, NetworkTransport,
     NodeDescriptor, NodeRole, OperatorId, PeerId, PlacementPlan, PlacementPolicy, ProviderLease,
-    ShardEnvelope, ShardProviderRecord, ShardRef, SignedShardProviderRecord, plan_shard_placement,
+    ShardAuditChallenge, ShardEnvelope, ShardProviderRecord, ShardRef, SignedShardProviderRecord,
+    plan_shard_placement,
 };
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use thiserror::Error;
@@ -241,6 +242,14 @@ pub struct TransportShardAuditReport {
     pub corrupt_shards: Vec<usize>,
     pub durability_satisfied: bool,
     pub repair_needed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransportChallengeAuditReport {
+    pub segment_cid: Cid,
+    pub checked_providers: usize,
+    pub verified_shards: Vec<usize>,
+    pub failed_shards: Vec<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -856,6 +865,73 @@ pub fn audit_shards_via_transport<T: NetworkTransport>(
     })
 }
 
+pub fn challenge_shards_via_transport<T: NetworkTransport>(
+    transport: &mut T,
+    client_peer: &PeerId,
+    segment_cid: Cid,
+    providers: &[ShardProviderRecord],
+    now_unix: u64,
+    challenge_len: usize,
+) -> Result<TransportChallengeAuditReport> {
+    if challenge_len == 0 {
+        return Err(StorageError::Network(
+            "challenge length must be non-zero".to_string(),
+        ));
+    }
+    let mut checked_providers = 0;
+    let mut verified_shards = Vec::new();
+    let mut failed_shards = Vec::new();
+
+    for provider in providers {
+        if provider.segment_cid != segment_cid || !provider.is_active_at(now_unix) {
+            continue;
+        }
+        checked_providers += 1;
+        let shard_ref = ShardRef {
+            segment_cid: provider.segment_cid,
+            shard_cid: provider.shard_cid,
+            shard_index: provider.shard_index,
+        };
+        let challenge = ShardAuditChallenge::new(
+            shard_ref,
+            0,
+            challenge_len,
+            audit_challenge_nonce(segment_cid, provider.shard_index),
+        )
+        .map_err(|err| StorageError::Network(err.to_string()))?;
+        let response = transport.request(
+            client_peer,
+            &provider.peer_id,
+            NetworkRequest::ChallengeShard {
+                challenge: challenge.clone(),
+            },
+        );
+        match response {
+            Ok(NetworkResponse::ShardAuditProof { proof }) if proof.verify(&challenge).is_ok() => {
+                verified_shards.push(provider.shard_index);
+            }
+            Ok(_)
+            | Err(
+                NetworkError::UnknownPeer
+                | NetworkError::ShardNotFound
+                | NetworkError::ShardIntegrity
+                | NetworkError::InvalidAuditChallenge
+                | NetworkError::InvalidAuditProof,
+            ) => {
+                failed_shards.push(provider.shard_index);
+            }
+            Err(err) => return Err(StorageError::Network(err.to_string())),
+        }
+    }
+
+    Ok(TransportChallengeAuditReport {
+        segment_cid,
+        checked_providers,
+        verified_shards,
+        failed_shards,
+    })
+}
+
 fn choose_repair_target(
     providers_after_repair: &[ShardProviderRecord],
     fallback_provider: &ShardProviderRecord,
@@ -1098,6 +1174,17 @@ pub fn repair_shards_via_transport<T: NetworkTransport>(
         providers_after_repair,
         durability_satisfied,
     })
+}
+
+fn audit_challenge_nonce(segment_cid: Cid, shard_index: usize) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"gitmesh.storage.audit-challenge-nonce.v0");
+    hasher.update(segment_cid.to_string().as_bytes());
+    hasher.update(&(shard_index as u64).to_be_bytes());
+    let hash = hasher.finalize();
+    let mut nonce = [0_u8; 16];
+    nonce.copy_from_slice(&hash.as_bytes()[..16]);
+    nonce
 }
 
 fn verify_shard(segment: &EncryptedSegment, policy: &StoragePolicy, shard: &Shard) -> bool {
@@ -1540,6 +1627,60 @@ mod tests {
         assert_eq!(report.missing_shards, vec![3]);
         assert!(report.durability_satisfied);
         assert!(report.repair_needed);
+    }
+
+    #[test]
+    fn challenge_audit_detects_valid_corrupt_and_missing_provider_shards() {
+        let storage_policy = StoragePolicy {
+            data_shards: 3,
+            parity_shards: 2,
+        };
+        let placement_policy =
+            PlacementPolicy::new(storage_policy.total_shards(), 5, 2, true).unwrap();
+        let encrypted =
+            encrypt_segment(b"challenge audit samples shard bytes without fetching all").unwrap();
+        let shards = erasure_encode(&encrypted, &storage_policy).unwrap();
+        let client = PeerId::new("client-a").unwrap();
+        let mut swarm = InMemorySwarm::default();
+        swarm
+            .add_peer(InMemoryPeer::new(client_descriptor("client-a").unwrap()))
+            .unwrap();
+        for index in 0..storage_policy.total_shards() {
+            let peer = format!("storage-{index}");
+            let operator = format!("operator-{index}");
+            let region = if index % 2 == 0 { "iad" } else { "sfo" };
+            swarm
+                .add_peer(InMemoryPeer::new(
+                    storage_descriptor(&peer, &operator, region).unwrap(),
+                ))
+                .unwrap();
+        }
+
+        let descriptors = swarm.descriptors();
+        let (_plan, providers) = plan_and_distribute_shards(
+            &mut swarm,
+            &client,
+            descriptors,
+            &placement_policy,
+            &shards,
+            1,
+            1_000,
+        )
+        .unwrap();
+        swarm
+            .corrupt_shard(&providers[1].peer_id, providers[1].shard_cid)
+            .unwrap();
+        swarm
+            .remove_shard(&providers[3].peer_id, providers[3].shard_cid)
+            .unwrap();
+
+        let report =
+            challenge_shards_via_transport(&mut swarm, &client, encrypted.cid, &providers, 100, 1)
+                .unwrap();
+
+        assert_eq!(report.checked_providers, storage_policy.total_shards());
+        assert_eq!(report.verified_shards, vec![0, 2, 4]);
+        assert_eq!(report.failed_shards, vec![1, 3]);
     }
 
     #[test]

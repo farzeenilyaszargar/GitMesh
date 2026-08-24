@@ -129,9 +129,11 @@ produce a new signed lease. Expired or missing leases trigger repair.
 
 ## Auditing
 
-Each shard is split into authenticated subchunks with a Merkle root or equivalent
-authenticated structure. Auditors challenge random subchunk ranges and verify
-responses without downloading the full shard.
+Each shard is challenged through bounded byte-range audit messages. The current
+implementation verifies deterministic challenge transcripts and response hashes;
+the production protocol should back those ranges with a Merkle root or
+equivalent authenticated structure so auditors can verify responses without
+downloading the full shard.
 
 Repeated audit failures reduce peer reliability, trigger replacement, and may
 make the node ineligible for high-durability placement. V1 starts with simple

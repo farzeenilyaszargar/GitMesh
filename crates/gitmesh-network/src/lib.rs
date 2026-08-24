@@ -648,6 +648,108 @@ impl ShardEnvelope {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShardAuditChallenge {
+    pub shard_ref: ShardRef,
+    pub offset: usize,
+    pub length: usize,
+    pub nonce: [u8; 16],
+}
+
+impl ShardAuditChallenge {
+    pub fn new(
+        shard_ref: ShardRef,
+        offset: usize,
+        length: usize,
+        nonce: [u8; 16],
+    ) -> Result<Self, NetworkError> {
+        if length == 0 {
+            return Err(NetworkError::InvalidAuditChallenge);
+        }
+        Ok(Self {
+            shard_ref,
+            offset,
+            length,
+            nonce,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShardAuditProof {
+    pub shard_ref: ShardRef,
+    pub offset: usize,
+    pub length: usize,
+    pub total_len: usize,
+    pub nonce: [u8; 16],
+    pub bytes: Vec<u8>,
+    pub proof_hash: [u8; 32],
+}
+
+impl ShardAuditProof {
+    pub fn from_envelope(
+        envelope: &ShardEnvelope,
+        challenge: &ShardAuditChallenge,
+    ) -> Result<Self, NetworkError> {
+        envelope.verify()?;
+        if envelope.shard_ref != challenge.shard_ref {
+            return Err(NetworkError::ShardIntegrity);
+        }
+        let end = challenge
+            .offset
+            .checked_add(challenge.length)
+            .ok_or(NetworkError::InvalidAuditChallenge)?;
+        if end > envelope.bytes.len() {
+            return Err(NetworkError::InvalidAuditChallenge);
+        }
+        let bytes = envelope.bytes[challenge.offset..end].to_vec();
+        let proof_hash = audit_proof_hash(
+            &challenge.shard_ref,
+            challenge.offset,
+            challenge.length,
+            envelope.bytes.len(),
+            &challenge.nonce,
+            &bytes,
+        );
+        Ok(Self {
+            shard_ref: challenge.shard_ref.clone(),
+            offset: challenge.offset,
+            length: challenge.length,
+            total_len: envelope.bytes.len(),
+            nonce: challenge.nonce,
+            bytes,
+            proof_hash,
+        })
+    }
+
+    pub fn verify(&self, challenge: &ShardAuditChallenge) -> Result<(), NetworkError> {
+        if self.shard_ref != challenge.shard_ref
+            || self.offset != challenge.offset
+            || self.length != challenge.length
+            || self.nonce != challenge.nonce
+            || self.bytes.len() != self.length
+            || self
+                .offset
+                .checked_add(self.length)
+                .is_none_or(|end| end > self.total_len)
+        {
+            return Err(NetworkError::InvalidAuditProof);
+        }
+        let expected = audit_proof_hash(
+            &self.shard_ref,
+            self.offset,
+            self.length,
+            self.total_len,
+            &self.nonce,
+            &self.bytes,
+        );
+        if expected != self.proof_hash {
+            return Err(NetworkError::InvalidAuditProof);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderLease {
     pub lease_epoch: u64,
     pub expires_at_unix: u64,
@@ -983,6 +1085,9 @@ pub enum NetworkRequest {
     AuditShard {
         shard_ref: ShardRef,
     },
+    ChallengeShard {
+        challenge: ShardAuditChallenge,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1001,6 +1106,9 @@ pub enum NetworkResponse {
         shard_ref: ShardRef,
         present: bool,
         valid: bool,
+    },
+    ShardAuditProof {
+        proof: ShardAuditProof,
     },
     Ack,
 }
@@ -1110,6 +1218,16 @@ impl InMemoryPeer {
                     shard_ref,
                     present,
                     valid,
+                })
+            }
+            NetworkRequest::ChallengeShard { challenge } => {
+                self.require_protocol(ProtocolId::ShardTransferV0)?;
+                let envelope = self
+                    .shards
+                    .get(&challenge.shard_ref.shard_cid)
+                    .ok_or(NetworkError::ShardNotFound)?;
+                Ok(NetworkResponse::ShardAuditProof {
+                    proof: ShardAuditProof::from_envelope(envelope, &challenge)?,
                 })
             }
         }
@@ -1328,6 +1446,32 @@ fn put_transcript_field(out: &mut Vec<u8>, value: &[u8]) {
     out.extend_from_slice(value);
 }
 
+fn audit_proof_hash(
+    shard_ref: &ShardRef,
+    offset: usize,
+    length: usize,
+    total_len: usize,
+    nonce: &[u8; 16],
+    bytes: &[u8],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"gitmesh.network.shard-audit-proof.v0");
+    put_hash_field(&mut hasher, shard_ref.segment_cid.to_string().as_bytes());
+    put_hash_field(&mut hasher, shard_ref.shard_cid.to_string().as_bytes());
+    hasher.update(&(shard_ref.shard_index as u64).to_be_bytes());
+    hasher.update(&(offset as u64).to_be_bytes());
+    hasher.update(&(length as u64).to_be_bytes());
+    hasher.update(&(total_len as u64).to_be_bytes());
+    hasher.update(nonce);
+    put_hash_field(&mut hasher, bytes);
+    *hasher.finalize().as_bytes()
+}
+
+fn put_hash_field(hasher: &mut blake3::Hasher, value: &[u8]) {
+    hasher.update(&(value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum NetworkError {
     #[error("I/O failed: {0}")]
@@ -1362,6 +1506,10 @@ pub enum NetworkError {
     InvalidShardEnvelope,
     #[error("invalid shard index")]
     InvalidShardIndex,
+    #[error("invalid shard audit challenge")]
+    InvalidAuditChallenge,
+    #[error("invalid shard audit proof")]
+    InvalidAuditProof,
     #[error("shard integrity check failed")]
     ShardIntegrity,
     #[error("peer is not known")]
@@ -1594,6 +1742,81 @@ mod tests {
                 valid: false
             }
         );
+    }
+
+    #[test]
+    fn in_memory_swarm_answers_shard_audit_challenges() {
+        let client = PeerId::new("client-a").unwrap();
+        let storage = PeerId::new("storage-a").unwrap();
+        let segment = cid(CidKind::EncryptedSegment, 7);
+        let envelope =
+            ShardEnvelope::new(segment, 0, 16, 10, b"0123456789abcdef".to_vec()).unwrap();
+        let shard_ref = envelope.shard_ref.clone();
+        let challenge = ShardAuditChallenge::new(shard_ref.clone(), 4, 6, [9_u8; 16]).unwrap();
+        let mut swarm = InMemorySwarm::default();
+        swarm
+            .add_peer(InMemoryPeer::new(client_descriptor("client-a").unwrap()))
+            .unwrap();
+        swarm
+            .add_peer(InMemoryPeer::new(
+                storage_descriptor("storage-a", "operator-a", "iad").unwrap(),
+            ))
+            .unwrap();
+        swarm
+            .request(
+                &client,
+                &storage,
+                NetworkRequest::PutShard {
+                    envelope,
+                    lease_epoch: 1,
+                    expires_at_unix: 500,
+                },
+            )
+            .unwrap();
+
+        let response = swarm
+            .request(
+                &client,
+                &storage,
+                NetworkRequest::ChallengeShard {
+                    challenge: challenge.clone(),
+                },
+            )
+            .unwrap();
+
+        let NetworkResponse::ShardAuditProof { proof } = response else {
+            panic!("expected audit proof");
+        };
+        proof.verify(&challenge).unwrap();
+        assert_eq!(proof.bytes, b"456789");
+        assert_eq!(proof.shard_ref, shard_ref);
+    }
+
+    #[test]
+    fn shard_audit_proof_rejects_tampering() {
+        let segment = cid(CidKind::EncryptedSegment, 7);
+        let envelope =
+            ShardEnvelope::new(segment, 0, 16, 10, b"0123456789abcdef".to_vec()).unwrap();
+        let challenge =
+            ShardAuditChallenge::new(envelope.shard_ref.clone(), 4, 6, [9_u8; 16]).unwrap();
+        let mut proof = ShardAuditProof::from_envelope(&envelope, &challenge).unwrap();
+        proof.bytes[0] ^= 0xff;
+
+        let err = proof.verify(&challenge).unwrap_err();
+
+        assert_eq!(err, NetworkError::InvalidAuditProof);
+    }
+
+    #[test]
+    fn shard_audit_challenge_rejects_out_of_range_request() {
+        let segment = cid(CidKind::EncryptedSegment, 7);
+        let envelope = ShardEnvelope::new(segment, 0, 16, 10, b"0123".to_vec()).unwrap();
+        let challenge =
+            ShardAuditChallenge::new(envelope.shard_ref.clone(), 3, 2, [9_u8; 16]).unwrap();
+
+        let err = ShardAuditProof::from_envelope(&envelope, &challenge).unwrap_err();
+
+        assert_eq!(err, NetworkError::InvalidAuditChallenge);
     }
 
     #[test]

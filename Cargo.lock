@@ -371,6 +371,7 @@ dependencies = [
 name = "gitmesh-network"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "gitmesh-core",
  "gitmesh-identity",
  "thiserror",
@@ -392,6 +393,7 @@ dependencies = [
 name = "gitmesh-storage"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "gitmesh-core",
  "gitmesh-crypto",
  "gitmesh-identity",

@@ -46,6 +46,7 @@ The in-memory swarm supports:
 - placement across qualified storage peers with operator and region constraints
 - transport-level provider publish/discover flows from `gitmesh-storage`
 - remote shard audits that distinguish valid, corrupt, and missing shards
+- bounded shard audit challenge/proof messages for deterministic byte ranges
 - repair of known missing/corrupt provider shards through the same transport
 - replacement-peer repair when an original storage provider disappears
 - lease refresh and republish after successful transport repair

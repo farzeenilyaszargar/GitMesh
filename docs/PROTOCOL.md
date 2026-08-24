@@ -84,7 +84,8 @@ The first schema set must include:
 - `NodeAnnouncement`: signed peer, role, protocol, region, and address
   advertisement with expiry.
 - `AvailabilityRecord`: signed directory record listing current shard leases.
-- `AuditChallenge` and `AuditResponse`: random subchunk proof protocol messages.
+- `AuditChallenge` and `AuditResponse`: bounded shard byte-range proof protocol
+  messages, with Merkle-backed proofs as the production target.
 - `RefUpdate`: signed compare-and-swap mutation request.
 - `RefCheckpoint`: signed append-only checkpoint of ref state and history root.
 - `PolicyManifest`: protected branches, permissions, mutation requirements.
