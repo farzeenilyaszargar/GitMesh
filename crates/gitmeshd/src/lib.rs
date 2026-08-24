@@ -905,12 +905,6 @@ impl DaemonState {
         let providers = self
             .availability
             .active_records_for_segment(record.segment_cid, now);
-        let providers = if providers.is_empty() {
-            self.objects
-                .local_provider_records_for_object(oid, 1, now.saturating_add(86_400))?
-        } else {
-            providers
-        };
         let report = self
             .objects
             .object_availability_report(oid, &providers, requirement, now)?;
@@ -4095,6 +4089,25 @@ mod tests {
         assert!(report.contains("required_shards=10"));
         assert!(report.contains("required_operators=3"));
         assert!(report.contains("required_regions=2"));
+    }
+
+    #[test]
+    fn object_availability_uses_directory_evidence_only() {
+        let mut state = DaemonState::default();
+        let oid = put_object(
+            &mut state,
+            "blob",
+            &encode_hex(b"empty availability directory"),
+        );
+        state.availability = InMemoryAvailabilityDirectory::default();
+
+        let report = state
+            .handle_command(&format!("OBJECT_AVAILABILITY {oid} 10 3 2"))
+            .unwrap()
+            .into_line();
+
+        assert!(report.contains("active_records=0"));
+        assert!(report.contains("satisfied=false"));
     }
 
     #[test]

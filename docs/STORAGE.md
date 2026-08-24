@@ -126,6 +126,9 @@ StorageLease {
 A repository counts a shard as durably placed only while valid, signed,
 unexpired leases satisfy the repository's placement policy. Lease renewal must
 produce a new signed lease. Expired or missing leases trigger repair.
+Availability reports are derived from current provider-directory lease evidence;
+local object presence or cached shard bytes are not counted unless they have
+corresponding active provider records.
 
 ## Auditing
 
