@@ -201,18 +201,24 @@ impl SimulatedNetwork {
     ) -> Result<()> {
         for stored in self.available_shards() {
             directory
-                .publish(ShardProviderRecord::new(
-                    stored.shard.segment_cid,
-                    stored.shard.cid,
-                    stored.shard.shard_index,
-                    PeerId::new(format!("v0-node-{}", stored.node_id))
-                        .map_err(|err| StorageError::Network(err.to_string()))?,
-                    OperatorId::new(format!("v0-operator-{}", stored.node_id))
-                        .map_err(|err| StorageError::Network(err.to_string()))?,
-                    [NodeRole::Storage],
-                    ProviderLease::new(lease_epoch, expires_at_unix)
-                        .map_err(|err| StorageError::Network(err.to_string()))?,
-                ))
+                .publish(
+                    ShardProviderRecord::new(
+                        gitmesh_network::ShardRef {
+                            segment_cid: stored.shard.segment_cid,
+                            shard_cid: stored.shard.cid,
+                            shard_index: stored.shard.shard_index,
+                        },
+                        PeerId::new(format!("v0-node-{}", stored.node_id))
+                            .map_err(|err| StorageError::Network(err.to_string()))?,
+                        OperatorId::new(format!("v0-operator-{}", stored.node_id))
+                            .map_err(|err| StorageError::Network(err.to_string()))?,
+                        "local",
+                        [NodeRole::Storage],
+                        ProviderLease::new(lease_epoch, expires_at_unix)
+                            .map_err(|err| StorageError::Network(err.to_string()))?,
+                    )
+                    .map_err(|err| StorageError::Network(err.to_string()))?,
+                )
                 .map_err(|err| StorageError::Network(err.to_string()))?;
         }
         Ok(())
@@ -598,17 +604,19 @@ pub fn distribute_shards_via_transport<T: NetworkTransport>(
                 "unexpected response to PutShard".to_string(),
             ));
         };
-        providers.push(ShardProviderRecord::new(
-            shard_ref.segment_cid,
-            shard_ref.shard_cid,
-            shard_ref.shard_index,
-            peer.clone(),
-            OperatorId::new(format!("remote-operator-{}", peer.as_str()))
-                .map_err(|err| StorageError::Network(err.to_string()))?,
-            [NodeRole::Storage],
-            ProviderLease::new(lease_epoch, expires_at_unix)
-                .map_err(|err| StorageError::Network(err.to_string()))?,
-        ));
+        providers.push(
+            ShardProviderRecord::new(
+                shard_ref,
+                peer.clone(),
+                OperatorId::new(format!("remote-operator-{}", peer.as_str()))
+                    .map_err(|err| StorageError::Network(err.to_string()))?,
+                "unknown",
+                [NodeRole::Storage],
+                ProviderLease::new(lease_epoch, expires_at_unix)
+                    .map_err(|err| StorageError::Network(err.to_string()))?,
+            )
+            .map_err(|err| StorageError::Network(err.to_string()))?,
+        );
     }
     Ok(providers)
 }
@@ -965,6 +973,7 @@ fn choose_repair_target(
             let mut provider = fallback_provider.clone();
             provider.peer_id = descriptor.peer_id.clone();
             provider.operator_id = descriptor.operator_id.clone();
+            provider.region = descriptor.region.clone();
             provider.roles = descriptor.roles.clone();
             provider
         })
@@ -995,16 +1004,16 @@ fn store_repaired_shard<T: NetworkTransport>(
             "unexpected response to PutShard during repair".to_string(),
         ));
     };
-    Ok(ShardProviderRecord::new(
-        shard_ref.segment_cid,
-        shard_ref.shard_cid,
-        shard_ref.shard_index,
+    ShardProviderRecord::new(
+        shard_ref,
         provider.peer_id.clone(),
         provider.operator_id.clone(),
+        provider.region.clone(),
         provider.roles.clone(),
         ProviderLease::new(lease_epoch, expires_at_unix)
             .map_err(|err| StorageError::Network(err.to_string()))?,
-    ))
+    )
+    .map_err(|err| StorageError::Network(err.to_string()))
 }
 
 pub fn repair_shards_via_transport<T: NetworkTransport>(

@@ -137,15 +137,7 @@ impl NodeDescriptor {
         region: impl Into<String>,
         protocols: impl IntoIterator<Item = ProtocolId>,
     ) -> Result<Self, NetworkError> {
-        let region = region.into();
-        if region.is_empty()
-            || region.len() > 32
-            || !region
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        {
-            return Err(NetworkError::InvalidRegion);
-        }
+        let region = validate_region(region.into())?;
         let roles = roles.into_iter().collect::<BTreeSet<_>>();
         if roles.is_empty() {
             return Err(NetworkError::InvalidNodeDescriptor);
@@ -774,6 +766,7 @@ pub struct ShardProviderRecord {
     pub shard_index: usize,
     pub peer_id: PeerId,
     pub operator_id: OperatorId,
+    pub region: String,
     pub roles: BTreeSet<NodeRole>,
     pub lease_epoch: u64,
     pub expires_at_unix: u64,
@@ -781,24 +774,24 @@ pub struct ShardProviderRecord {
 
 impl ShardProviderRecord {
     pub fn new(
-        segment_cid: Cid,
-        shard_cid: Cid,
-        shard_index: usize,
+        shard_ref: ShardRef,
         peer_id: PeerId,
         operator_id: OperatorId,
+        region: impl Into<String>,
         roles: impl IntoIterator<Item = NodeRole>,
         lease: ProviderLease,
-    ) -> Self {
-        Self {
-            segment_cid,
-            shard_cid,
-            shard_index,
+    ) -> Result<Self, NetworkError> {
+        Ok(Self {
+            segment_cid: shard_ref.segment_cid,
+            shard_cid: shard_ref.shard_cid,
+            shard_index: shard_ref.shard_index,
             peer_id,
             operator_id,
+            region: validate_region(region.into())?,
             roles: roles.into_iter().collect(),
             lease_epoch: lease.lease_epoch,
             expires_at_unix: lease.expires_at_unix,
-        }
+        })
     }
 
     pub fn is_active_at(&self, now_unix: u64) -> bool {
@@ -817,6 +810,7 @@ impl ShardProviderRecord {
         transcript.extend_from_slice(&(self.shard_index as u64).to_be_bytes());
         put_transcript_field(&mut transcript, self.peer_id.as_str().as_bytes());
         put_transcript_field(&mut transcript, self.operator_id.as_str().as_bytes());
+        put_transcript_field(&mut transcript, self.region.as_bytes());
         put_transcript_field(&mut transcript, format_roles(&self.roles).as_bytes());
         transcript.extend_from_slice(&self.lease_epoch.to_be_bytes());
         transcript.extend_from_slice(&self.expires_at_unix.to_be_bytes());
@@ -937,6 +931,97 @@ impl InMemoryAvailabilityDirectory {
             .map(|record| (record.shard_index, record.operator_id))
             .collect::<BTreeSet<_>>()
             .len()
+    }
+
+    pub fn availability_report(
+        &self,
+        segment_cid: Cid,
+        now_unix: u64,
+        requirement: AvailabilityRequirement,
+    ) -> AvailabilityReport {
+        let active_records = self.active_records_for_segment(segment_cid, now_unix);
+        let durable_records = active_records
+            .iter()
+            .filter(|record| record.counts_for_durability())
+            .collect::<Vec<_>>();
+        let distinct_shards = durable_records
+            .iter()
+            .map(|record| record.shard_index)
+            .collect::<BTreeSet<_>>();
+        let distinct_operators = durable_records
+            .iter()
+            .map(|record| record.operator_id.clone())
+            .collect::<BTreeSet<_>>();
+        let distinct_regions = durable_records
+            .iter()
+            .map(|record| record.region.clone())
+            .collect::<BTreeSet<_>>();
+        let duplicate_operator_shards = durable_records
+            .iter()
+            .map(|record| (record.shard_index, record.operator_id.clone()))
+            .collect::<BTreeSet<_>>()
+            .len();
+
+        AvailabilityReport {
+            segment_cid,
+            active_record_count: active_records.len(),
+            durable_record_count: durable_records.len(),
+            distinct_shard_count: distinct_shards.len(),
+            distinct_operator_count: distinct_operators.len(),
+            distinct_region_count: distinct_regions.len(),
+            qualified_durable_shard_count: duplicate_operator_shards,
+            requirement,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AvailabilityRequirement {
+    pub min_shards: usize,
+    pub min_distinct_operators: usize,
+    pub min_distinct_regions: usize,
+}
+
+impl AvailabilityRequirement {
+    pub fn new(
+        min_shards: usize,
+        min_distinct_operators: usize,
+        min_distinct_regions: usize,
+    ) -> Result<Self, NetworkError> {
+        if min_shards == 0
+            || min_distinct_operators == 0
+            || min_distinct_regions == 0
+            || min_distinct_operators > min_shards
+            || min_distinct_regions > min_shards
+        {
+            return Err(NetworkError::InvalidAvailabilityRequirement);
+        }
+        Ok(Self {
+            min_shards,
+            min_distinct_operators,
+            min_distinct_regions,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AvailabilityReport {
+    pub segment_cid: Cid,
+    pub active_record_count: usize,
+    pub durable_record_count: usize,
+    pub distinct_shard_count: usize,
+    pub qualified_durable_shard_count: usize,
+    pub distinct_operator_count: usize,
+    pub distinct_region_count: usize,
+    pub requirement: AvailabilityRequirement,
+}
+
+impl AvailabilityReport {
+    pub fn satisfies_requirement(&self) -> bool {
+        self.distinct_shard_count >= self.requirement.min_shards
+            && self.qualified_durable_shard_count >= self.requirement.min_shards
+            && self.distinct_operator_count >= self.requirement.min_distinct_operators
+            && self.distinct_region_count >= self.requirement.min_distinct_regions
     }
 }
 
@@ -1182,14 +1267,13 @@ impl InMemoryPeer {
                 let shard_ref = envelope.shard_ref.clone();
                 self.shards.insert(shard_ref.shard_cid, envelope);
                 self.directory.publish(ShardProviderRecord::new(
-                    shard_ref.segment_cid,
-                    shard_ref.shard_cid,
-                    shard_ref.shard_index,
+                    shard_ref.clone(),
                     self.descriptor.peer_id.clone(),
                     self.descriptor.operator_id.clone(),
+                    self.descriptor.region.clone(),
                     self.descriptor.roles.clone(),
                     ProviderLease::new(lease_epoch, expires_at_unix)?,
-                ))?;
+                )?)?;
                 Ok(NetworkResponse::ShardStored { shard_ref })
             }
             NetworkRequest::GetShard { shard_ref } => {
@@ -1390,6 +1474,18 @@ fn validate_address(value: String) -> Result<String, NetworkError> {
     Ok(value)
 }
 
+fn validate_region(value: String) -> Result<String, NetworkError> {
+    if value.is_empty()
+        || value.len() > 32
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(NetworkError::InvalidRegion);
+    }
+    Ok(value)
+}
+
 fn format_roles(roles: &BTreeSet<NodeRole>) -> String {
     roles
         .iter()
@@ -1524,6 +1620,8 @@ pub enum NetworkError {
     ShardNotFound,
     #[error("invalid placement policy")]
     InvalidPlacementPolicy,
+    #[error("invalid availability requirement")]
+    InvalidAvailabilityRequirement,
     #[error("not enough qualified independent storage peers")]
     InsufficientStoragePeers,
 }
@@ -1546,14 +1644,14 @@ mod tests {
     ) -> ShardProviderRecord {
         let bytes = vec![shard_index as u8, 42];
         ShardProviderRecord::new(
-            segment,
-            shard_cid(segment, shard_index, &bytes),
-            shard_index,
+            ShardRef::new(segment, shard_index, &bytes),
             PeerId::new(peer).unwrap(),
             OperatorId::new(operator).unwrap(),
+            "iad",
             [NodeRole::Storage],
             ProviderLease::new(1, expires).unwrap(),
         )
+        .unwrap()
     }
 
     #[test]
@@ -1581,6 +1679,51 @@ mod tests {
 
         assert_eq!(directory.active_records_for_segment(segment, 100).len(), 1);
         assert_eq!(directory.durable_shard_count(segment, 100), 0);
+    }
+
+    #[test]
+    fn availability_report_checks_shard_operator_and_region_requirements() {
+        let segment = cid(CidKind::EncryptedSegment, 1);
+        let mut directory = InMemoryAvailabilityDirectory::default();
+        directory
+            .publish(provider(segment, 0, "peer-a", "op-a", 150))
+            .unwrap();
+        let mut second = provider(segment, 1, "peer-b", "op-b", 150);
+        second.region = "sfo".to_string();
+        directory.publish(second).unwrap();
+        let mut duplicate_operator = provider(segment, 2, "peer-c", "op-b", 150);
+        duplicate_operator.region = "sfo".to_string();
+        directory.publish(duplicate_operator).unwrap();
+        let requirement = AvailabilityRequirement::new(3, 3, 2).unwrap();
+
+        let report = directory.availability_report(segment, 100, requirement);
+
+        assert_eq!(report.active_record_count, 3);
+        assert_eq!(report.distinct_shard_count, 3);
+        assert_eq!(report.distinct_operator_count, 2);
+        assert_eq!(report.distinct_region_count, 2);
+        assert!(!report.satisfies_requirement());
+    }
+
+    #[test]
+    fn availability_report_satisfies_independent_storage_requirement() {
+        let segment = cid(CidKind::EncryptedSegment, 1);
+        let mut directory = InMemoryAvailabilityDirectory::default();
+        directory
+            .publish(provider(segment, 0, "peer-a", "op-a", 150))
+            .unwrap();
+        let mut second = provider(segment, 1, "peer-b", "op-b", 150);
+        second.region = "sfo".to_string();
+        directory.publish(second).unwrap();
+        let mut third = provider(segment, 2, "peer-c", "op-c", 150);
+        third.region = "lhr".to_string();
+        directory.publish(third).unwrap();
+        let requirement = AvailabilityRequirement::new(3, 3, 2).unwrap();
+
+        let report = directory.availability_report(segment, 100, requirement);
+
+        assert_eq!(report.qualified_durable_shard_count, 3);
+        assert!(report.satisfies_requirement());
     }
 
     #[test]

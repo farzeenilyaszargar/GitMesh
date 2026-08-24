@@ -13,6 +13,8 @@ Currently implemented:
 - `ShardEnvelope`
 - `ShardProviderRecord`
 - `SignedShardProviderRecord`
+- `AvailabilityRequirement`
+- `AvailabilityReport`
 - `NodeAnnouncement`
 - `SignedNodeAnnouncement`
 - `KnownPeerRecord`
@@ -41,8 +43,11 @@ The in-memory swarm supports:
 - storage-role enforcement for shard writes
 - shard integrity verification before store/fetch success
 - unsigned and signed provider publication with lease expiry
-- signed provider records with device-certificate verification and expiry
+- signed provider records with device-certificate verification, provider
+  region binding, and expiry
 - provider discovery through the availability protocol
+- availability reports that check unique durable shards, independent operators,
+  and independent regions before higher layers publish mutable refs
 - placement across qualified storage peers with operator and region constraints
 - transport-level provider publish/discover flows from `gitmesh-storage`
 - remote shard audits that distinguish valid, corrupt, and missing shards
