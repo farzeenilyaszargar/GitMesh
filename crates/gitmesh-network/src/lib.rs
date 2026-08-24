@@ -10,6 +10,7 @@ use std::fs;
 use std::path::Path;
 
 use gitmesh_core::{Cid, shard_cid};
+use gitmesh_identity::{DeviceCertificate, DeviceId, DeviceKey, IdentityError};
 use thiserror::Error;
 
 const NODE_STORE_HEADER: &str = "gitmesh-network-node-store-v0";
@@ -202,6 +203,127 @@ pub struct KnownPeerRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NodeAnnouncement {
+    pub descriptor: NodeDescriptor,
+    pub addresses: Vec<String>,
+    pub issued_at_unix: u64,
+    pub expires_at_unix: u64,
+    pub signer_device_id: DeviceId,
+}
+
+impl NodeAnnouncement {
+    pub fn new(
+        descriptor: NodeDescriptor,
+        addresses: Vec<String>,
+        issued_at_unix: u64,
+        expires_at_unix: u64,
+        signer_device_id: DeviceId,
+    ) -> Result<Self, NetworkError> {
+        if issued_at_unix == 0 || expires_at_unix <= issued_at_unix {
+            return Err(NetworkError::InvalidNodeAnnouncement);
+        }
+        let mut addresses = addresses
+            .into_iter()
+            .map(validate_address)
+            .collect::<Result<Vec<_>, _>>()?;
+        addresses.sort();
+        addresses.dedup();
+        Ok(Self {
+            descriptor,
+            addresses,
+            issued_at_unix,
+            expires_at_unix,
+            signer_device_id,
+        })
+    }
+
+    pub fn is_active_at(&self, now_unix: u64) -> bool {
+        self.issued_at_unix <= now_unix && now_unix < self.expires_at_unix
+    }
+
+    pub fn signing_transcript(&self) -> Vec<u8> {
+        let mut transcript = Vec::new();
+        put_transcript_field(&mut transcript, b"gitmesh.network.node-announcement.v0");
+        put_transcript_field(&mut transcript, self.descriptor.peer_id.as_str().as_bytes());
+        put_transcript_field(
+            &mut transcript,
+            self.descriptor.operator_id.as_str().as_bytes(),
+        );
+        put_transcript_field(
+            &mut transcript,
+            format_roles(&self.descriptor.roles).as_bytes(),
+        );
+        put_transcript_field(&mut transcript, self.descriptor.region.as_bytes());
+        put_transcript_field(
+            &mut transcript,
+            format_protocols(&self.descriptor.protocols).as_bytes(),
+        );
+        put_transcript_field(
+            &mut transcript,
+            format_addresses(&self.addresses).as_bytes(),
+        );
+        transcript.extend_from_slice(&self.issued_at_unix.to_be_bytes());
+        transcript.extend_from_slice(&self.expires_at_unix.to_be_bytes());
+        put_transcript_field(
+            &mut transcript,
+            self.signer_device_id.as_cid().to_string().as_bytes(),
+        );
+        transcript
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignedNodeAnnouncement {
+    pub announcement: NodeAnnouncement,
+    pub certificate: DeviceCertificate,
+    pub signature: [u8; 64],
+}
+
+impl SignedNodeAnnouncement {
+    pub fn sign(
+        announcement: NodeAnnouncement,
+        certificate: DeviceCertificate,
+        device: &DeviceKey,
+    ) -> Result<Self, NetworkError> {
+        if announcement.signer_device_id != device.device_id()
+            || certificate.device_id != device.device_id()
+        {
+            return Err(NetworkError::AnnouncementSignerMismatch);
+        }
+        let signature = device.sign(&announcement.signing_transcript());
+        Ok(Self {
+            announcement,
+            certificate,
+            signature,
+        })
+    }
+
+    pub fn new(
+        announcement: NodeAnnouncement,
+        certificate: DeviceCertificate,
+        signature: [u8; 64],
+    ) -> Self {
+        Self {
+            announcement,
+            certificate,
+            signature,
+        }
+    }
+
+    pub fn verify(&self, now_unix: u64) -> Result<(), NetworkError> {
+        if !self.announcement.is_active_at(now_unix) {
+            return Err(NetworkError::ExpiredNodeAnnouncement);
+        }
+        if self.announcement.signer_device_id != self.certificate.device_id {
+            return Err(NetworkError::AnnouncementSignerMismatch);
+        }
+        self.certificate
+            .verify_device_signature(&self.announcement.signing_transcript(), &self.signature)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NetworkNodeStore {
     local_node: NodeDescriptor,
     listen_addresses: Vec<String>,
@@ -303,6 +425,19 @@ impl NetworkNodeStore {
         self.known_peers
             .get(&peer_id)
             .ok_or(NetworkError::UnknownPeer)
+    }
+
+    pub fn register_signed_peer(
+        &mut self,
+        signed: &SignedNodeAnnouncement,
+        now_unix: u64,
+    ) -> Result<&KnownPeerRecord, NetworkError> {
+        signed.verify(now_unix)?;
+        self.register_peer(
+            signed.announcement.descriptor.clone(),
+            signed.announcement.addresses.clone(),
+            now_unix,
+        )
     }
 
     pub fn bootstrap(
@@ -1110,6 +1245,11 @@ fn parse_addresses(value: &str) -> Result<Vec<String>, NetworkError> {
     Ok(addresses)
 }
 
+fn put_transcript_field(out: &mut Vec<u8>, value: &[u8]) {
+    out.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    out.extend_from_slice(value);
+}
+
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum NetworkError {
     #[error("I/O failed: {0}")]
@@ -1126,6 +1266,14 @@ pub enum NetworkError {
     InvalidNodeDescriptor,
     #[error("invalid network node store snapshot")]
     InvalidNodeStore,
+    #[error("invalid signed node announcement")]
+    InvalidNodeAnnouncement,
+    #[error("node announcement signer does not match certificate")]
+    AnnouncementSignerMismatch,
+    #[error("node announcement is expired or not yet valid")]
+    ExpiredNodeAnnouncement,
+    #[error("identity verification failed: {0}")]
+    Identity(#[from] IdentityError),
     #[error("invalid provider record")]
     InvalidProviderRecord,
     #[error("invalid shard envelope")]
@@ -1549,5 +1697,71 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err, NetworkError::InvalidAddress);
+    }
+
+    #[test]
+    fn signed_node_announcement_registers_verified_peer() {
+        let account = gitmesh_identity::AccountRootKey::generate();
+        let device = gitmesh_identity::DeviceKey::generate();
+        let certificate = account.certify_device(&device, "storage-node");
+        let announcement = NodeAnnouncement::new(
+            storage_descriptor("storage-a", "operator-a", "sfo").unwrap(),
+            vec!["/ip4/10.0.0.2/tcp/4001".to_string()],
+            100,
+            200,
+            device.device_id(),
+        )
+        .unwrap();
+        let signed = SignedNodeAnnouncement::sign(announcement, certificate, &device).unwrap();
+        let mut store = NetworkNodeStore::default();
+
+        store.register_signed_peer(&signed, 150).unwrap();
+
+        assert_eq!(store.known_peer_count(), 1);
+        assert_eq!(store.storage_peer_count(), 1);
+    }
+
+    #[test]
+    fn signed_node_announcement_rejects_tampering() {
+        let account = gitmesh_identity::AccountRootKey::generate();
+        let device = gitmesh_identity::DeviceKey::generate();
+        let certificate = account.certify_device(&device, "storage-node");
+        let announcement = NodeAnnouncement::new(
+            storage_descriptor("storage-a", "operator-a", "sfo").unwrap(),
+            vec!["/ip4/10.0.0.2/tcp/4001".to_string()],
+            100,
+            200,
+            device.device_id(),
+        )
+        .unwrap();
+        let mut signed = SignedNodeAnnouncement::sign(announcement, certificate, &device).unwrap();
+        signed.announcement.descriptor.region = "iad".to_string();
+
+        let err = signed.verify(150).unwrap_err();
+
+        assert!(matches!(
+            err,
+            NetworkError::Identity(gitmesh_identity::IdentityError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn signed_node_announcement_rejects_expired_records() {
+        let account = gitmesh_identity::AccountRootKey::generate();
+        let device = gitmesh_identity::DeviceKey::generate();
+        let certificate = account.certify_device(&device, "storage-node");
+        let announcement = NodeAnnouncement::new(
+            storage_descriptor("storage-a", "operator-a", "sfo").unwrap(),
+            vec!["/ip4/10.0.0.2/tcp/4001".to_string()],
+            100,
+            200,
+            device.device_id(),
+        )
+        .unwrap();
+        let signed = SignedNodeAnnouncement::sign(announcement, certificate, &device).unwrap();
+
+        let err = signed.verify(200).unwrap_err();
+
+        assert_eq!(err, NetworkError::ExpiredNodeAnnouncement);
     }
 }

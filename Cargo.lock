@@ -372,6 +372,7 @@ name = "gitmesh-network"
 version = "0.1.0"
 dependencies = [
  "gitmesh-core",
+ "gitmesh-identity",
  "thiserror",
 ]
 

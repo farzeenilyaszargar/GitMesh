@@ -16,6 +16,15 @@ GitMesh uses libp2p unless a later ADR identifies a compelling replacement.
 Multiple independent bootstrap and relay nodes must be supported. No
 GitMesh-operated bootstrap node is authoritative.
 
+## Node Announcements
+
+Nodes publish signed announcements containing their peer ID, operator ID, roles,
+region, supported protocols, reachable addresses, signer device ID, issue time,
+and expiry time. Announcements are signed by a certified device key and are not
+accepted after expiry. A peer registry may cache announcements locally, but the
+cached copy is not authority without signature, certificate, and freshness
+verification.
+
 ## DHT Usage
 
 The DHT is not an application database. It is used for:

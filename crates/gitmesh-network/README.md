@@ -12,6 +12,8 @@ Currently implemented:
 - `ShardRef`
 - `ShardEnvelope`
 - `ShardProviderRecord`
+- `NodeAnnouncement`
+- `SignedNodeAnnouncement`
 - `KnownPeerRecord`
 - `NetworkNodeStore`
 - `InMemoryAvailabilityDirectory`
@@ -31,6 +33,7 @@ interface before QUIC/TCP/Noise/Kademlia are introduced.
 The in-memory swarm supports:
 
 - peer descriptors with roles, operator identity, region, and protocol support
+- signed node announcements with device-certificate verification and expiry
 - persistent local node identity, listen addresses, bootstrap peers, and known
   peer records
 - request/response routing between peers

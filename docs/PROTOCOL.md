@@ -80,6 +80,8 @@ The first schema set must include:
 - `SegmentDescriptor`: segment layout, compression, encryption, coding policy,
   checksums, shard CIDs, and audit tree root.
 - `StorageLease`: signed promise from a storage node to hold a shard until expiry.
+- `NodeAnnouncement`: signed peer, role, protocol, region, and address
+  advertisement with expiry.
 - `AvailabilityRecord`: signed directory record listing current shard leases.
 - `AuditChallenge` and `AuditResponse`: random subchunk proof protocol messages.
 - `RefUpdate`: signed compare-and-swap mutation request.
