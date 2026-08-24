@@ -108,6 +108,13 @@ pub enum DaemonResponse {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct RepoAvailabilityStatus {
+    active_provider_records: usize,
+    available_objects: usize,
+    unavailable_objects: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DaemonAuth {
     admin_token: Option<String>,
 }
@@ -558,8 +565,10 @@ impl DaemonState {
         }
 
         if trimmed == "REPO_STATUS" {
+            let now = network_now_unix()?;
+            let availability = self.repo_availability_status(now)?;
             return Ok(DaemonResponse::Ok(format!(
-                "objects={} refs={} mutations={} checkpoints={} key_grants={} revoked_devices={} accounts={} active_sessions={} registered_repos={} collaboration_events={} network_peers={} network_storage_peers={} data_shards={} parity_shards={}",
+                "objects={} refs={} mutations={} checkpoints={} key_grants={} revoked_devices={} accounts={} active_sessions={} registered_repos={} collaboration_events={} network_peers={} network_storage_peers={} availability_records={} available_objects={} unavailable_objects={} data_shards={} parity_shards={}",
                 self.objects.object_count(),
                 self.refs.ref_count(),
                 self.refs.mutation_count(),
@@ -572,6 +581,9 @@ impl DaemonState {
                 self.collaboration.event_count(),
                 self.network.known_peer_count(),
                 self.network.storage_peer_count(),
+                availability.active_provider_records,
+                availability.available_objects,
+                availability.unavailable_objects,
                 self.objects.policy().data_shards,
                 self.objects.policy().parity_shards
             )));
@@ -686,8 +698,7 @@ impl DaemonState {
         let Some(oid) = oid else {
             return Ok(());
         };
-        let requirement = AvailabilityRequirement::new(self.objects.policy().data_shards, 3, 2)
-            .map_err(DaemonError::Network)?;
+        let requirement = self.default_availability_requirement()?;
         let now = network_now_unix()?;
         let record = self
             .objects
@@ -706,6 +717,34 @@ impl DaemonState {
             return Err(DaemonError::MissingDurableObject(oid));
         }
         Ok(())
+    }
+
+    fn default_availability_requirement(&self) -> Result<AvailabilityRequirement> {
+        AvailabilityRequirement::new(self.objects.policy().data_shards, 3, 2)
+            .map_err(DaemonError::Network)
+    }
+
+    fn repo_availability_status(&self, now_unix: u64) -> Result<RepoAvailabilityStatus> {
+        let requirement = self.default_availability_requirement()?;
+        let mut status = RepoAvailabilityStatus::default();
+        for record in self.objects.records() {
+            let providers = self
+                .availability
+                .active_records_for_segment(record.segment_cid, now_unix);
+            status.active_provider_records += providers.len();
+            let report = self.objects.object_availability_report(
+                record.oid,
+                &providers,
+                requirement,
+                now_unix,
+            )?;
+            if report.satisfies_requirement() {
+                status.available_objects += 1;
+            } else {
+                status.unavailable_objects += 1;
+            }
+        }
+        Ok(status)
     }
 
     fn ref_checkpoint_signed_verify(&self, rest: &str) -> Result<DaemonResponse> {
@@ -4232,7 +4271,24 @@ mod tests {
 
         assert!(status.contains("objects=1"));
         assert!(status.contains("checkpoints=0"));
+        assert!(status.contains("availability_records=16"));
+        assert!(status.contains("available_objects=1"));
+        assert!(status.contains("unavailable_objects=0"));
         assert!(status.contains("data_shards=10"));
+    }
+
+    #[test]
+    fn repo_status_reports_unavailable_objects_without_provider_evidence() {
+        let mut state = DaemonState::default();
+        state.handle_command("OBJECT_PUT blob 6869").unwrap();
+        state.availability = InMemoryAvailabilityDirectory::default();
+
+        let status = state.handle_command("REPO_STATUS").unwrap().into_line();
+
+        assert!(status.contains("objects=1"));
+        assert!(status.contains("availability_records=0"));
+        assert!(status.contains("available_objects=0"));
+        assert!(status.contains("unavailable_objects=1"));
     }
 
     #[test]

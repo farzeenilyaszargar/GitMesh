@@ -37,6 +37,9 @@ segment_fetch_latency
 shard_fetch_latency
 cache_hit_ratio
 healthy_shards
+active_provider_records
+available_objects
+unavailable_objects
 under_replicated_segments
 repair_queue_depth
 repair_latency

@@ -283,6 +283,8 @@ web_status="$(get_json "/api/gitmesh/status")"
 expect_contains "$web_status" '"ok":true'
 expect_contains "$web_status" '"collaboration_events":"8"'
 expect_contains "$web_status" '"network_peers":"2"'
+expect_contains "$web_status" '"available_objects":"1"'
+expect_contains "$web_status" '"unavailable_objects":"0"'
 
 for store in "$OBJECT_STORE" "$REF_STORE" "$COLLAB_STORE" "$NETWORK_STORE" "$AVAILABILITY_STORE"; do
   if [[ ! -s "$store" ]]; then
